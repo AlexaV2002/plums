@@ -7,6 +7,7 @@ import {
 import { ChannelType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateMessageDto } from './dto/create-message.dto';
+import { MessagesGateway } from './messages.gateway';
 import { UpdateMessageDto } from './dto/update-message.dto';
 
 type ChannelPermissions = {
@@ -17,7 +18,10 @@ type ChannelPermissions = {
 
 @Injectable()
 export class MessagesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly messagesGateway: MessagesGateway,
+  ) {}
 
   private getPermissions(raw: unknown): Required<ChannelPermissions> {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -67,7 +71,10 @@ export class MessagesService {
     return channel;
   }
 
-  private isServerOwner(channel: Awaited<ReturnType<MessagesService['getChannelForUser']>>, userId: string) {
+  private isServerOwner(
+    channel: Awaited<ReturnType<MessagesService['getChannelForUser']>>,
+    userId: string,
+  ) {
     return channel.server.ownerId === userId;
   }
 
@@ -75,7 +82,9 @@ export class MessagesService {
     const channel = await this.getChannelForUser(channelId, userId);
 
     if (channel.type !== ChannelType.TEXT) {
-      throw new BadRequestException('Сообщения можно отправлять только в текстовый канал');
+      throw new BadRequestException(
+        'Сообщения можно отправлять только в текстовый канал',
+      );
     }
 
     const isOwner = this.isServerOwner(channel, userId);
@@ -89,7 +98,7 @@ export class MessagesService {
       throw new ForbiddenException('В этом канале нельзя отправлять сообщения');
     }
 
-    return this.prisma.message.create({
+    const message = await this.prisma.message.create({
       data: {
         channelId,
         authorId: userId,
@@ -107,6 +116,10 @@ export class MessagesService {
         },
       },
     });
+
+    this.messagesGateway.emitMessageNew(channelId, message);
+
+    return message;
   }
 
   async findByChannel(channelId: string, userId: string) {
@@ -120,7 +133,9 @@ export class MessagesService {
     }
 
     if (channel.type !== ChannelType.TEXT) {
-      throw new BadRequestException('История сообщений есть только у текстовых каналов');
+      throw new BadRequestException(
+        'История сообщений есть только у текстовых каналов',
+      );
     }
 
     return this.prisma.message.findMany({
@@ -175,7 +190,9 @@ export class MessagesService {
     }
 
     if (!isOwner && !permissions.canSendMessages) {
-      throw new ForbiddenException('В этом канале нельзя редактировать сообщения');
+      throw new ForbiddenException(
+        'В этом канале нельзя редактировать сообщения',
+      );
     }
 
     return this.prisma.message.update({

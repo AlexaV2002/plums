@@ -1,6 +1,7 @@
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:socket_io_client/socket_io_client.dart' as io;
 
 void main() {
   runApp(const PlumsApp());
@@ -29,26 +30,20 @@ class PlumsApp extends StatelessWidget {
 
 class ApiClient {
   ApiClient()
-      : dio = Dio(
-          BaseOptions(
-            baseUrl: 'http://localhost:3000',
-            connectTimeout: const Duration(seconds: 5),
-            receiveTimeout: const Duration(seconds: 5),
-            headers: {
-              'Content-Type': 'application/json',
-            },
-          ),
-        );
+    : dio = Dio(
+        BaseOptions(
+          baseUrl: 'http://localhost:3000',
+          connectTimeout: const Duration(seconds: 5),
+          receiveTimeout: const Duration(seconds: 5),
+          headers: {'Content-Type': 'application/json'},
+        ),
+      );
 
   final Dio dio;
   String? accessToken;
 
   Options get authOptions {
-    return Options(
-      headers: {
-        'Authorization': 'Bearer $accessToken',
-      },
-    );
+    return Options(headers: {'Authorization': 'Bearer $accessToken'});
   }
 
   Future<void> register({
@@ -58,11 +53,7 @@ class ApiClient {
   }) async {
     await dio.post(
       '/auth/register',
-      data: {
-        'username': username,
-        'email': email,
-        'password': password,
-      },
+      data: {'username': username, 'email': email, 'password': password},
     );
   }
 
@@ -72,10 +63,7 @@ class ApiClient {
   }) async {
     final response = await dio.post(
       '/auth/login',
-      data: {
-        'email': email,
-        'password': password,
-      },
+      data: {'email': email, 'password': password},
     );
 
     final token = response.data['accessToken'] as String;
@@ -83,17 +71,11 @@ class ApiClient {
 
     final userJson = response.data['user'] as Map<String, dynamic>;
 
-    return LoginResult(
-      accessToken: token,
-      user: AppUser.fromJson(userJson),
-    );
+    return LoginResult(accessToken: token, user: AppUser.fromJson(userJson));
   }
 
   Future<AppUser> getMe() async {
-    final response = await dio.get(
-      '/users/me',
-      options: authOptions,
-    );
+    final response = await dio.get('/users/me', options: authOptions);
 
     return AppUser.fromJson(response.data as Map<String, dynamic>);
   }
@@ -117,10 +99,7 @@ class ApiClient {
   }
 
   Future<List<AppServer>> getServers() async {
-    final response = await dio.get(
-      '/servers',
-      options: authOptions,
-    );
+    final response = await dio.get('/servers', options: authOptions);
 
     final list = response.data as List;
 
@@ -129,23 +108,17 @@ class ApiClient {
         .toList();
   }
 
-  Future<AppServer> createServer({
-    required String name,
-  }) async {
+  Future<AppServer> createServer({required String name}) async {
     final response = await dio.post(
       '/servers',
       options: authOptions,
-      data: {
-        'name': name,
-      },
+      data: {'name': name},
     );
 
     return AppServer.fromJson(response.data as Map<String, dynamic>);
   }
 
-  Future<AppInvite> createInvite({
-    required String serverId,
-  }) async {
+  Future<AppInvite> createInvite({required String serverId}) async {
     final response = await dio.post(
       '/servers/$serverId/invites',
       options: authOptions,
@@ -156,10 +129,7 @@ class ApiClient {
   }
 
   Future<AppInvite> getInvite(String code) async {
-    final response = await dio.get(
-      '/invites/$code',
-      options: authOptions,
-    );
+    final response = await dio.get('/invites/$code', options: authOptions);
 
     return AppInvite.fromJson(response.data as Map<String, dynamic>);
   }
@@ -194,10 +164,7 @@ class ApiClient {
     final response = await dio.post(
       '/servers/$serverId/channels',
       options: authOptions,
-      data: {
-        'name': name,
-        'type': type.toBackend(),
-      },
+      data: {'name': name, 'type': type.toBackend()},
     );
 
     return AppChannel.fromJson(response.data as Map<String, dynamic>);
@@ -210,9 +177,7 @@ class ApiClient {
     final response = await dio.patch(
       '/channels/$channelId',
       options: authOptions,
-      data: {
-        'name': name,
-      },
+      data: {'name': name},
     );
 
     return AppChannel.fromJson(response.data as Map<String, dynamic>);
@@ -231,13 +196,8 @@ class ApiClient {
     return AppChannel.fromJson(response.data as Map<String, dynamic>);
   }
 
-  Future<void> deleteChannel({
-    required String channelId,
-  }) async {
-    await dio.delete(
-      '/channels/$channelId',
-      options: authOptions,
-    );
+  Future<void> deleteChannel({required String channelId}) async {
+    await dio.delete('/channels/$channelId', options: authOptions);
   }
 
   Future<List<AppMessage>> getMessages(String channelId) async {
@@ -260,9 +220,7 @@ class ApiClient {
     final response = await dio.post(
       '/channels/$channelId/messages',
       options: authOptions,
-      data: {
-        'content': content,
-      },
+      data: {'content': content},
     );
 
     return AppMessage.fromJson(response.data as Map<String, dynamic>);
@@ -275,25 +233,58 @@ class ApiClient {
     final response = await dio.patch(
       '/messages/$messageId',
       options: authOptions,
-      data: {
-        'content': content,
-      },
+      data: {'content': content},
     );
 
     return AppMessage.fromJson(response.data as Map<String, dynamic>);
   }
 
-  Future<void> deleteMessage({
-    required String messageId,
-  }) async {
-    await dio.delete(
-      '/messages/$messageId',
-      options: authOptions,
-    );
+  Future<void> deleteMessage({required String messageId}) async {
+    await dio.delete('/messages/$messageId', options: authOptions);
   }
 }
 
 final apiClient = ApiClient();
+
+class RealtimeClient {
+  RealtimeClient() {
+    socket = io.io(
+      'http://localhost:3000',
+      io.OptionBuilder()
+          .setTransports(['websocket'])
+          .disableAutoConnect()
+          .build(),
+    );
+  }
+
+  late final io.Socket socket;
+
+  void connect({required ValueChanged<AppMessage> onMessageNew}) {
+    socket.on('message:new', (data) {
+      if (data is Map) {
+        onMessageNew(AppMessage.fromJson(Map<String, dynamic>.from(data)));
+      }
+    });
+
+    socket.connect();
+  }
+
+  void joinChannel(String channelId) {
+    if (!socket.connected) {
+      socket.connect();
+    }
+
+    socket.emit('channel:join', {'channelId': channelId});
+  }
+
+  void leaveChannel(String channelId) {
+    socket.emit('channel:leave', {'channelId': channelId});
+  }
+
+  void dispose() {
+    socket.dispose();
+  }
+}
 
 /* =========================
    AUTH
@@ -318,22 +309,15 @@ class _AuthGateState extends State<AuthGate> {
   @override
   Widget build(BuildContext context) {
     if (currentUser == null) {
-      return LoginScreen(
-        onLoggedIn: handleLogin,
-      );
+      return LoginScreen(onLoggedIn: handleLogin);
     }
 
-    return MainShell(
-      initialUser: currentUser!,
-    );
+    return MainShell(initialUser: currentUser!);
   }
 }
 
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({
-    super.key,
-    required this.onLoggedIn,
-  });
+  const LoginScreen({super.key, required this.onLoggedIn});
 
   final ValueChanged<AppUser> onLoggedIn;
 
@@ -456,9 +440,7 @@ class _LoginScreenState extends State<LoginScreen> {
           decoration: BoxDecoration(
             color: const Color(0xFF211C29),
             borderRadius: BorderRadius.circular(28),
-            border: Border.all(
-              color: const Color(0xFF342D3F),
-            ),
+            border: Border.all(color: const Color(0xFF342D3F)),
             boxShadow: [
               BoxShadow(
                 color: Colors.black.withOpacity(0.35),
@@ -476,10 +458,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(24),
                   gradient: const LinearGradient(
-                    colors: [
-                      Color(0xFF8D5CFF),
-                      Color(0xFFFF7AC8),
-                    ],
+                    colors: [Color(0xFF8D5CFF), Color(0xFFFF7AC8)],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
@@ -510,10 +489,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     ? 'Создай аккаунт, чтобы начать пользоваться plums'
                     : 'Войди в аккаунт, чтобы открыть свои серверы и каналы',
                 textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: Color(0xFFB8ADC8),
-                  fontSize: 14,
-                ),
+                style: const TextStyle(color: Color(0xFFB8ADC8), fontSize: 14),
               ),
               const SizedBox(height: 26),
               if (isRegisterMode) ...[
@@ -634,15 +610,10 @@ class PlumsTextField extends StatelessWidget {
         TextField(
           controller: controller,
           obscureText: obscureText,
-          style: const TextStyle(
-            color: Color(0xFFF3EEFF),
-            fontSize: 14,
-          ),
+          style: const TextStyle(color: Color(0xFFF3EEFF), fontSize: 14),
           decoration: InputDecoration(
             hintText: hintText,
-            hintStyle: const TextStyle(
-              color: Color(0xFF6F647E),
-            ),
+            hintStyle: const TextStyle(color: Color(0xFF6F647E)),
             filled: true,
             fillColor: const Color(0xFF302A39),
             contentPadding: const EdgeInsets.symmetric(
@@ -651,15 +622,11 @@ class PlumsTextField extends StatelessWidget {
             ),
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(16),
-              borderSide: const BorderSide(
-                color: Color(0xFF40374D),
-              ),
+              borderSide: const BorderSide(color: Color(0xFF40374D)),
             ),
             enabledBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(16),
-              borderSide: const BorderSide(
-                color: Color(0xFF40374D),
-              ),
+              borderSide: const BorderSide(color: Color(0xFF40374D)),
             ),
             focusedBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(16),
@@ -680,10 +647,7 @@ class PlumsTextField extends StatelessWidget {
 ========================= */
 
 class MainShell extends StatefulWidget {
-  const MainShell({
-    super.key,
-    required this.initialUser,
-  });
+  const MainShell({super.key, required this.initialUser});
 
   final AppUser initialUser;
 
@@ -692,6 +656,8 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
+  final realtimeClient = RealtimeClient();
+
   AppUser? currentUser;
   List<AppServer> servers = [];
   List<AppChannel> channels = [];
@@ -699,6 +665,7 @@ class _MainShellState extends State<MainShell> {
 
   String? selectedServerId;
   String? selectedChannelId;
+  String? realtimeChannelId;
 
   bool isLoading = true;
   bool isMessagesLoading = false;
@@ -708,7 +675,48 @@ class _MainShellState extends State<MainShell> {
   void initState() {
     super.initState();
     currentUser = widget.initialUser;
+    realtimeClient.connect(onMessageNew: handleRealtimeMessage);
     loadInitialData();
+  }
+
+  @override
+  void dispose() {
+    realtimeClient.dispose();
+    super.dispose();
+  }
+
+  void handleRealtimeMessage(AppMessage message) {
+    if (!mounted || message.channelId != selectedChannelId) {
+      return;
+    }
+
+    if (messages.any((item) => item.id == message.id)) {
+      return;
+    }
+
+    setState(() {
+      messages = [...messages, message];
+    });
+  }
+
+  void syncRealtimeChannel(AppChannel? channel) {
+    final nextChannelId = channel != null && channel.type == ChannelType.text
+        ? channel.id
+        : null;
+
+    if (realtimeChannelId == nextChannelId) {
+      return;
+    }
+
+    if (realtimeChannelId != null) {
+      realtimeClient.leaveChannel(realtimeChannelId!);
+    }
+
+    realtimeChannelId = nextChannelId;
+
+    if (nextChannelId != null) {
+      realtimeClient.joinChannel(nextChannelId);
+    }
   }
 
   Future<void> loadInitialData() async {
@@ -721,20 +729,22 @@ class _MainShellState extends State<MainShell> {
       final me = await apiClient.getMe();
       final loadedServers = await apiClient.getServers();
 
-      final firstServerId =
-          loadedServers.isNotEmpty ? loadedServers.first.id : null;
+      final firstServerId = loadedServers.isNotEmpty
+          ? loadedServers.first.id
+          : null;
 
       final loadedChannels = firstServerId != null
           ? await apiClient.getChannels(firstServerId)
           : <AppChannel>[];
 
-      final firstChannel =
-          loadedChannels.isNotEmpty ? loadedChannels.first : null;
+      final firstChannel = loadedChannels.isNotEmpty
+          ? loadedChannels.first
+          : null;
 
       final loadedMessages =
           firstChannel != null && firstChannel.type == ChannelType.text
-              ? await apiClient.getMessages(firstChannel.id)
-              : <AppMessage>[];
+          ? await apiClient.getMessages(firstChannel.id)
+          : <AppMessage>[];
 
       setState(() {
         currentUser = me;
@@ -745,6 +755,7 @@ class _MainShellState extends State<MainShell> {
         messages = loadedMessages;
         isLoading = false;
       });
+      syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
       setState(() {
         errorMessage = 'Ошибка загрузки данных: ${error.response?.data}';
@@ -770,13 +781,14 @@ class _MainShellState extends State<MainShell> {
 
     try {
       final loadedChannels = await apiClient.getChannels(serverId);
-      final firstChannel =
-          loadedChannels.isNotEmpty ? loadedChannels.first : null;
+      final firstChannel = loadedChannels.isNotEmpty
+          ? loadedChannels.first
+          : null;
 
       final loadedMessages =
           firstChannel != null && firstChannel.type == ChannelType.text
-              ? await apiClient.getMessages(firstChannel.id)
-              : <AppMessage>[];
+          ? await apiClient.getMessages(firstChannel.id)
+          : <AppMessage>[];
 
       setState(() {
         channels = loadedChannels;
@@ -784,6 +796,7 @@ class _MainShellState extends State<MainShell> {
         messages = loadedMessages;
         isLoading = false;
       });
+      syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
       setState(() {
         errorMessage = 'Ошибка загрузки каналов: ${error.response?.data}';
@@ -814,6 +827,7 @@ class _MainShellState extends State<MainShell> {
       setState(() {
         isMessagesLoading = false;
       });
+      syncRealtimeChannel(null);
       return;
     }
 
@@ -824,6 +838,7 @@ class _MainShellState extends State<MainShell> {
         messages = loadedMessages;
         isMessagesLoading = false;
       });
+      syncRealtimeChannel(channel);
     } on DioException catch (error) {
       setState(() {
         errorMessage = 'Ошибка загрузки сообщений: ${error.response?.data}';
@@ -850,10 +865,11 @@ class _MainShellState extends State<MainShell> {
     );
 
     setState(() {
-      messages = [
-        ...messages,
-        sentMessage,
-      ];
+      if (messages.any((item) => item.id == sentMessage.id)) {
+        return;
+      }
+
+      messages = [...messages, sentMessage];
     });
   }
 
@@ -879,9 +895,7 @@ class _MainShellState extends State<MainShell> {
 
       setState(() {
         messages = messages
-            .map(
-              (item) => item.id == updatedMessage.id ? updatedMessage : item,
-            )
+            .map((item) => item.id == updatedMessage.id ? updatedMessage : item)
             .toList();
       });
     } on DioException catch (error) {
@@ -929,10 +943,7 @@ class _MainShellState extends State<MainShell> {
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(
-        context,
-        'Не удалось удалить сообщение: $error',
-      );
+      showErrorSnackBar(context, 'Не удалось удалить сообщение: $error');
     }
   }
 
@@ -959,17 +970,18 @@ class _MainShellState extends State<MainShell> {
       final loadedChannels = await apiClient.getChannels(server.id);
 
       setState(() {
-        servers = [
-          ...servers,
-          server,
-        ];
+        servers = [...servers, server];
         selectedServerId = server.id;
         channels = loadedChannels;
-        selectedChannelId =
-            loadedChannels.isNotEmpty ? loadedChannels.first.id : null;
+        selectedChannelId = loadedChannels.isNotEmpty
+            ? loadedChannels.first.id
+            : null;
         messages = [];
         isLoading = false;
       });
+      syncRealtimeChannel(
+        loadedChannels.isNotEmpty ? loadedChannels.first : null,
+      );
     } on DioException catch (error) {
       setState(() {
         errorMessage = 'Ошибка создания сервера: ${error.response?.data}';
@@ -1036,12 +1048,13 @@ class _MainShellState extends State<MainShell> {
       final server = await apiClient.joinInvite(code);
       final loadedServers = await apiClient.getServers();
       final loadedChannels = await apiClient.getChannels(server.id);
-      final firstChannel =
-          loadedChannels.isNotEmpty ? loadedChannels.first : null;
+      final firstChannel = loadedChannels.isNotEmpty
+          ? loadedChannels.first
+          : null;
       final loadedMessages =
           firstChannel != null && firstChannel.type == ChannelType.text
-              ? await apiClient.getMessages(firstChannel.id)
-              : <AppMessage>[];
+          ? await apiClient.getMessages(firstChannel.id)
+          : <AppMessage>[];
 
       setState(() {
         servers = loadedServers;
@@ -1051,6 +1064,7 @@ class _MainShellState extends State<MainShell> {
         messages = loadedMessages;
         isLoading = false;
       });
+      syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
       setState(() {
         errorMessage = 'Ошибка вступления на сервер: ${error.response?.data}';
@@ -1076,10 +1090,7 @@ class _MainShellState extends State<MainShell> {
 
       if (!mounted) return;
 
-      await showInviteDialog(
-        context: context,
-        invite: invite,
-      );
+      await showInviteDialog(context: context, invite: invite);
     } on DioException catch (error) {
       if (!mounted) return;
 
@@ -1090,10 +1101,7 @@ class _MainShellState extends State<MainShell> {
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(
-        context,
-        'Не удалось создать приглашение: $error',
-      );
+      showErrorSnackBar(context, 'Не удалось создать приглашение: $error');
     }
   }
 
@@ -1118,10 +1126,7 @@ class _MainShellState extends State<MainShell> {
       );
 
       setState(() {
-        channels = [
-          ...channels,
-          channel,
-        ];
+        channels = [...channels, channel];
         selectedChannelId = channel.id;
         messages = [];
       });
@@ -1139,10 +1144,7 @@ class _MainShellState extends State<MainShell> {
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(
-        context,
-        'Не удалось создать канал: $error',
-      );
+      showErrorSnackBar(context, 'Не удалось создать канал: $error');
     }
   }
 
@@ -1153,10 +1155,7 @@ class _MainShellState extends State<MainShell> {
       return;
     }
 
-    final result = await showEditProfileDialog(
-      context: context,
-      user: user,
-    );
+    final result = await showEditProfileDialog(context: context, user: user);
 
     if (result == null) {
       return;
@@ -1182,10 +1181,7 @@ class _MainShellState extends State<MainShell> {
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(
-        context,
-        'Не удалось обновить профиль: $error',
-      );
+      showErrorSnackBar(context, 'Не удалось обновить профиль: $error');
     }
   }
 
@@ -1226,10 +1222,7 @@ class _MainShellState extends State<MainShell> {
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(
-        context,
-        'Не удалось переименовать канал: $error',
-      );
+      showErrorSnackBar(context, 'Не удалось переименовать канал: $error');
     }
   }
 
@@ -1248,11 +1241,13 @@ class _MainShellState extends State<MainShell> {
     try {
       await apiClient.deleteChannel(channelId: channel.id);
 
-      final remainingChannels =
-          channels.where((item) => item.id != channel.id).toList();
+      final remainingChannels = channels
+          .where((item) => item.id != channel.id)
+          .toList();
 
-      final nextChannel =
-          remainingChannels.isNotEmpty ? remainingChannels.first : null;
+      final nextChannel = remainingChannels.isNotEmpty
+          ? remainingChannels.first
+          : null;
 
       setState(() {
         channels = remainingChannels;
@@ -1273,14 +1268,11 @@ class _MainShellState extends State<MainShell> {
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(
-        context,
-        'Не удалось удалить канал: $error',
-      );
+      showErrorSnackBar(context, 'Не удалось удалить канал: $error');
     }
   }
 
-    Future<void> editChannelPermissions(AppChannel channel) async {
+  Future<void> editChannelPermissions(AppChannel channel) async {
     final result = await showChannelPermissionsDialog(
       context: context,
       channel: channel,
@@ -1313,10 +1305,7 @@ class _MainShellState extends State<MainShell> {
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(
-        context,
-        'Не удалось изменить права канала: $error',
-      );
+      showErrorSnackBar(context, 'Не удалось изменить права канала: $error');
     }
   }
 
@@ -1328,9 +1317,7 @@ class _MainShellState extends State<MainShell> {
       return const Scaffold(
         backgroundColor: Color(0xFF15131A),
         body: Center(
-          child: CircularProgressIndicator(
-            color: Color(0xFF8D5CFF),
-          ),
+          child: CircularProgressIndicator(color: Color(0xFF8D5CFF)),
         ),
       );
     }
@@ -1361,15 +1348,15 @@ class _MainShellState extends State<MainShell> {
           )
         : null;
 
-    final selectedChannel =
-        channels.isNotEmpty && selectedChannelId != null
-            ? channels.firstWhere(
-                (channel) => channel.id == selectedChannelId,
-                orElse: () => channels.first,
-              )
-            : null;
+    final selectedChannel = channels.isNotEmpty && selectedChannelId != null
+        ? channels.firstWhere(
+            (channel) => channel.id == selectedChannelId,
+            orElse: () => channels.first,
+          )
+        : null;
     final canManageChannels = selectedServer?.ownerId == user.id;
-    final canSendMessages = selectedChannel == null ||
+    final canSendMessages =
+        selectedChannel == null ||
         canManageChannels ||
         selectedChannel.resolvedPermissions.canSendMessages;
 
@@ -1446,11 +1433,7 @@ class ServersSidebar extends StatelessWidget {
           const SizedBox(height: 14),
           const PlumsLogoButton(),
           const SizedBox(height: 12),
-          Container(
-            width: 44,
-            height: 1,
-            color: const Color(0xFF2B2633),
-          ),
+          Container(width: 44, height: 1, color: const Color(0xFF2B2633)),
           const SizedBox(height: 12),
           Expanded(
             child: ListView.separated(
@@ -1499,10 +1482,7 @@ class PlumsLogoButton extends StatelessWidget {
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(18),
         gradient: const LinearGradient(
-          colors: [
-            Color(0xFF8D5CFF),
-            Color(0xFFFF7AC8),
-          ],
+          colors: [Color(0xFF8D5CFF), Color(0xFFFF7AC8)],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
@@ -1665,10 +1645,7 @@ class ChannelsPanel extends StatelessWidget {
               ],
             ),
           ),
-          UserPanel(
-            user: currentUser,
-            onEditProfile: onEditProfile,
-          ),
+          UserPanel(user: currentUser, onEditProfile: onEditProfile),
         ],
       ),
     );
@@ -1694,12 +1671,7 @@ class ServerHeader extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 16),
       decoration: const BoxDecoration(
         color: Color(0xFF1D1925),
-        border: Border(
-          bottom: BorderSide(
-            color: Color(0xFF2B2633),
-            width: 1,
-          ),
-        ),
+        border: Border(bottom: BorderSide(color: Color(0xFF2B2633), width: 1)),
       ),
       child: Row(
         children: [
@@ -1735,11 +1707,7 @@ class ServerHeader extends StatelessWidget {
 }
 
 class ChannelSectionHeader extends StatelessWidget {
-  const ChannelSectionHeader({
-    super.key,
-    required this.title,
-    this.onAdd,
-  });
+  const ChannelSectionHeader({super.key, required this.title, this.onAdd});
 
   final String title;
   final VoidCallback? onAdd;
@@ -1764,11 +1732,7 @@ class ChannelSectionHeader extends StatelessWidget {
             borderRadius: BorderRadius.circular(8),
             child: const Padding(
               padding: EdgeInsets.all(4),
-              child: Icon(
-                Icons.add,
-                size: 16,
-                color: Color(0xFF8F849F),
-              ),
+              child: Icon(Icons.add, size: 16, color: Color(0xFF8F849F)),
             ),
           ),
       ],
@@ -1888,11 +1852,7 @@ class ChannelTile extends StatelessWidget {
 ========================= */
 
 class UserPanel extends StatelessWidget {
-  const UserPanel({
-    super.key,
-    required this.user,
-    required this.onEditProfile,
-  });
+  const UserPanel({super.key, required this.user, required this.onEditProfile});
 
   final AppUser user;
   final VoidCallback onEditProfile;
@@ -2041,16 +2001,16 @@ class ChatArea extends StatelessWidget {
           Expanded(
             child: channel.type == ChannelType.text
                 ? isMessagesLoading
-                    ? const Center(
-                        child: CircularProgressIndicator(
-                          color: Color(0xFF8D5CFF),
-                        ),
-                      )
-                    : MessagesList(
-                        messages: messages,
-                        onEditMessage: onEditMessage,
-                        onDeleteMessage: onDeleteMessage,
-                      )
+                      ? const Center(
+                          child: CircularProgressIndicator(
+                            color: Color(0xFF8D5CFF),
+                          ),
+                        )
+                      : MessagesList(
+                          messages: messages,
+                          onEditMessage: onEditMessage,
+                          onDeleteMessage: onDeleteMessage,
+                        )
                 : const VoiceChannelPlaceholder(),
           ),
           if (channel.type == ChannelType.text)
@@ -2066,10 +2026,7 @@ class ChatArea extends StatelessWidget {
 }
 
 class ChatHeader extends StatelessWidget {
-  const ChatHeader({
-    super.key,
-    required this.channel,
-  });
+  const ChatHeader({super.key, required this.channel});
 
   final AppChannel channel;
 
@@ -2084,20 +2041,11 @@ class ChatHeader extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 20),
       decoration: const BoxDecoration(
         color: Color(0xFF241F2D),
-        border: Border(
-          bottom: BorderSide(
-            color: Color(0xFF312A3B),
-            width: 1,
-          ),
-        ),
+        border: Border(bottom: BorderSide(color: Color(0xFF312A3B), width: 1)),
       ),
       child: Row(
         children: [
-          Icon(
-            icon,
-            color: const Color(0xFFCFC4E8),
-            size: 20,
-          ),
+          Icon(icon, color: const Color(0xFFCFC4E8), size: 20),
           const SizedBox(width: 10),
           Text(
             channel.name,
@@ -2108,20 +2056,13 @@ class ChatHeader extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 12),
-          Container(
-            width: 1,
-            height: 22,
-            color: const Color(0xFF3A3245),
-          ),
+          Container(width: 1, height: 22, color: const Color(0xFF3A3245)),
           const SizedBox(width: 12),
           Text(
             channel.type == ChannelType.text
                 ? 'Текстовый канал'
                 : 'Голосовой канал',
-            style: const TextStyle(
-              color: Color(0xFF8F849F),
-              fontSize: 13,
-            ),
+            style: const TextStyle(color: Color(0xFF8F849F), fontSize: 13),
           ),
           const Spacer(),
           IconButton(
@@ -2232,9 +2173,7 @@ class MessageBubble extends StatelessWidget {
               decoration: BoxDecoration(
                 color: const Color(0xFF282230),
                 borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                  color: const Color(0xFF342D3F),
-                ),
+                border: Border.all(color: const Color(0xFF342D3F)),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -2346,9 +2285,7 @@ class _MessageInputState extends State<MessageInput> {
       controller.clear();
     } catch (_) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Не удалось отправить сообщение'),
-        ),
+        const SnackBar(content: Text('Не удалось отправить сообщение')),
       );
     } finally {
       if (mounted) {
@@ -2365,16 +2302,12 @@ class _MessageInputState extends State<MessageInput> {
       padding: const EdgeInsets.fromLTRB(22, 12, 22, 22),
       color: const Color(0xFF211C29),
       child: Container(
-        constraints: const BoxConstraints(
-          minHeight: 54,
-        ),
+        constraints: const BoxConstraints(minHeight: 54),
         padding: const EdgeInsets.symmetric(horizontal: 14),
         decoration: BoxDecoration(
           color: const Color(0xFF302A39),
           borderRadius: BorderRadius.circular(18),
-          border: Border.all(
-            color: const Color(0xFF40374D),
-          ),
+          border: Border.all(color: const Color(0xFF40374D)),
         ),
         child: Row(
           children: [
@@ -2389,25 +2322,21 @@ class _MessageInputState extends State<MessageInput> {
                 controller: controller,
                 enabled: widget.canSendMessages && !isSending,
                 onSubmitted: (_) => submitMessage(),
-                style: const TextStyle(
-                  color: Color(0xFFF3EEFF),
-                  fontSize: 14,
-                ),
+                style: const TextStyle(color: Color(0xFFF3EEFF), fontSize: 14),
                 decoration: InputDecoration(
                   hintText: widget.canSendMessages
                       ? 'Написать в #${widget.channelName}'
                       : 'Нет прав писать в этот канал',
-                  hintStyle: const TextStyle(
-                    color: Color(0xFF8F849F),
-                  ),
+                  hintStyle: const TextStyle(color: Color(0xFF8F849F)),
                   border: InputBorder.none,
                 ),
               ),
             ),
             IconButton(
               tooltip: 'Отправить',
-              onPressed:
-                  widget.canSendMessages && !isSending ? submitMessage : null,
+              onPressed: widget.canSendMessages && !isSending
+                  ? submitMessage
+                  : null,
               icon: isSending
                   ? const SizedBox(
                       width: 18,
@@ -2439,18 +2368,12 @@ class VoiceChannelPlaceholder extends StatelessWidget {
         decoration: BoxDecoration(
           color: const Color(0xFF282230),
           borderRadius: BorderRadius.circular(24),
-          border: Border.all(
-            color: const Color(0xFF3A3245),
-          ),
+          border: Border.all(color: const Color(0xFF3A3245)),
         ),
         child: const Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              Icons.volume_up_rounded,
-              size: 42,
-              color: Color(0xFFBFA7FF),
-            ),
+            Icon(Icons.volume_up_rounded, size: 42, color: Color(0xFFBFA7FF)),
             SizedBox(height: 16),
             Text(
               'Голосовой канал',
@@ -2512,9 +2435,7 @@ Future<String?> showTextDialog({
                     onPressed: () => Navigator.pop(context),
                     style: OutlinedButton.styleFrom(
                       foregroundColor: const Color(0xFFB8ADC8),
-                      side: const BorderSide(
-                        color: Color(0xFF40374D),
-                      ),
+                      side: const BorderSide(color: Color(0xFF40374D)),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14),
                       ),
@@ -2582,9 +2503,7 @@ Future<void> showInviteDialog({
               decoration: BoxDecoration(
                 color: const Color(0xFF302A39),
                 borderRadius: BorderRadius.circular(14),
-                border: Border.all(
-                  color: const Color(0xFF40374D),
-                ),
+                border: Border.all(color: const Color(0xFF40374D)),
               ),
               child: SelectableText(
                 invite.code,
@@ -2603,16 +2522,12 @@ Future<void> showInviteDialog({
                 Expanded(
                   child: OutlinedButton(
                     onPressed: () {
-                      Clipboard.setData(
-                        ClipboardData(text: invite.code),
-                      );
+                      Clipboard.setData(ClipboardData(text: invite.code));
                       Navigator.pop(context);
                     },
                     style: OutlinedButton.styleFrom(
                       foregroundColor: const Color(0xFFB8ADC8),
-                      side: const BorderSide(
-                        color: Color(0xFF40374D),
-                      ),
+                      side: const BorderSide(color: Color(0xFF40374D)),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14),
                       ),
@@ -2624,9 +2539,7 @@ Future<void> showInviteDialog({
                 Expanded(
                   child: ElevatedButton(
                     onPressed: () {
-                      Clipboard.setData(
-                        ClipboardData(text: inviteUrl),
-                      );
+                      Clipboard.setData(ClipboardData(text: inviteUrl));
                       Navigator.pop(context);
                     },
                     style: ElevatedButton.styleFrom(
@@ -2738,9 +2651,7 @@ Future<CreateChannelResult?> showCreateChannelDialog({
                         onPressed: () => Navigator.pop(context),
                         style: OutlinedButton.styleFrom(
                           foregroundColor: const Color(0xFFB8ADC8),
-                          side: const BorderSide(
-                            color: Color(0xFF40374D),
-                          ),
+                          side: const BorderSide(color: Color(0xFF40374D)),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(14),
                           ),
@@ -2760,10 +2671,7 @@ Future<CreateChannelResult?> showCreateChannelDialog({
 
                           Navigator.pop(
                             context,
-                            CreateChannelResult(
-                              name: name,
-                              type: selectedType,
-                            ),
+                            CreateChannelResult(name: name, type: selectedType),
                           );
                         },
                         style: ElevatedButton.styleFrom(
@@ -2823,9 +2731,7 @@ Future<bool?> showConfirmDialog({
                     onPressed: () => Navigator.pop(context, false),
                     style: OutlinedButton.styleFrom(
                       foregroundColor: const Color(0xFFB8ADC8),
-                      side: const BorderSide(
-                        color: Color(0xFF40374D),
-                      ),
+                      side: const BorderSide(color: Color(0xFF40374D)),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14),
                       ),
@@ -2912,18 +2818,9 @@ Future<EditProfileResult?> showEditProfileDialog({
                     fontSize: 14,
                   ),
                   items: const [
-                    DropdownMenuItem(
-                      value: 'ONLINE',
-                      child: Text('ONLINE'),
-                    ),
-                    DropdownMenuItem(
-                      value: 'OFFLINE',
-                      child: Text('OFFLINE'),
-                    ),
-                    DropdownMenuItem(
-                      value: 'AWAY',
-                      child: Text('AWAY'),
-                    ),
+                    DropdownMenuItem(value: 'ONLINE', child: Text('ONLINE')),
+                    DropdownMenuItem(value: 'OFFLINE', child: Text('OFFLINE')),
+                    DropdownMenuItem(value: 'AWAY', child: Text('AWAY')),
                     DropdownMenuItem(
                       value: 'DO_NOT_DISTURB',
                       child: Text('DO_NOT_DISTURB'),
@@ -2944,9 +2841,7 @@ Future<EditProfileResult?> showEditProfileDialog({
                         onPressed: () => Navigator.pop(context),
                         style: OutlinedButton.styleFrom(
                           foregroundColor: const Color(0xFFB8ADC8),
-                          side: const BorderSide(
-                            color: Color(0xFF40374D),
-                          ),
+                          side: const BorderSide(color: Color(0xFF40374D)),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(14),
                           ),
@@ -3032,7 +2927,8 @@ Future<ChannelPermissions?> showChannelPermissionsDialog({
                 ),
                 PermissionSwitchTile(
                   title: 'Писать сообщения',
-                  subtitle: 'Для текстовых каналов: можно отправлять сообщения.',
+                  subtitle:
+                      'Для текстовых каналов: можно отправлять сообщения.',
                   value: canSendMessages,
                   onChanged: (value) {
                     setDialogState(() {
@@ -3042,7 +2938,8 @@ Future<ChannelPermissions?> showChannelPermissionsDialog({
                 ),
                 PermissionSwitchTile(
                   title: 'Подключаться',
-                  subtitle: 'Для голосовых каналов: можно подключаться к каналу.',
+                  subtitle:
+                      'Для голосовых каналов: можно подключаться к каналу.',
                   value: canConnect,
                   onChanged: (value) {
                     setDialogState(() {
@@ -3058,9 +2955,7 @@ Future<ChannelPermissions?> showChannelPermissionsDialog({
                         onPressed: () => Navigator.pop(context),
                         style: OutlinedButton.styleFrom(
                           foregroundColor: const Color(0xFFB8ADC8),
-                          side: const BorderSide(
-                            color: Color(0xFF40374D),
-                          ),
+                          side: const BorderSide(color: Color(0xFF40374D)),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(14),
                           ),
@@ -3148,13 +3043,8 @@ class PermissionSwitchTile extends StatelessWidget {
   }
 }
 
-
 class PlumsDialog extends StatelessWidget {
-  const PlumsDialog({
-    super.key,
-    required this.title,
-    required this.child,
-  });
+  const PlumsDialog({super.key, required this.title, required this.child});
 
   final String title;
   final Widget child;
@@ -3169,9 +3059,7 @@ class PlumsDialog extends StatelessWidget {
         decoration: BoxDecoration(
           color: const Color(0xFF211C29),
           borderRadius: BorderRadius.circular(24),
-          border: Border.all(
-            color: const Color(0xFF342D3F),
-          ),
+          border: Border.all(color: const Color(0xFF342D3F)),
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -3194,11 +3082,7 @@ class PlumsDialog extends StatelessWidget {
 }
 
 void showErrorSnackBar(BuildContext context, String message) {
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(
-      content: Text(message),
-    ),
-  );
+  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
 }
 
 /* =========================
@@ -3206,10 +3090,7 @@ void showErrorSnackBar(BuildContext context, String message) {
 ========================= */
 
 class LoginResult {
-  const LoginResult({
-    required this.accessToken,
-    required this.user,
-  });
+  const LoginResult({required this.accessToken, required this.user});
 
   final String accessToken;
   final AppUser user;
@@ -3308,10 +3189,7 @@ class AppInvite {
   }
 }
 
-enum ChannelType {
-  text,
-  voice,
-}
+enum ChannelType { text, voice }
 
 extension ChannelTypeX on ChannelType {
   static ChannelType fromBackend(String value) {
@@ -3463,10 +3341,7 @@ class AppMessage {
 }
 
 class CreateChannelResult {
-  const CreateChannelResult({
-    required this.name,
-    required this.type,
-  });
+  const CreateChannelResult({required this.name, required this.type});
 
   final String name;
   final ChannelType type;
