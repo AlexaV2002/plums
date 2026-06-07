@@ -1,5 +1,6 @@
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 void main() {
   runApp(const PlumsApp());
@@ -137,6 +138,36 @@ class ApiClient {
       data: {
         'name': name,
       },
+    );
+
+    return AppServer.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<AppInvite> createInvite({
+    required String serverId,
+  }) async {
+    final response = await dio.post(
+      '/servers/$serverId/invites',
+      options: authOptions,
+      data: {},
+    );
+
+    return AppInvite.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<AppInvite> getInvite(String code) async {
+    final response = await dio.get(
+      '/invites/$code',
+      options: authOptions,
+    );
+
+    return AppInvite.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<AppServer> joinInvite(String code) async {
+    final response = await dio.post(
+      '/invites/$code/join',
+      options: authOptions,
     );
 
     return AppServer.fromJson(response.data as Map<String, dynamic>);
@@ -952,6 +983,120 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
+  String parseInviteCode(String input) {
+    final trimmed = input.trim();
+
+    if (trimmed.isEmpty) {
+      return '';
+    }
+
+    final uri = Uri.tryParse(trimmed);
+
+    if (uri != null && uri.pathSegments.isNotEmpty) {
+      final segments = uri.pathSegments;
+      final invitesIndex = segments.indexOf('invites');
+
+      if (invitesIndex >= 0 && invitesIndex + 1 < segments.length) {
+        return segments[invitesIndex + 1];
+      }
+
+      return segments.last == 'join' && segments.length >= 2
+          ? segments[segments.length - 2]
+          : segments.last;
+    }
+
+    return trimmed;
+  }
+
+  Future<void> joinServerByInvite() async {
+    final input = await showTextDialog(
+      context: context,
+      title: 'Вступить на сервер',
+      label: 'Код или ссылка приглашения',
+      hintText: 'GWNqgkBdN54',
+      confirmText: 'Вступить',
+    );
+
+    if (input == null || input.trim().isEmpty) {
+      return;
+    }
+
+    final code = parseInviteCode(input);
+
+    if (code.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      isLoading = true;
+      errorMessage = null;
+    });
+
+    try {
+      final server = await apiClient.joinInvite(code);
+      final loadedServers = await apiClient.getServers();
+      final loadedChannels = await apiClient.getChannels(server.id);
+      final firstChannel =
+          loadedChannels.isNotEmpty ? loadedChannels.first : null;
+      final loadedMessages =
+          firstChannel != null && firstChannel.type == ChannelType.text
+              ? await apiClient.getMessages(firstChannel.id)
+              : <AppMessage>[];
+
+      setState(() {
+        servers = loadedServers;
+        selectedServerId = server.id;
+        channels = loadedChannels;
+        selectedChannelId = firstChannel?.id;
+        messages = loadedMessages;
+        isLoading = false;
+      });
+    } on DioException catch (error) {
+      setState(() {
+        errorMessage = 'Ошибка вступления на сервер: ${error.response?.data}';
+        isLoading = false;
+      });
+    } catch (error) {
+      setState(() {
+        errorMessage = 'Не удалось вступить на сервер: $error';
+        isLoading = false;
+      });
+    }
+  }
+
+  Future<void> createInvite() async {
+    final serverId = selectedServerId;
+
+    if (serverId == null) {
+      return;
+    }
+
+    try {
+      final invite = await apiClient.createInvite(serverId: serverId);
+
+      if (!mounted) return;
+
+      await showInviteDialog(
+        context: context,
+        invite: invite,
+      );
+    } on DioException catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        'Ошибка создания приглашения: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        'Не удалось создать приглашение: $error',
+      );
+    }
+  }
+
   Future<void> createChannel() async {
     final serverId = selectedServerId;
 
@@ -1236,6 +1381,7 @@ class _MainShellState extends State<MainShell> {
             selectedServerId: selectedServerId,
             onServerSelected: selectServer,
             onCreateServer: createServer,
+            onJoinServer: joinServerByInvite,
           ),
           ChannelsPanel(
             serverName: selectedServer?.name ?? 'Нет серверов',
@@ -1248,6 +1394,7 @@ class _MainShellState extends State<MainShell> {
             onEditChannel: renameChannel,
             onDeleteChannel: deleteChannel,
             onEditChannelPermissions: editChannelPermissions,
+            onCreateInvite: createInvite,
             onEditProfile: editProfile,
           ),
           Expanded(
@@ -1280,12 +1427,14 @@ class ServersSidebar extends StatelessWidget {
     required this.selectedServerId,
     required this.onServerSelected,
     required this.onCreateServer,
+    required this.onJoinServer,
   });
 
   final List<AppServer> servers;
   final String? selectedServerId;
   final ValueChanged<String> onServerSelected;
   final VoidCallback onCreateServer;
+  final VoidCallback onJoinServer;
 
   @override
   Widget build(BuildContext context) {
@@ -1325,6 +1474,12 @@ class ServersSidebar extends StatelessWidget {
             onPressed: onCreateServer,
             icon: const Icon(Icons.add),
             color: const Color(0xFFBFA7FF),
+          ),
+          IconButton(
+            tooltip: 'Вступить по приглашению',
+            onPressed: onJoinServer,
+            icon: const Icon(Icons.login_rounded),
+            color: const Color(0xFFB8ADC8),
           ),
           const SizedBox(height: 12),
         ],
@@ -1435,6 +1590,7 @@ class ChannelsPanel extends StatelessWidget {
     required this.onEditChannel,
     required this.onDeleteChannel,
     required this.onEditChannelPermissions,
+    required this.onCreateInvite,
     required this.onEditProfile,
   });
 
@@ -1448,6 +1604,7 @@ class ChannelsPanel extends StatelessWidget {
   final ValueChanged<AppChannel> onEditChannel;
   final ValueChanged<AppChannel> onDeleteChannel;
   final ValueChanged<AppChannel> onEditChannelPermissions;
+  final VoidCallback onCreateInvite;
   final VoidCallback onEditProfile;
 
   @override
@@ -1465,7 +1622,11 @@ class ChannelsPanel extends StatelessWidget {
       color: const Color(0xFF191620),
       child: Column(
         children: [
-          ServerHeader(serverName: serverName),
+          ServerHeader(
+            serverName: serverName,
+            canCreateInvite: canManageChannels,
+            onCreateInvite: onCreateInvite,
+          ),
           Expanded(
             child: ListView(
               padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
@@ -1518,9 +1679,13 @@ class ServerHeader extends StatelessWidget {
   const ServerHeader({
     super.key,
     required this.serverName,
+    required this.canCreateInvite,
+    required this.onCreateInvite,
   });
 
   final String serverName;
+  final bool canCreateInvite;
+  final VoidCallback onCreateInvite;
 
   @override
   Widget build(BuildContext context) {
@@ -1550,6 +1715,13 @@ class ServerHeader extends StatelessWidget {
               ),
             ),
           ),
+          if (canCreateInvite)
+            IconButton(
+              tooltip: 'Создать приглашение',
+              onPressed: onCreateInvite,
+              icon: const Icon(Icons.link_rounded),
+              color: const Color(0xFFBFA7FF),
+            ),
           IconButton(
             tooltip: 'Настройки сервера',
             onPressed: () {},
@@ -2380,6 +2552,118 @@ Future<String?> showTextDialog({
   );
 }
 
+Future<void> showInviteDialog({
+  required BuildContext context,
+  required AppInvite invite,
+}) {
+  final inviteUrl = 'http://localhost:3000/invites/${invite.code}';
+
+  return showDialog<void>(
+    context: context,
+    builder: (context) {
+      return PlumsDialog(
+        title: 'Приглашение создано',
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              invite.server?.name ?? 'Сервер',
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Color(0xFFB8ADC8),
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF302A39),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: const Color(0xFF40374D),
+                ),
+              ),
+              child: SelectableText(
+                invite.code,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Color(0xFFF3EEFF),
+                  fontSize: 16,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.4,
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () {
+                      Clipboard.setData(
+                        ClipboardData(text: invite.code),
+                      );
+                      Navigator.pop(context);
+                    },
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFFB8ADC8),
+                      side: const BorderSide(
+                        color: Color(0xFF40374D),
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    child: const Text('Копировать код'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: () {
+                      Clipboard.setData(
+                        ClipboardData(text: inviteUrl),
+                      );
+                      Navigator.pop(context);
+                    },
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF8D5CFF),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    child: const Text(
+                      'Копировать ссылку',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text(
+                'Закрыть',
+                style: TextStyle(
+                  color: Color(0xFFBFA7FF),
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    },
+  );
+}
+
 Future<CreateChannelResult?> showCreateChannelDialog({
   required BuildContext context,
 }) {
@@ -2987,6 +3271,39 @@ class AppServer {
       name: json['name'] as String,
       iconUrl: json['iconUrl'] as String?,
       ownerId: json['ownerId'] as String?,
+    );
+  }
+}
+
+class AppInvite {
+  const AppInvite({
+    required this.id,
+    required this.code,
+    this.expiresAt,
+    this.maxUses,
+    this.currentUses = 0,
+    this.server,
+  });
+
+  final String id;
+  final String code;
+  final String? expiresAt;
+  final int? maxUses;
+  final int currentUses;
+  final AppServer? server;
+
+  factory AppInvite.fromJson(Map<String, dynamic> json) {
+    final serverJson = json['server'];
+
+    return AppInvite(
+      id: json['id'] as String,
+      code: json['code'] as String,
+      expiresAt: json['expiresAt'] as String?,
+      maxUses: json['maxUses'] as int?,
+      currentUses: json['currentUses'] as int? ?? 0,
+      server: serverJson is Map<String, dynamic>
+          ? AppServer.fromJson(serverJson)
+          : null,
     );
   }
 }
