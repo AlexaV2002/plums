@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AuthModule } from './auth/auth.module';
 import { ChannelsModule } from './channels/channels.module';
+import { InvitesModule } from './invites/invites.module';
 import { MessagesModule } from './messages/messages.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ServersModule } from './servers/servers.module';
@@ -18,6 +19,7 @@ import { UsersModule } from './users/users.module';
     ServersModule,
     ChannelsModule,
     MessagesModule,
+    InvitesModule,
   ],
 })
 export class AppModule {}

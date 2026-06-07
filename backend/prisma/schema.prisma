@@ -32,6 +32,7 @@ model User {
   ownedServers Server[]       @relation("ServerOwner")
   memberships  ServerMember[]
   messages     Message[]
+  createdInvites Invite[]     @relation("InviteCreator")
 
   @@map("users")
 }
@@ -47,6 +48,7 @@ model Server {
   owner    User           @relation("ServerOwner", fields: [ownerId], references: [id], onDelete: Cascade)
   members  ServerMember[]
   channels Channel[]
+  invites  Invite[]
 
   @@map("servers")
 }
@@ -93,4 +95,20 @@ model Message {
   author  User    @relation(fields: [authorId], references: [id], onDelete: Cascade)
 
   @@map("messages")
+}
+
+model Invite {
+  id          String    @id @default(uuid())
+  serverId    String
+  code        String    @unique
+  createdBy   String
+  expiresAt   DateTime?
+  maxUses     Int?
+  currentUses Int       @default(0)
+  createdAt   DateTime  @default(now())
+
+  server  Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  creator User   @relation("InviteCreator", fields: [createdBy], references: [id], onDelete: Cascade)
+
+  @@map("invites")
 }
