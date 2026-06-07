@@ -1223,6 +1223,10 @@ class _MainShellState extends State<MainShell> {
                 orElse: () => channels.first,
               )
             : null;
+    final canManageChannels = selectedServer?.ownerId == user.id;
+    final canSendMessages = selectedChannel == null ||
+        canManageChannels ||
+        selectedChannel.resolvedPermissions.canSendMessages;
 
     return Scaffold(
       body: Row(
@@ -1238,6 +1242,7 @@ class _MainShellState extends State<MainShell> {
             channels: channels,
             selectedChannelId: selectedChannelId,
             currentUser: user,
+            canManageChannels: canManageChannels,
             onChannelSelected: selectChannel,
             onCreateChannel: createChannel,
             onEditChannel: renameChannel,
@@ -1252,6 +1257,7 @@ class _MainShellState extends State<MainShell> {
                     channel: selectedChannel,
                     messages: messages,
                     isMessagesLoading: isMessagesLoading,
+                    canSendMessages: canSendMessages,
                     onSendMessage: sendMessage,
                     onEditMessage: editMessage,
                     onDeleteMessage: deleteMessage,
@@ -1423,6 +1429,7 @@ class ChannelsPanel extends StatelessWidget {
     required this.channels,
     required this.selectedChannelId,
     required this.currentUser,
+    required this.canManageChannels,
     required this.onChannelSelected,
     required this.onCreateChannel,
     required this.onEditChannel,
@@ -1435,6 +1442,7 @@ class ChannelsPanel extends StatelessWidget {
   final List<AppChannel> channels;
   final String? selectedChannelId;
   final AppUser currentUser;
+  final bool canManageChannels;
   final ValueChanged<String> onChannelSelected;
   final VoidCallback onCreateChannel;
   final ValueChanged<AppChannel> onEditChannel;
@@ -1464,7 +1472,7 @@ class ChannelsPanel extends StatelessWidget {
               children: [
                 ChannelSectionHeader(
                   title: 'Текстовые каналы',
-                  onAdd: onCreateChannel,
+                  onAdd: canManageChannels ? onCreateChannel : null,
                 ),
                 const SizedBox(height: 6),
                 for (final channel in textChannels)
@@ -1475,11 +1483,12 @@ class ChannelsPanel extends StatelessWidget {
                     onEdit: () => onEditChannel(channel),
                     onDelete: () => onDeleteChannel(channel),
                     onPermissions: () => onEditChannelPermissions(channel),
+                    canManageChannel: canManageChannels,
                   ),
                 const SizedBox(height: 18),
                 ChannelSectionHeader(
                   title: 'Голосовые каналы',
-                  onAdd: onCreateChannel,
+                  onAdd: canManageChannels ? onCreateChannel : null,
                 ),
                 const SizedBox(height: 6),
                 for (final channel in voiceChannels)
@@ -1490,6 +1499,7 @@ class ChannelsPanel extends StatelessWidget {
                     onEdit: () => onEditChannel(channel),
                     onDelete: () => onDeleteChannel(channel),
                     onPermissions: () => onEditChannelPermissions(channel),
+                    canManageChannel: canManageChannels,
                   ),
               ],
             ),
@@ -1556,11 +1566,11 @@ class ChannelSectionHeader extends StatelessWidget {
   const ChannelSectionHeader({
     super.key,
     required this.title,
-    required this.onAdd,
+    this.onAdd,
   });
 
   final String title;
-  final VoidCallback onAdd;
+  final VoidCallback? onAdd;
 
   @override
   Widget build(BuildContext context) {
@@ -1576,18 +1586,19 @@ class ChannelSectionHeader extends StatelessWidget {
           ),
         ),
         const Spacer(),
-        InkWell(
-          onTap: onAdd,
-          borderRadius: BorderRadius.circular(8),
-          child: const Padding(
-            padding: EdgeInsets.all(4),
-            child: Icon(
-              Icons.add,
-              size: 16,
-              color: Color(0xFF8F849F),
+        if (onAdd != null)
+          InkWell(
+            onTap: onAdd,
+            borderRadius: BorderRadius.circular(8),
+            child: const Padding(
+              padding: EdgeInsets.all(4),
+              child: Icon(
+                Icons.add,
+                size: 16,
+                color: Color(0xFF8F849F),
+              ),
             ),
           ),
-        ),
       ],
     );
   }
@@ -1602,6 +1613,7 @@ class ChannelTile extends StatelessWidget {
     required this.onEdit,
     required this.onDelete,
     required this.onPermissions,
+    required this.canManageChannel,
   });
 
   final AppChannel channel;
@@ -1610,6 +1622,7 @@ class ChannelTile extends StatelessWidget {
   final VoidCallback onEdit;
   final VoidCallback onDelete;
   final VoidCallback onPermissions;
+  final bool canManageChannel;
 
   @override
   Widget build(BuildContext context) {
@@ -1652,7 +1665,7 @@ class ChannelTile extends StatelessWidget {
                   ),
                 ),
               ),
-              if (isSelected) ...[
+              if (isSelected && canManageChannel) ...[
                 const SizedBox(width: 6),
                 IconButton(
                   tooltip: 'Права канала',
@@ -1832,6 +1845,7 @@ class ChatArea extends StatelessWidget {
     required this.channel,
     required this.messages,
     required this.isMessagesLoading,
+    required this.canSendMessages,
     required this.onSendMessage,
     required this.onEditMessage,
     required this.onDeleteMessage,
@@ -1840,6 +1854,7 @@ class ChatArea extends StatelessWidget {
   final AppChannel channel;
   final List<AppMessage> messages;
   final bool isMessagesLoading;
+  final bool canSendMessages;
   final Future<void> Function(String content) onSendMessage;
   final ValueChanged<AppMessage> onEditMessage;
   final ValueChanged<AppMessage> onDeleteMessage;
@@ -1869,6 +1884,7 @@ class ChatArea extends StatelessWidget {
           if (channel.type == ChannelType.text)
             MessageInput(
               channelName: channel.name,
+              canSendMessages: canSendMessages,
               onSendMessage: onSendMessage,
             ),
         ],
@@ -2120,10 +2136,12 @@ class MessageInput extends StatefulWidget {
   const MessageInput({
     super.key,
     required this.channelName,
+    required this.canSendMessages,
     required this.onSendMessage,
   });
 
   final String channelName;
+  final bool canSendMessages;
   final Future<void> Function(String content) onSendMessage;
 
   @override
@@ -2143,7 +2161,7 @@ class _MessageInputState extends State<MessageInput> {
   Future<void> submitMessage() async {
     final text = controller.text.trim();
 
-    if (text.isEmpty || isSending) {
+    if (!widget.canSendMessages || text.isEmpty || isSending) {
       return;
     }
 
@@ -2197,14 +2215,16 @@ class _MessageInputState extends State<MessageInput> {
             Expanded(
               child: TextField(
                 controller: controller,
-                enabled: !isSending,
+                enabled: widget.canSendMessages && !isSending,
                 onSubmitted: (_) => submitMessage(),
                 style: const TextStyle(
                   color: Color(0xFFF3EEFF),
                   fontSize: 14,
                 ),
                 decoration: InputDecoration(
-                  hintText: 'Написать в #${widget.channelName}',
+                  hintText: widget.canSendMessages
+                      ? 'Написать в #${widget.channelName}'
+                      : 'Нет прав писать в этот канал',
                   hintStyle: const TextStyle(
                     color: Color(0xFF8F849F),
                   ),
@@ -2214,7 +2234,8 @@ class _MessageInputState extends State<MessageInput> {
             ),
             IconButton(
               tooltip: 'Отправить',
-              onPressed: isSending ? null : submitMessage,
+              onPressed:
+                  widget.canSendMessages && !isSending ? submitMessage : null,
               icon: isSending
                   ? const SizedBox(
                       width: 18,
