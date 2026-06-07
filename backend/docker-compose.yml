@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: plums_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: plums_user
+      POSTGRES_PASSWORD: plums_password
+      POSTGRES_DB: plums_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - plums_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  plums_postgres_data:
