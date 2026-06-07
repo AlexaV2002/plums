@@ -8,6 +8,12 @@ import { CreateChannelDto } from './dto/create-channel.dto';
 import { UpdateChannelPermissionsDto } from './dto/update-channel-permissions.dto';
 import { UpdateChannelDto } from './dto/update-channel.dto';
 
+type ChannelPermissions = {
+  canView?: boolean;
+  canSendMessages?: boolean;
+  canConnect?: boolean;
+};
+
 @Injectable()
 export class ChannelsService {
   constructor(private readonly prisma: PrismaService) {}
@@ -63,20 +69,26 @@ export class ChannelsService {
     return channel;
   }
 
-  private getCanView(rawPermissions: unknown) {
+  private getPermissions(rawPermissions: unknown): Required<ChannelPermissions> {
     if (
       !rawPermissions ||
       typeof rawPermissions !== 'object' ||
       Array.isArray(rawPermissions)
     ) {
-      return true;
+      return {
+        canView: true,
+        canSendMessages: true,
+        canConnect: true,
+      };
     }
 
-    const permissions = rawPermissions as {
-      canView?: boolean;
-    };
+    const permissions = rawPermissions as ChannelPermissions;
 
-    return permissions.canView ?? true;
+    return {
+      canView: permissions.canView ?? true,
+      canSendMessages: permissions.canSendMessages ?? true,
+      canConnect: permissions.canConnect ?? true,
+    };
   }
 
   async createChannel(userId: string, serverId: string, dto: CreateChannelDto) {
@@ -125,7 +137,9 @@ export class ChannelsService {
     }
 
     return channels.filter((channel) => {
-      return this.getCanView(channel.permissions);
+      const permissions = this.getPermissions(channel.permissions);
+
+      return permissions.canView;
     });
   }
 
@@ -173,15 +187,16 @@ export class ChannelsService {
 
     await this.checkServerOwner(userId, channel.serverId);
 
+    const currentPermissions = this.getPermissions(channel.permissions);
+
     return this.prisma.channel.update({
       where: {
         id: channelId,
       },
       data: {
         permissions: {
-          canView: dto.canView ?? true,
-          canSendMessages: dto.canSendMessages ?? true,
-          canConnect: dto.canConnect ?? true,
+          ...currentPermissions,
+          ...dto,
         },
       },
     });
