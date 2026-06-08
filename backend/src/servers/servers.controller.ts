@@ -39,6 +39,11 @@ export class ServersController {
     return this.serversService.getServerById(user.sub, id);
   }
 
+  @Get(':id/members')
+  getServerMembers(@CurrentUser() user: JwtPayload, @Param('id') id: string) {
+    return this.serversService.getServerMembers(user.sub, id);
+  }
+
   @Patch(':id')
   updateServer(
     @CurrentUser() user: JwtPayload,

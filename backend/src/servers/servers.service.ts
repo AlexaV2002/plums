@@ -129,6 +129,35 @@ export class ServersService {
     return server;
   }
 
+  async getServerMembers(userId: string, serverId: string) {
+    await this.getServerMemberOrThrow(userId, serverId);
+
+    return this.prisma.serverMember.findMany({
+      where: {
+        serverId,
+      },
+      orderBy: {
+        joinedAt: 'asc',
+      },
+      select: {
+        id: true,
+        serverId: true,
+        userId: true,
+        joinedAt: true,
+        user: {
+          select: {
+            id: true,
+            username: true,
+            email: true,
+            avatarUrl: true,
+            status: true,
+            bio: true,
+          },
+        },
+      },
+    });
+  }
+
   async updateServer(userId: string, serverId: string, dto: UpdateServerDto) {
     await this.getServerOwnerOrThrow(userId, serverId);
 

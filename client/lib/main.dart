@@ -108,6 +108,19 @@ class ApiClient {
         .toList();
   }
 
+  Future<List<AppServerMember>> getServerMembers(String serverId) async {
+    final response = await dio.get(
+      '/servers/$serverId/members',
+      options: authOptions,
+    );
+
+    final list = response.data as List;
+
+    return list
+        .map((item) => AppServerMember.fromJson(item as Map<String, dynamic>))
+        .toList();
+  }
+
   Future<AppServer> createServer({required String name}) async {
     final response = await dio.post(
       '/servers',
@@ -764,6 +777,7 @@ class _MainShellState extends State<MainShell> {
   List<AppServer> servers = [];
   List<AppChannel> channels = [];
   List<AppMessage> messages = [];
+  List<AppServerMember> members = [];
 
   String? selectedServerId;
   String? selectedChannelId;
@@ -899,6 +913,42 @@ class _MainShellState extends State<MainShell> {
     if (deletedSelectedChannel) {
       if (nextChannel != null) {
         selectChannel(nextChannel.id);
+        Future<void> showMembers() async {
+          final serverId = selectedServerId;
+
+          if (serverId == null) {
+            return;
+          }
+
+          try {
+            final loadedMembers = await apiClient.getServerMembers(serverId);
+
+            setState(() {
+              members = loadedMembers;
+            });
+
+            if (!mounted) return;
+
+            await showServerMembersDialog(
+              context: context,
+              members: loadedMembers,
+            );
+          } on DioException catch (error) {
+            if (!mounted) return;
+
+            showErrorSnackBar(
+              context,
+              'Ошибка загрузки участников: ${error.response?.data}',
+            );
+          } catch (error) {
+            if (!mounted) return;
+
+            showErrorSnackBar(
+              context,
+              'Не удалось загрузить участников: $error',
+            );
+          }
+        }
       } else {
         syncRealtimeChannel(null);
       }
@@ -1105,6 +1155,37 @@ class _MainShellState extends State<MainShell> {
         errorMessage = 'Не удалось загрузить сообщения: $error';
         isMessagesLoading = false;
       });
+    }
+  }
+
+  Future<void> showMembers() async {
+    final serverId = selectedServerId;
+
+    if (serverId == null) {
+      return;
+    }
+
+    try {
+      final loadedMembers = await apiClient.getServerMembers(serverId);
+
+      setState(() {
+        members = loadedMembers;
+      });
+
+      if (!mounted) return;
+
+      await showServerMembersDialog(context: context, members: loadedMembers);
+    } on DioException catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        'Ошибка загрузки участников: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось загрузить участников: $error');
     }
   }
 
@@ -1800,6 +1881,7 @@ class _MainShellState extends State<MainShell> {
                     onSendMessage: sendMessage,
                     onEditMessage: editMessage,
                     onDeleteMessage: deleteMessage,
+                    onShowMembers: showMembers,
                   ),
           ),
         ],
@@ -2457,6 +2539,7 @@ class ChatArea extends StatelessWidget {
     required this.onSendMessage,
     required this.onEditMessage,
     required this.onDeleteMessage,
+    required this.onShowMembers,
   });
 
   final AppChannel channel;
@@ -2466,6 +2549,7 @@ class ChatArea extends StatelessWidget {
   final Future<void> Function(String content) onSendMessage;
   final ValueChanged<AppMessage> onEditMessage;
   final ValueChanged<AppMessage> onDeleteMessage;
+  final VoidCallback onShowMembers;
 
   @override
   Widget build(BuildContext context) {
@@ -2473,7 +2557,7 @@ class ChatArea extends StatelessWidget {
       color: const Color(0xFF211C29),
       child: Column(
         children: [
-          ChatHeader(channel: channel),
+          ChatHeader(channel: channel, onShowMembers: onShowMembers),
           Expanded(
             child: channel.type == ChannelType.text
                 ? isMessagesLoading
@@ -2502,9 +2586,14 @@ class ChatArea extends StatelessWidget {
 }
 
 class ChatHeader extends StatelessWidget {
-  const ChatHeader({super.key, required this.channel});
+  const ChatHeader({
+    super.key,
+    required this.channel,
+    required this.onShowMembers,
+  });
 
   final AppChannel channel;
+  final VoidCallback onShowMembers;
 
   @override
   Widget build(BuildContext context) {
@@ -2549,7 +2638,7 @@ class ChatHeader extends StatelessWidget {
           ),
           IconButton(
             tooltip: 'Участники',
-            onPressed: () {},
+            onPressed: onShowMembers,
             icon: const Icon(Icons.people_alt_outlined),
             color: const Color(0xFFB8ADC8),
           ),
@@ -3521,6 +3610,112 @@ class PermissionSwitchTile extends StatelessWidget {
   }
 }
 
+Future<void> showServerMembersDialog({
+  required BuildContext context,
+  required List<AppServerMember> members,
+}) {
+  return showDialog<void>(
+    context: context,
+    builder: (context) {
+      return PlumsDialog(
+        title: 'Участники сервера',
+        child: SizedBox(
+          width: 420,
+          height: 420,
+          child: members.isEmpty
+              ? const Center(
+                  child: Text(
+                    'Участников пока нет',
+                    style: TextStyle(
+                      color: Color(0xFFB8ADC8),
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                )
+              : ListView.separated(
+                  itemCount: members.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 10),
+                  itemBuilder: (context, index) {
+                    final member = members[index];
+                    final user = member.user;
+                    final letter = user.username.isNotEmpty
+                        ? user.username.characters.first.toUpperCase()
+                        : '?';
+
+                    return Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF302A39),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: const Color(0xFF40374D)),
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 42,
+                            height: 42,
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF8D5CFF),
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: Center(
+                              child: Text(
+                                letter,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  user.username,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Color(0xFFF3EEFF),
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  user.email,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Color(0xFF8F849F),
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            user.status,
+                            style: const TextStyle(
+                              color: Color(0xFFBFA7FF),
+                              fontSize: 11,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+        ),
+      );
+    },
+  );
+}
+
 class PlumsDialog extends StatelessWidget {
   const PlumsDialog({super.key, required this.title, required this.child});
 
@@ -3853,4 +4048,30 @@ class EditProfileResult {
   final String username;
   final String bio;
   final String status;
+}
+
+class AppServerMember {
+  const AppServerMember({
+    required this.id,
+    required this.serverId,
+    required this.userId,
+    required this.joinedAt,
+    required this.user,
+  });
+
+  final String id;
+  final String serverId;
+  final String userId;
+  final DateTime? joinedAt;
+  final AppUser user;
+
+  factory AppServerMember.fromJson(Map<String, dynamic> json) {
+    return AppServerMember(
+      id: json['id'] as String,
+      serverId: json['serverId'] as String,
+      userId: json['userId'] as String,
+      joinedAt: DateTime.tryParse(json['joinedAt'] as String? ?? ''),
+      user: AppUser.fromJson(json['user'] as Map<String, dynamic>),
+    );
+  }
 }
