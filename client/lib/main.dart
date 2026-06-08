@@ -926,16 +926,15 @@ class _MainShellState extends State<MainShell> {
   }
 
   List<AppChannel> sortChannels(List<AppChannel> items) {
-    return [...items]
-      ..sort((left, right) {
-        final positionCompare = left.position.compareTo(right.position);
+    return [...items]..sort((left, right) {
+      final positionCompare = left.position.compareTo(right.position);
 
-        if (positionCompare != 0) {
-          return positionCompare;
-        }
+      if (positionCompare != 0) {
+        return positionCompare;
+      }
 
-        return left.name.compareTo(right.name);
-      });
+      return left.name.compareTo(right.name);
+    });
   }
 
   void syncRealtimeServer(String? nextServerId) {
@@ -1326,7 +1325,8 @@ class _MainShellState extends State<MainShell> {
     final confirmed = await showConfirmDialog(
       context: context,
       title: 'Удалить сервер?',
-      message: 'Сервер "${server.name}" будет удалён вместе с каналами и сообщениями.',
+      message:
+          'Сервер "${server.name}" будет удалён вместе с каналами и сообщениями.',
       confirmText: 'Удалить',
     );
 
@@ -1515,10 +1515,10 @@ class _MainShellState extends State<MainShell> {
         channels = sortChannels(
           channels.any((item) => item.id == channel.id)
               ? channels
-                  .map<AppChannel>(
-                    (item) => item.id == channel.id ? channel : item,
-                  )
-                  .toList()
+                    .map<AppChannel>(
+                      (item) => item.id == channel.id ? channel : item,
+                    )
+                    .toList()
               : [...channels, channel],
         );
         selectedChannelId = channel.id;
@@ -2668,7 +2668,9 @@ class MessageBubble extends StatelessWidget {
                       ),
                       const SizedBox(width: 8),
                       Text(
-                        message.time,
+                        message.isEdited
+                            ? '${message.time} · изменено'
+                            : message.time,
                         style: const TextStyle(
                           color: Color(0xFF8F849F),
                           fontSize: 12,
@@ -3766,6 +3768,8 @@ class AppMessage {
     required this.author,
     required this.content,
     required this.time,
+    required this.createdAt,
+    required this.updatedAt,
   });
 
   final String id;
@@ -3774,6 +3778,8 @@ class AppMessage {
   final String author;
   final String content;
   final String time;
+  final DateTime? createdAt;
+  final DateTime? updatedAt;
 
   String get authorInitial {
     if (author.isEmpty) {
@@ -3783,9 +3789,21 @@ class AppMessage {
     return author.characters.first.toUpperCase();
   }
 
+  bool get isEdited {
+    final created = createdAt;
+    final updated = updatedAt;
+
+    if (created == null || updated == null) {
+      return false;
+    }
+
+    return updated.difference(created).inSeconds.abs() > 1;
+  }
+
   factory AppMessage.fromJson(Map<String, dynamic> json) {
     final authorJson = json['author'] as Map<String, dynamic>?;
     final createdAtRaw = json['createdAt'] as String?;
+    final updatedAtRaw = json['updatedAt'] as String?;
 
     return AppMessage(
       id: json['id'] as String,
@@ -3794,6 +3812,8 @@ class AppMessage {
       author: authorJson?['username'] as String? ?? 'unknown',
       content: json['content'] as String,
       time: _formatTime(createdAtRaw),
+      createdAt: DateTime.tryParse(createdAtRaw ?? ''),
+      updatedAt: DateTime.tryParse(updatedAtRaw ?? ''),
     );
   }
 
