@@ -37,6 +37,7 @@ dependencies:
   dio: ^5.9.2
   provider: ^6.1.5+1
   socket_io_client: ^3.1.5
+  shared_preferences: ^2.5.5
 
 dev_dependencies:
   flutter_test:

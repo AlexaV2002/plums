@@ -1,6 +1,7 @@
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
 
 void main() {
@@ -280,6 +281,27 @@ class ApiClient {
 
 final apiClient = ApiClient();
 
+final authStorage = AuthStorage();
+
+class AuthStorage {
+  static const String _accessTokenKey = 'accessToken';
+
+  Future<void> saveAccessToken(String token) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_accessTokenKey, token);
+  }
+
+  Future<String?> readAccessToken() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_accessTokenKey);
+  }
+
+  Future<void> clearAccessToken() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_accessTokenKey);
+  }
+}
+
 class RealtimeClient {
   RealtimeClient() {
     socket = io.io(
@@ -414,20 +436,91 @@ class AuthGate extends StatefulWidget {
 
 class _AuthGateState extends State<AuthGate> {
   AppUser? currentUser;
+  bool isCheckingAuth = true;
 
-  void handleLogin(AppUser user) {
+  @override
+  void initState() {
+    super.initState();
+    restoreSession();
+  }
+
+  Future<void> restoreSession() async {
+    final token = await authStorage.readAccessToken();
+
+    if (token == null || token.isEmpty) {
+      if (!mounted) return;
+
+      setState(() {
+        isCheckingAuth = false;
+      });
+
+      return;
+    }
+
+    try {
+      apiClient.accessToken = token;
+      final user = await apiClient.getMe();
+
+      if (!mounted) return;
+
+      setState(() {
+        currentUser = user;
+        isCheckingAuth = false;
+      });
+    } catch (_) {
+      await authStorage.clearAccessToken();
+      apiClient.accessToken = null;
+
+      if (!mounted) return;
+
+      setState(() {
+        currentUser = null;
+        isCheckingAuth = false;
+      });
+    }
+  }
+
+  Future<void> handleLogin(AppUser user) async {
+    final token = apiClient.accessToken;
+
+    if (token != null && token.isNotEmpty) {
+      await authStorage.saveAccessToken(token);
+    }
+
+    if (!mounted) return;
+
     setState(() {
       currentUser = user;
     });
   }
 
+  Future<void> handleLogout() async {
+    await authStorage.clearAccessToken();
+    apiClient.accessToken = null;
+
+    if (!mounted) return;
+
+    setState(() {
+      currentUser = null;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (isCheckingAuth) {
+      return const Scaffold(
+        backgroundColor: Color(0xFF15131A),
+        body: Center(
+          child: CircularProgressIndicator(color: Color(0xFF8D5CFF)),
+        ),
+      );
+    }
+
     if (currentUser == null) {
       return LoginScreen(onLoggedIn: handleLogin);
     }
 
-    return MainShell(initialUser: currentUser!);
+    return MainShell(initialUser: currentUser!, onLoggedOut: handleLogout);
   }
 }
 
@@ -762,9 +855,14 @@ class PlumsTextField extends StatelessWidget {
 ========================= */
 
 class MainShell extends StatefulWidget {
-  const MainShell({super.key, required this.initialUser});
+  const MainShell({
+    super.key,
+    required this.initialUser,
+    required this.onLoggedOut,
+  });
 
   final AppUser initialUser;
+  final Future<void> Function() onLoggedOut;
 
   @override
   State<MainShell> createState() => _MainShellState();
@@ -807,6 +905,11 @@ class _MainShellState extends State<MainShell> {
   void dispose() {
     realtimeClient.dispose();
     super.dispose();
+  }
+
+  Future<void> logout() async {
+    realtimeClient.dispose();
+    await widget.onLoggedOut();
   }
 
   void handleRealtimeMessage(AppMessage message) {
@@ -1869,6 +1972,7 @@ class _MainShellState extends State<MainShell> {
                 ? null
                 : () => leaveServer(selectedServer!),
             onEditProfile: editProfile,
+            onLogout: logout,
           ),
           Expanded(
             child: selectedChannel == null
@@ -2064,6 +2168,7 @@ class ChannelsPanel extends StatelessWidget {
     required this.onDeleteServer,
     required this.onLeaveServer,
     required this.onEditProfile,
+    required this.onLogout,
   });
 
   final String serverName;
@@ -2083,6 +2188,7 @@ class ChannelsPanel extends StatelessWidget {
   final VoidCallback? onDeleteServer;
   final VoidCallback? onLeaveServer;
   final VoidCallback onEditProfile;
+  final VoidCallback onLogout;
 
   @override
   Widget build(BuildContext context) {
@@ -2147,7 +2253,11 @@ class ChannelsPanel extends StatelessWidget {
               ],
             ),
           ),
-          UserPanel(user: currentUser, onEditProfile: onEditProfile),
+          UserPanel(
+            user: currentUser,
+            onEditProfile: onEditProfile,
+            onLogout: onLogout,
+          ),
         ],
       ),
     );
@@ -2410,10 +2520,16 @@ class ChannelTile extends StatelessWidget {
 ========================= */
 
 class UserPanel extends StatelessWidget {
-  const UserPanel({super.key, required this.user, required this.onEditProfile});
+  const UserPanel({
+    super.key,
+    required this.user,
+    required this.onEditProfile,
+    required this.onLogout,
+  });
 
   final AppUser user;
   final VoidCallback onEditProfile;
+  final VoidCallback onLogout;
 
   @override
   Widget build(BuildContext context) {
@@ -2497,6 +2613,12 @@ class UserPanel extends StatelessWidget {
             onPressed: onEditProfile,
             icon: const Icon(Icons.settings_outlined),
             color: const Color(0xFFB8ADC8),
+          ),
+          IconButton(
+            tooltip: 'Выйти',
+            onPressed: onLogout,
+            icon: const Icon(Icons.logout_rounded),
+            color: const Color(0xFFFF7A7A),
           ),
         ],
       ),
