@@ -153,6 +153,16 @@ class ApiClient {
     await dio.delete('/servers/$serverId/members/me', options: authOptions);
   }
 
+  Future<void> kickServerMember({
+    required String serverId,
+    required String memberId,
+  }) async {
+    await dio.delete(
+      '/servers/$serverId/members/$memberId',
+      options: authOptions,
+    );
+  }
+
   Future<AppInvite> createInvite({required String serverId}) async {
     final response = await dio.post(
       '/servers/$serverId/invites',
@@ -1013,48 +1023,14 @@ class _MainShellState extends State<MainShell> {
       }
     });
 
-    if (deletedSelectedChannel) {
-      if (nextChannel != null) {
-        selectChannel(nextChannel.id);
-        Future<void> showMembers() async {
-          final serverId = selectedServerId;
+    if (!deletedSelectedChannel) {
+      return;
+    }
 
-          if (serverId == null) {
-            return;
-          }
-
-          try {
-            final loadedMembers = await apiClient.getServerMembers(serverId);
-
-            setState(() {
-              members = loadedMembers;
-            });
-
-            if (!mounted) return;
-
-            await showServerMembersDialog(
-              context: context,
-              members: loadedMembers,
-            );
-          } on DioException catch (error) {
-            if (!mounted) return;
-
-            showErrorSnackBar(
-              context,
-              'Ошибка загрузки участников: ${error.response?.data}',
-            );
-          } catch (error) {
-            if (!mounted) return;
-
-            showErrorSnackBar(
-              context,
-              'Не удалось загрузить участников: $error',
-            );
-          }
-        }
-      } else {
-        syncRealtimeChannel(null);
-      }
+    if (nextChannel != null) {
+      selectChannel(nextChannel.id);
+    } else {
+      syncRealtimeChannel(null);
     }
   }
 
@@ -1277,7 +1253,13 @@ class _MainShellState extends State<MainShell> {
 
       if (!mounted) return;
 
-      await showServerMembersDialog(context: context, members: loadedMembers);
+      await showServerMembersDialog(
+        context: context,
+        members: loadedMembers,
+        currentUserId: currentUser?.id,
+        isServerOwner: isSelectedServerOwner,
+        onKickMember: kickMember,
+      );
     } on DioException catch (error) {
       if (!mounted) return;
 
@@ -1289,6 +1271,53 @@ class _MainShellState extends State<MainShell> {
       if (!mounted) return;
 
       showErrorSnackBar(context, 'Не удалось загрузить участников: $error');
+    }
+  }
+
+  Future<void> kickMember(AppServerMember member) async {
+    final serverId = selectedServerId;
+
+    if (serverId == null) {
+      return;
+    }
+
+    final confirmed = await showConfirmDialog(
+      context: context,
+      title: 'Удалить участника?',
+      message: 'Пользователь "${member.user.username}" будет удалён с сервера.',
+      confirmText: 'Удалить',
+    );
+
+    if (confirmed != true) {
+      return;
+    }
+
+    try {
+      await apiClient.kickServerMember(
+        serverId: serverId,
+        memberId: member.id,
+      );
+
+      final loadedMembers = await apiClient.getServerMembers(serverId);
+
+      setState(() {
+        members = loadedMembers;
+      });
+
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Участник удалён с сервера');
+    } on DioException catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        'Ошибка удаления участника: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось удалить участника: $error');
     }
   }
 
@@ -3735,6 +3764,9 @@ class PermissionSwitchTile extends StatelessWidget {
 Future<void> showServerMembersDialog({
   required BuildContext context,
   required List<AppServerMember> members,
+  required String? currentUserId,
+  required bool isServerOwner,
+  required ValueChanged<AppServerMember> onKickMember,
 }) {
   return showDialog<void>(
     context: context,
@@ -3764,6 +3796,7 @@ Future<void> showServerMembersDialog({
                     final letter = user.username.isNotEmpty
                         ? user.username.characters.first.toUpperCase()
                         : '?';
+                    final canKick = isServerOwner && user.id != currentUserId;
 
                     return Container(
                       padding: const EdgeInsets.all(12),
@@ -3827,6 +3860,18 @@ Future<void> showServerMembersDialog({
                               fontWeight: FontWeight.w800,
                             ),
                           ),
+                          if (canKick) ...[
+                            const SizedBox(width: 8),
+                            IconButton(
+                              tooltip: 'Удалить участника',
+                              onPressed: () {
+                                Navigator.pop(context);
+                                onKickMember(member);
+                              },
+                              icon: const Icon(Icons.person_remove_outlined),
+                              color: const Color(0xFFFF7A7A),
+                            ),
+                          ],
                         ],
                       ),
                     );

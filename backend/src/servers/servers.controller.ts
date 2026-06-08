@@ -62,4 +62,13 @@ export class ServersController {
   leaveServer(@CurrentUser() user: JwtPayload, @Param('id') id: string) {
     return this.serversService.leaveServer(user.sub, id);
   }
+
+  @Delete(':id/members/:memberId')
+  kickServerMember(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Param('memberId') memberId: string,
+  ) {
+    return this.serversService.kickServerMember(user.sub, id, memberId);
+  }
 }

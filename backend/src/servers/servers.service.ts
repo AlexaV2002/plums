@@ -216,4 +216,33 @@ export class ServersService {
       message: 'Вы вышли с сервера',
     };
   }
+
+  async kickServerMember(userId: string, serverId: string, memberId: string) {
+    const server = await this.getServerOwnerOrThrow(userId, serverId);
+
+    const member = await this.prisma.serverMember.findUnique({
+      where: {
+        id: memberId,
+      },
+    });
+
+    if (!member || member.serverId !== serverId) {
+      throw new NotFoundException('Участник сервера не найден');
+    }
+
+    if (member.userId === server.ownerId) {
+      throw new ForbiddenException('Нельзя удалить владельца сервера');
+    }
+
+    await this.prisma.serverMember.delete({
+      where: {
+        id: memberId,
+      },
+    });
+
+    return {
+      message: 'Участник удалён с сервера',
+    };
+  }
+
 }
