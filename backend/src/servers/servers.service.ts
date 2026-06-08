@@ -1,10 +1,56 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateServerDto } from './dto/create-server.dto';
+import { UpdateServerDto } from './dto/update-server.dto';
 
 @Injectable()
 export class ServersService {
   constructor(private readonly prisma: PrismaService) {}
+
+  private async getServerOrThrow(serverId: string) {
+    const server = await this.prisma.server.findUnique({
+      where: {
+        id: serverId,
+      },
+    });
+
+    if (!server) {
+      throw new NotFoundException('Сервер не найден');
+    }
+
+    return server;
+  }
+
+  private async getServerOwnerOrThrow(userId: string, serverId: string) {
+    const server = await this.getServerOrThrow(serverId);
+
+    if (server.ownerId !== userId) {
+      throw new ForbiddenException(
+        'Только владелец сервера может управлять сервером',
+      );
+    }
+
+    return server;
+  }
+
+  private async getServerMemberOrThrow(userId: string, serverId: string) {
+    const server = await this.getServerOrThrow(serverId);
+
+    const member = await this.prisma.serverMember.findUnique({
+      where: {
+        serverId_userId: {
+          serverId,
+          userId,
+        },
+      },
+    });
+
+    if (!member) {
+      throw new ForbiddenException('У вас нет доступа к этому серверу');
+    }
+
+    return { server, member };
+  }
 
   async createServer(ownerId: string, dto: CreateServerDto) {
     return this.prisma.server.create({
@@ -81,5 +127,64 @@ export class ServersService {
     }
 
     return server;
+  }
+
+  async updateServer(userId: string, serverId: string, dto: UpdateServerDto) {
+    await this.getServerOwnerOrThrow(userId, serverId);
+
+    return this.prisma.server.update({
+      where: {
+        id: serverId,
+      },
+      data: {
+        name: dto.name,
+        iconUrl: dto.iconUrl,
+      },
+      select: {
+        id: true,
+        name: true,
+        iconUrl: true,
+        ownerId: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+  }
+
+  async deleteServer(userId: string, serverId: string) {
+    await this.getServerOwnerOrThrow(userId, serverId);
+
+    await this.prisma.server.delete({
+      where: {
+        id: serverId,
+      },
+    });
+
+    return {
+      message: 'Сервер удалён',
+    };
+  }
+
+  async leaveServer(userId: string, serverId: string) {
+    const { server, member } = await this.getServerMemberOrThrow(
+      userId,
+      serverId,
+    );
+
+    if (server.ownerId === userId) {
+      throw new ForbiddenException(
+        'Владелец не может выйти из своего сервера. Удалите сервер или передайте владение.',
+      );
+    }
+
+    await this.prisma.serverMember.delete({
+      where: {
+        id: member.id,
+      },
+    });
+
+    return {
+      message: 'Вы вышли с сервера',
+    };
   }
 }

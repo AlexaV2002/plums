@@ -1,7 +1,17 @@
-import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CreateServerDto } from './dto/create-server.dto';
+import { UpdateServerDto } from './dto/update-server.dto';
 import { ServersService } from './servers.service';
 
 type JwtPayload = {
@@ -27,5 +37,24 @@ export class ServersController {
   @Get(':id')
   getServerById(@CurrentUser() user: JwtPayload, @Param('id') id: string) {
     return this.serversService.getServerById(user.sub, id);
+  }
+
+  @Patch(':id')
+  updateServer(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Body() dto: UpdateServerDto,
+  ) {
+    return this.serversService.updateServer(user.sub, id, dto);
+  }
+
+  @Delete(':id')
+  deleteServer(@CurrentUser() user: JwtPayload, @Param('id') id: string) {
+    return this.serversService.deleteServer(user.sub, id);
+  }
+
+  @Delete(':id/members/me')
+  leaveServer(@CurrentUser() user: JwtPayload, @Param('id') id: string) {
+    return this.serversService.leaveServer(user.sub, id);
   }
 }

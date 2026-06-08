@@ -118,6 +118,27 @@ class ApiClient {
     return AppServer.fromJson(response.data as Map<String, dynamic>);
   }
 
+  Future<AppServer> updateServer({
+    required String serverId,
+    required String name,
+  }) async {
+    final response = await dio.patch(
+      '/servers/$serverId',
+      options: authOptions,
+      data: {'name': name},
+    );
+
+    return AppServer.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<void> deleteServer({required String serverId}) async {
+    await dio.delete('/servers/$serverId', options: authOptions);
+  }
+
+  Future<void> leaveServer({required String serverId}) async {
+    await dio.delete('/servers/$serverId/members/me', options: authOptions);
+  }
+
   Future<AppInvite> createInvite({required String serverId}) async {
     final response = await dio.post(
       '/servers/$serverId/invites',
@@ -1232,6 +1253,133 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
+  Future<void> selectNextServerAfterRemoving(String serverId) async {
+    final remainingServers = servers
+        .where((server) => server.id != serverId)
+        .toList();
+    final nextServer = remainingServers.isNotEmpty
+        ? remainingServers.first
+        : null;
+
+    if (nextServer == null) {
+      setState(() {
+        servers = [];
+        selectedServerId = null;
+        channels = [];
+        selectedChannelId = null;
+        messages = [];
+      });
+      syncRealtimeServer(null);
+      syncRealtimeChannel(null);
+      return;
+    }
+
+    setState(() {
+      servers = remainingServers;
+    });
+
+    await selectServer(nextServer.id);
+  }
+
+  Future<void> renameServer(AppServer server) async {
+    final newName = await showTextDialog(
+      context: context,
+      title: 'Переименовать сервер',
+      label: 'Новое название',
+      hintText: server.name,
+      initialValue: server.name,
+      confirmText: 'Сохранить',
+    );
+
+    if (newName == null || newName.trim().isEmpty) {
+      return;
+    }
+
+    try {
+      final updatedServer = await apiClient.updateServer(
+        serverId: server.id,
+        name: newName.trim(),
+      );
+
+      setState(() {
+        servers = servers
+            .map<AppServer>(
+              (item) => item.id == updatedServer.id ? updatedServer : item,
+            )
+            .toList();
+      });
+    } on DioException catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        'Ошибка переименования сервера: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось переименовать сервер: $error');
+    }
+  }
+
+  Future<void> deleteServer(AppServer server) async {
+    final confirmed = await showConfirmDialog(
+      context: context,
+      title: 'Удалить сервер?',
+      message: 'Сервер "${server.name}" будет удалён вместе с каналами и сообщениями.',
+      confirmText: 'Удалить',
+    );
+
+    if (confirmed != true) {
+      return;
+    }
+
+    try {
+      await apiClient.deleteServer(serverId: server.id);
+      await selectNextServerAfterRemoving(server.id);
+    } on DioException catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        'Ошибка удаления сервера: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось удалить сервер: $error');
+    }
+  }
+
+  Future<void> leaveServer(AppServer server) async {
+    final confirmed = await showConfirmDialog(
+      context: context,
+      title: 'Выйти с сервера?',
+      message: 'Сервер "${server.name}" исчезнет из вашего списка серверов.',
+      confirmText: 'Выйти',
+    );
+
+    if (confirmed != true) {
+      return;
+    }
+
+    try {
+      await apiClient.leaveServer(serverId: server.id);
+      await selectNextServerAfterRemoving(server.id);
+    } on DioException catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        'Ошибка выхода с сервера: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось выйти с сервера: $error');
+    }
+  }
+
   String parseInviteCode(String input) {
     final trimmed = input.trim();
 
@@ -1622,12 +1770,23 @@ class _MainShellState extends State<MainShell> {
             selectedChannelId: selectedChannelId,
             currentUser: user,
             canManageChannels: canManageChannels,
+            hasSelectedServer: selectedServer != null,
+            canManageServer: canManageChannels,
             onChannelSelected: selectChannel,
             onCreateChannel: createChannel,
             onEditChannel: renameChannel,
             onDeleteChannel: deleteChannel,
             onEditChannelPermissions: editChannelPermissions,
             onCreateInvite: createInvite,
+            onRenameServer: selectedServer == null
+                ? null
+                : () => renameServer(selectedServer!),
+            onDeleteServer: selectedServer == null
+                ? null
+                : () => deleteServer(selectedServer!),
+            onLeaveServer: selectedServer == null
+                ? null
+                : () => leaveServer(selectedServer!),
             onEditProfile: editProfile,
           ),
           Expanded(
@@ -1811,12 +1970,17 @@ class ChannelsPanel extends StatelessWidget {
     required this.selectedChannelId,
     required this.currentUser,
     required this.canManageChannels,
+    required this.hasSelectedServer,
+    required this.canManageServer,
     required this.onChannelSelected,
     required this.onCreateChannel,
     required this.onEditChannel,
     required this.onDeleteChannel,
     required this.onEditChannelPermissions,
     required this.onCreateInvite,
+    required this.onRenameServer,
+    required this.onDeleteServer,
+    required this.onLeaveServer,
     required this.onEditProfile,
   });
 
@@ -1825,12 +1989,17 @@ class ChannelsPanel extends StatelessWidget {
   final String? selectedChannelId;
   final AppUser currentUser;
   final bool canManageChannels;
+  final bool hasSelectedServer;
+  final bool canManageServer;
   final ValueChanged<String> onChannelSelected;
   final VoidCallback onCreateChannel;
   final ValueChanged<AppChannel> onEditChannel;
   final ValueChanged<AppChannel> onDeleteChannel;
   final ValueChanged<AppChannel> onEditChannelPermissions;
   final VoidCallback onCreateInvite;
+  final VoidCallback? onRenameServer;
+  final VoidCallback? onDeleteServer;
+  final VoidCallback? onLeaveServer;
   final VoidCallback onEditProfile;
 
   @override
@@ -1850,8 +2019,13 @@ class ChannelsPanel extends StatelessWidget {
         children: [
           ServerHeader(
             serverName: serverName,
+            hasSelectedServer: hasSelectedServer,
+            canManageServer: canManageServer,
             canCreateInvite: canManageChannels,
             onCreateInvite: onCreateInvite,
+            onRenameServer: onRenameServer,
+            onDeleteServer: onDeleteServer,
+            onLeaveServer: onLeaveServer,
           ),
           Expanded(
             child: ListView(
@@ -1902,13 +2076,23 @@ class ServerHeader extends StatelessWidget {
   const ServerHeader({
     super.key,
     required this.serverName,
+    required this.hasSelectedServer,
+    required this.canManageServer,
     required this.canCreateInvite,
     required this.onCreateInvite,
+    required this.onRenameServer,
+    required this.onDeleteServer,
+    required this.onLeaveServer,
   });
 
   final String serverName;
+  final bool hasSelectedServer;
+  final bool canManageServer;
   final bool canCreateInvite;
   final VoidCallback onCreateInvite;
+  final VoidCallback? onRenameServer;
+  final VoidCallback? onDeleteServer;
+  final VoidCallback? onLeaveServer;
 
   @override
   Widget build(BuildContext context) {
@@ -1940,11 +2124,57 @@ class ServerHeader extends StatelessWidget {
               icon: const Icon(Icons.link_rounded),
               color: const Color(0xFFBFA7FF),
             ),
-          IconButton(
+          PopupMenuButton<String>(
             tooltip: 'Настройки сервера',
-            onPressed: () {},
-            icon: const Icon(Icons.keyboard_arrow_down),
-            color: const Color(0xFFCFC4E8),
+            enabled: hasSelectedServer,
+            color: const Color(0xFF2B2535),
+            icon: const Icon(
+              Icons.keyboard_arrow_down,
+              color: Color(0xFFCFC4E8),
+            ),
+            onSelected: (value) {
+              switch (value) {
+                case 'rename':
+                  onRenameServer?.call();
+                  break;
+                case 'delete':
+                  onDeleteServer?.call();
+                  break;
+                case 'leave':
+                  onLeaveServer?.call();
+                  break;
+              }
+            },
+            itemBuilder: (context) {
+              if (canManageServer) {
+                return const [
+                  PopupMenuItem(
+                    value: 'rename',
+                    child: Text(
+                      'Переименовать сервер',
+                      style: TextStyle(color: Color(0xFFF3EEFF)),
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'delete',
+                    child: Text(
+                      'Удалить сервер',
+                      style: TextStyle(color: Color(0xFFFF7A7A)),
+                    ),
+                  ),
+                ];
+              }
+
+              return const [
+                PopupMenuItem(
+                  value: 'leave',
+                  child: Text(
+                    'Выйти с сервера',
+                    style: TextStyle(color: Color(0xFFFFC66D)),
+                  ),
+                ),
+              ];
+            },
           ),
         ],
       ),
