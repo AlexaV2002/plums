@@ -44,6 +44,18 @@ export class MessagesGateway {
     this.server.to(this.getChannelRoom(channelId)).emit('message:new', message);
   }
 
+  emitMessageUpdate(channelId: string, message: unknown) {
+    this.server
+      .to(this.getChannelRoom(channelId))
+      .emit('message:update', message);
+  }
+
+  emitMessageDelete(channelId: string, message: unknown) {
+    this.server
+      .to(this.getChannelRoom(channelId))
+      .emit('message:delete', message);
+  }
+
   private getChannelRoom(channelId: string) {
     return `channel:${channelId}`;
   }

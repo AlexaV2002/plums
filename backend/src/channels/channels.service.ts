@@ -7,6 +7,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
 import { UpdateChannelPermissionsDto } from './dto/update-channel-permissions.dto';
 import { UpdateChannelDto } from './dto/update-channel.dto';
+import { ChannelsGateway } from './channels.gateway';
 
 type ChannelPermissions = {
   canView?: boolean;
@@ -16,7 +17,10 @@ type ChannelPermissions = {
 
 @Injectable()
 export class ChannelsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly channelsGateway: ChannelsGateway,
+  ) {}
 
   private async checkServerAccess(userId: string, serverId: string) {
     const member = await this.prisma.serverMember.findUnique({
@@ -100,7 +104,7 @@ export class ChannelsService {
       },
     });
 
-    return this.prisma.channel.create({
+    const channel = await this.prisma.channel.create({
       data: {
         serverId,
         name: dto.name,
@@ -108,6 +112,10 @@ export class ChannelsService {
         position: channelsCount,
       },
     });
+
+    this.channelsGateway.emitChannelNew(serverId, channel);
+
+    return channel;
   }
 
   async getServerChannels(userId: string, serverId: string) {
@@ -152,7 +160,7 @@ export class ChannelsService {
 
     await this.checkServerOwner(userId, channel.serverId);
 
-    return this.prisma.channel.update({
+    const updatedChannel = await this.prisma.channel.update({
       where: {
         id: channelId,
       },
@@ -160,6 +168,13 @@ export class ChannelsService {
         name: dto.name,
       },
     });
+
+    this.channelsGateway.emitChannelUpdate(
+      updatedChannel.serverId,
+      updatedChannel,
+    );
+
+    return updatedChannel;
   }
 
   async deleteChannel(userId: string, channelId: string) {
@@ -171,6 +186,11 @@ export class ChannelsService {
       where: {
         id: channelId,
       },
+    });
+
+    this.channelsGateway.emitChannelDelete(channel.serverId, {
+      id: channel.id,
+      serverId: channel.serverId,
     });
 
     return {
@@ -189,7 +209,7 @@ export class ChannelsService {
 
     const currentPermissions = this.getPermissions(channel.permissions);
 
-    return this.prisma.channel.update({
+    const updatedChannel = await this.prisma.channel.update({
       where: {
         id: channelId,
       },
@@ -200,5 +220,12 @@ export class ChannelsService {
         },
       },
     });
+
+    this.channelsGateway.emitChannelUpdate(
+      updatedChannel.serverId,
+      updatedChannel,
+    );
+
+    return updatedChannel;
   }
 }

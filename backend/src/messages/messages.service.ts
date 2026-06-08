@@ -195,7 +195,7 @@ export class MessagesService {
       );
     }
 
-    return this.prisma.message.update({
+    const updatedMessage = await this.prisma.message.update({
       where: {
         id: messageId,
       },
@@ -214,6 +214,13 @@ export class MessagesService {
         },
       },
     });
+
+    this.messagesGateway.emitMessageUpdate(
+      updatedMessage.channelId,
+      updatedMessage,
+    );
+
+    return updatedMessage;
   }
 
   async remove(messageId: string, userId: string) {
@@ -245,7 +252,7 @@ export class MessagesService {
       throw new ForbiddenException('У вас нет доступа к этому каналу');
     }
 
-    return this.prisma.message.update({
+    const deletedMessage = await this.prisma.message.update({
       where: {
         id: messageId,
       },
@@ -253,5 +260,12 @@ export class MessagesService {
         deletedAt: new Date(),
       },
     });
+
+    this.messagesGateway.emitMessageDelete(deletedMessage.channelId, {
+      id: deletedMessage.id,
+      channelId: deletedMessage.channelId,
+    });
+
+    return deletedMessage;
   }
 }

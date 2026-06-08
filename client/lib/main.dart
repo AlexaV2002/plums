@@ -259,14 +259,67 @@ class RealtimeClient {
 
   late final io.Socket socket;
 
-  void connect({required ValueChanged<AppMessage> onMessageNew}) {
+  void connect({
+    required ValueChanged<AppMessage> onMessageNew,
+    required ValueChanged<AppMessage> onMessageUpdate,
+    required ValueChanged<RealtimeMessageDelete> onMessageDelete,
+    required ValueChanged<AppChannel> onChannelNew,
+    required ValueChanged<AppChannel> onChannelUpdate,
+    required ValueChanged<RealtimeChannelDelete> onChannelDelete,
+  }) {
     socket.on('message:new', (data) {
       if (data is Map) {
         onMessageNew(AppMessage.fromJson(Map<String, dynamic>.from(data)));
       }
     });
 
+    socket.on('message:update', (data) {
+      if (data is Map) {
+        onMessageUpdate(AppMessage.fromJson(Map<String, dynamic>.from(data)));
+      }
+    });
+
+    socket.on('message:delete', (data) {
+      if (data is Map) {
+        onMessageDelete(
+          RealtimeMessageDelete.fromJson(Map<String, dynamic>.from(data)),
+        );
+      }
+    });
+
+    socket.on('channel:new', (data) {
+      if (data is Map) {
+        onChannelNew(AppChannel.fromJson(Map<String, dynamic>.from(data)));
+      }
+    });
+
+    socket.on('channel:update', (data) {
+      if (data is Map) {
+        onChannelUpdate(AppChannel.fromJson(Map<String, dynamic>.from(data)));
+      }
+    });
+
+    socket.on('channel:delete', (data) {
+      if (data is Map) {
+        onChannelDelete(
+          RealtimeChannelDelete.fromJson(Map<String, dynamic>.from(data)),
+        );
+      }
+    });
+
     socket.connect();
+  }
+
+  void joinServer(String serverId) {
+    if (!socket.connected) {
+      socket.connect();
+    }
+
+    socket.emit('server:join', {'serverId': serverId});
+  }
+
+  void leaveServer(String serverId) {
+    socket.emit('server:leave', {'serverId': serverId});
   }
 
   void joinChannel(String channelId) {
@@ -283,6 +336,34 @@ class RealtimeClient {
 
   void dispose() {
     socket.dispose();
+  }
+}
+
+class RealtimeMessageDelete {
+  const RealtimeMessageDelete({required this.id, required this.channelId});
+
+  final String id;
+  final String channelId;
+
+  factory RealtimeMessageDelete.fromJson(Map<String, dynamic> json) {
+    return RealtimeMessageDelete(
+      id: json['id'] as String,
+      channelId: json['channelId'] as String,
+    );
+  }
+}
+
+class RealtimeChannelDelete {
+  const RealtimeChannelDelete({required this.id, required this.serverId});
+
+  final String id;
+  final String serverId;
+
+  factory RealtimeChannelDelete.fromJson(Map<String, dynamic> json) {
+    return RealtimeChannelDelete(
+      id: json['id'] as String,
+      serverId: json['serverId'] as String,
+    );
   }
 }
 
@@ -665,6 +746,7 @@ class _MainShellState extends State<MainShell> {
 
   String? selectedServerId;
   String? selectedChannelId;
+  String? realtimeServerId;
   String? realtimeChannelId;
 
   bool isLoading = true;
@@ -675,7 +757,14 @@ class _MainShellState extends State<MainShell> {
   void initState() {
     super.initState();
     currentUser = widget.initialUser;
-    realtimeClient.connect(onMessageNew: handleRealtimeMessage);
+    realtimeClient.connect(
+      onMessageNew: handleRealtimeMessage,
+      onMessageUpdate: handleRealtimeMessageUpdate,
+      onMessageDelete: handleRealtimeMessageDelete,
+      onChannelNew: handleRealtimeChannelNew,
+      onChannelUpdate: handleRealtimeChannelUpdate,
+      onChannelDelete: handleRealtimeChannelDelete,
+    );
     loadInitialData();
   }
 
@@ -697,6 +786,151 @@ class _MainShellState extends State<MainShell> {
     setState(() {
       messages = [...messages, message];
     });
+  }
+
+  void handleRealtimeMessageUpdate(AppMessage message) {
+    if (!mounted || message.channelId != selectedChannelId) {
+      return;
+    }
+
+    setState(() {
+      messages = messages
+          .map((item) => item.id == message.id ? message : item)
+          .toList();
+    });
+  }
+
+  void handleRealtimeMessageDelete(RealtimeMessageDelete message) {
+    if (!mounted || message.channelId != selectedChannelId) {
+      return;
+    }
+
+    setState(() {
+      messages = messages.where((item) => item.id != message.id).toList();
+    });
+  }
+
+  void handleRealtimeChannelNew(AppChannel channel) {
+    if (!mounted ||
+        channel.serverId == null ||
+        channel.serverId != selectedServerId) {
+      return;
+    }
+
+    if (!canViewRealtimeChannel(channel)) {
+      return;
+    }
+
+    if (channels.any((item) => item.id == channel.id)) {
+      return;
+    }
+
+    setState(() {
+      channels = sortChannels([...channels, channel]);
+    });
+  }
+
+  void handleRealtimeChannelUpdate(AppChannel channel) {
+    if (!mounted ||
+        channel.serverId == null ||
+        channel.serverId != selectedServerId) {
+      return;
+    }
+
+    if (!canViewRealtimeChannel(channel)) {
+      handleRealtimeChannelDelete(
+        RealtimeChannelDelete(id: channel.id, serverId: channel.serverId!),
+      );
+      return;
+    }
+
+    setState(() {
+      channels = sortChannels(
+        channels
+            .map<AppChannel>((item) => item.id == channel.id ? channel : item)
+            .toList(),
+      );
+    });
+  }
+
+  void handleRealtimeChannelDelete(RealtimeChannelDelete channel) {
+    if (!mounted || channel.serverId != selectedServerId) {
+      return;
+    }
+
+    final remainingChannels = channels
+        .where((item) => item.id != channel.id)
+        .toList();
+    final deletedSelectedChannel = selectedChannelId == channel.id;
+    final nextChannel = deletedSelectedChannel && remainingChannels.isNotEmpty
+        ? remainingChannels.first
+        : null;
+
+    setState(() {
+      channels = remainingChannels;
+
+      if (deletedSelectedChannel) {
+        selectedChannelId = nextChannel?.id;
+        messages = [];
+      }
+    });
+
+    if (deletedSelectedChannel) {
+      if (nextChannel != null) {
+        selectChannel(nextChannel.id);
+      } else {
+        syncRealtimeChannel(null);
+      }
+    }
+  }
+
+  bool get isSelectedServerOwner {
+    final serverId = selectedServerId;
+    final userId = currentUser?.id;
+
+    if (serverId == null || userId == null) {
+      return false;
+    }
+
+    final server = servers.cast<AppServer?>().firstWhere(
+      (item) => item?.id == serverId,
+      orElse: () => null,
+    );
+
+    return server?.ownerId == userId;
+  }
+
+  bool canViewRealtimeChannel(AppChannel channel) {
+    return isSelectedServerOwner || channel.resolvedPermissions.canView;
+  }
+
+  List<AppChannel> sortChannels(List<AppChannel> items) {
+    return [...items]
+      ..sort((left, right) {
+        final positionCompare = left.position.compareTo(right.position);
+
+        if (positionCompare != 0) {
+          return positionCompare;
+        }
+
+        return left.name.compareTo(right.name);
+      });
+  }
+
+  void syncRealtimeServer(String? nextServerId) {
+    if (realtimeServerId == nextServerId) {
+      return;
+    }
+
+    if (realtimeServerId != null) {
+      realtimeClient.leaveServer(realtimeServerId!);
+    }
+
+    realtimeServerId = nextServerId;
+
+    if (nextServerId != null) {
+      realtimeClient.joinServer(nextServerId);
+    }
   }
 
   void syncRealtimeChannel(AppChannel? channel) {
@@ -755,6 +989,7 @@ class _MainShellState extends State<MainShell> {
         messages = loadedMessages;
         isLoading = false;
       });
+      syncRealtimeServer(firstServerId);
       syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
       setState(() {
@@ -796,6 +1031,7 @@ class _MainShellState extends State<MainShell> {
         messages = loadedMessages;
         isLoading = false;
       });
+      syncRealtimeServer(serverId);
       syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
       setState(() {
@@ -979,6 +1215,7 @@ class _MainShellState extends State<MainShell> {
         messages = [];
         isLoading = false;
       });
+      syncRealtimeServer(server.id);
       syncRealtimeChannel(
         loadedChannels.isNotEmpty ? loadedChannels.first : null,
       );
@@ -1064,6 +1301,7 @@ class _MainShellState extends State<MainShell> {
         messages = loadedMessages;
         isLoading = false;
       });
+      syncRealtimeServer(server.id);
       syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
       setState(() {
@@ -1126,7 +1364,15 @@ class _MainShellState extends State<MainShell> {
       );
 
       setState(() {
-        channels = [...channels, channel];
+        channels = sortChannels(
+          channels.any((item) => item.id == channel.id)
+              ? channels
+                  .map<AppChannel>(
+                    (item) => item.id == channel.id ? channel : item,
+                  )
+                  .toList()
+              : [...channels, channel],
+        );
         selectedChannelId = channel.id;
         messages = [];
       });
