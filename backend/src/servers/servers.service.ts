@@ -1,11 +1,19 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateServerDto } from './dto/create-server.dto';
 import { UpdateServerDto } from './dto/update-server.dto';
+import { ServersGateway } from './servers.gateway';
 
 @Injectable()
 export class ServersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly serversGateway: ServersGateway,
+  ) {}
 
   private async getServerOrThrow(serverId: string) {
     const server = await this.prisma.server.findUnique({
@@ -212,6 +220,13 @@ export class ServersService {
       },
     });
 
+    this.serversGateway.emitMemberLeave({
+      serverId,
+      userId,
+      memberId: member.id,
+      reason: 'leave',
+    });
+
     return {
       message: 'Вы вышли с сервера',
     };
@@ -240,9 +255,15 @@ export class ServersService {
       },
     });
 
+    this.serversGateway.emitMemberLeave({
+      serverId,
+      userId: member.userId,
+      memberId: member.id,
+      reason: 'kick',
+    });
+
     return {
       message: 'Участник удалён с сервера',
     };
   }
-
 }

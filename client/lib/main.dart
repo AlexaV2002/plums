@@ -332,6 +332,7 @@ class RealtimeClient {
     required ValueChanged<AppChannel> onChannelNew,
     required ValueChanged<AppChannel> onChannelUpdate,
     required ValueChanged<RealtimeChannelDelete> onChannelDelete,
+    required ValueChanged<RealtimeMemberLeave> onMemberLeave,
   }) {
     socket.on('message:new', (data) {
       if (data is Map) {
@@ -349,6 +350,14 @@ class RealtimeClient {
       if (data is Map) {
         onMessageDelete(
           RealtimeMessageDelete.fromJson(Map<String, dynamic>.from(data)),
+        );
+      }
+    });
+
+    socket.on('member:leave', (data) {
+      if (data is Map) {
+        onMemberLeave(
+          RealtimeMemberLeave.fromJson(Map<String, dynamic>.from(data)),
         );
       }
     });
@@ -415,6 +424,29 @@ class RealtimeMessageDelete {
     return RealtimeMessageDelete(
       id: json['id'] as String,
       channelId: json['channelId'] as String,
+    );
+  }
+}
+
+class RealtimeMemberLeave {
+  const RealtimeMemberLeave({
+    required this.serverId,
+    required this.userId,
+    required this.memberId,
+    required this.reason,
+  });
+
+  final String serverId;
+  final String userId;
+  final String memberId;
+  final String reason;
+
+  factory RealtimeMemberLeave.fromJson(Map<String, dynamic> json) {
+    return RealtimeMemberLeave(
+      serverId: json['serverId'] as String,
+      userId: json['userId'] as String,
+      memberId: json['memberId'] as String,
+      reason: json['reason'] as String,
     );
   }
 }
@@ -907,6 +939,7 @@ class _MainShellState extends State<MainShell> {
       onChannelNew: handleRealtimeChannelNew,
       onChannelUpdate: handleRealtimeChannelUpdate,
       onChannelDelete: handleRealtimeChannelDelete,
+      onMemberLeave: handleRealtimeMemberLeave,
     );
     loadInitialData();
   }
@@ -999,6 +1032,24 @@ class _MainShellState extends State<MainShell> {
             .toList(),
       );
     });
+  }
+
+  void handleRealtimeMemberLeave(RealtimeMemberLeave event) {
+    if (!mounted || event.serverId != selectedServerId) {
+      return;
+    }
+
+    setState(() {
+      members = members.where((item) => item.id != event.memberId).toList();
+    });
+
+    if (event.userId == currentUser?.id) {
+      selectNextServerAfterRemoving(event.serverId);
+      showErrorSnackBar(
+        context,
+        event.reason == 'kick' ? 'Вас удалили с сервера' : 'Вы вышли с сервера',
+      );
+    }
   }
 
   void handleRealtimeChannelDelete(RealtimeChannelDelete channel) {
@@ -1119,6 +1170,9 @@ class _MainShellState extends State<MainShell> {
       final loadedChannels = firstServerId != null
           ? await apiClient.getChannels(firstServerId)
           : <AppChannel>[];
+      final loadedMembers = firstServerId != null
+          ? await apiClient.getServerMembers(firstServerId)
+          : <AppServerMember>[];
 
       final firstChannel = loadedChannels.isNotEmpty
           ? loadedChannels.first
@@ -1134,6 +1188,7 @@ class _MainShellState extends State<MainShell> {
         servers = loadedServers;
         selectedServerId = firstServerId;
         channels = loadedChannels;
+        members = loadedMembers;
         selectedChannelId = firstChannel?.id;
         messages = loadedMessages;
         isLoading = false;
@@ -1157,6 +1212,7 @@ class _MainShellState extends State<MainShell> {
     setState(() {
       selectedServerId = serverId;
       channels = [];
+      members = [];
       selectedChannelId = null;
       messages = [];
       isLoading = true;
@@ -1165,6 +1221,7 @@ class _MainShellState extends State<MainShell> {
 
     try {
       final loadedChannels = await apiClient.getChannels(serverId);
+      final loadedMembers = await apiClient.getServerMembers(serverId);
       final firstChannel = loadedChannels.isNotEmpty
           ? loadedChannels.first
           : null;
@@ -1176,6 +1233,7 @@ class _MainShellState extends State<MainShell> {
 
       setState(() {
         channels = loadedChannels;
+        members = loadedMembers;
         selectedChannelId = firstChannel?.id;
         messages = loadedMessages;
         isLoading = false;
@@ -1190,10 +1248,7 @@ class _MainShellState extends State<MainShell> {
 
         if (!mounted) return;
 
-        showErrorSnackBar(
-          context,
-          'Вы больше не состоите на этом сервере',
-        );
+        showErrorSnackBar(context, 'Вы больше не состоите на этом сервере');
 
         return;
       }
@@ -1273,16 +1328,6 @@ class _MainShellState extends State<MainShell> {
       setState(() {
         members = loadedMembers;
       });
-
-      if (!mounted) return;
-
-      await showServerMembersDialog(
-        context: context,
-        members: loadedMembers,
-        currentUserId: currentUser?.id,
-        isServerOwner: isSelectedServerOwner,
-        onKickMember: kickMember,
-      );
     } on DioException catch (error) {
       if (!mounted) return;
 
@@ -1452,7 +1497,17 @@ class _MainShellState extends State<MainShell> {
       confirmText: 'Создать',
     );
 
-    if (name == null || name.trim().isEmpty) {
+    if (name == null) {
+      return;
+    }
+
+    final trimmedName = name.trim();
+
+    if (trimmedName.length < 2) {
+      showErrorSnackBar(
+        context,
+        'Название сервера должно быть не короче 2 символов',
+      );
       return;
     }
 
@@ -1462,13 +1517,15 @@ class _MainShellState extends State<MainShell> {
     });
 
     try {
-      final server = await apiClient.createServer(name: name.trim());
+      final server = await apiClient.createServer(name: trimmedName);
       final loadedChannels = await apiClient.getChannels(server.id);
+      final loadedMembers = await apiClient.getServerMembers(server.id);
 
       setState(() {
         servers = [...servers, server];
         selectedServerId = server.id;
         channels = loadedChannels;
+        members = loadedMembers;
         selectedChannelId = loadedChannels.isNotEmpty
             ? loadedChannels.first.id
             : null;
@@ -1480,15 +1537,24 @@ class _MainShellState extends State<MainShell> {
         loadedChannels.isNotEmpty ? loadedChannels.first : null,
       );
     } on DioException catch (error) {
+      if (!mounted) return;
+
       setState(() {
-        errorMessage = 'Ошибка создания сервера: ${error.response?.data}';
         isLoading = false;
       });
+
+      showErrorSnackBar(
+        context,
+        'Ошибка создания сервера: ${error.response?.data}',
+      );
     } catch (error) {
+      if (!mounted) return;
+
       setState(() {
-        errorMessage = 'Не удалось создать сервер: $error';
         isLoading = false;
       });
+
+      showErrorSnackBar(context, 'Не удалось создать сервер: $error');
     }
   }
 
@@ -1507,6 +1573,10 @@ class _MainShellState extends State<MainShell> {
         channels = [];
         selectedChannelId = null;
         messages = [];
+        members = [];
+        isMessagesLoading = false;
+        isLoading = false;
+        errorMessage = null;
       });
       syncRealtimeServer(null);
       syncRealtimeChannel(null);
@@ -1673,6 +1743,7 @@ class _MainShellState extends State<MainShell> {
       final server = await apiClient.joinInvite(code);
       final loadedServers = await apiClient.getServers();
       final loadedChannels = await apiClient.getChannels(server.id);
+      final loadedMembers = await apiClient.getServerMembers(server.id);
       final firstChannel = loadedChannels.isNotEmpty
           ? loadedChannels.first
           : null;
@@ -1685,6 +1756,7 @@ class _MainShellState extends State<MainShell> {
         servers = loadedServers;
         selectedServerId = server.id;
         channels = loadedChannels;
+        members = loadedMembers;
         selectedChannelId = firstChannel?.id;
         messages = loadedMessages;
         isLoading = false;
@@ -2044,6 +2116,14 @@ class _MainShellState extends State<MainShell> {
                     onShowMembers: showMembers,
                   ),
           ),
+          if (selectedServer != null)
+            MembersSidebar(
+              members: members,
+              currentUserId: user.id,
+              isServerOwner: canManageChannels,
+              onKickMember: kickMember,
+              onRefresh: showMembers,
+            ),
         ],
       ),
     );
@@ -2819,6 +2899,160 @@ class ChatHeader extends StatelessWidget {
             onPressed: onShowMembers,
             icon: const Icon(Icons.people_alt_outlined),
             color: const Color(0xFFB8ADC8),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class MembersSidebar extends StatelessWidget {
+  const MembersSidebar({
+    super.key,
+    required this.members,
+    required this.currentUserId,
+    required this.isServerOwner,
+    required this.onKickMember,
+    required this.onRefresh,
+  });
+
+  final List<AppServerMember> members;
+  final String currentUserId;
+  final bool isServerOwner;
+  final ValueChanged<AppServerMember> onKickMember;
+  final VoidCallback onRefresh;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 240,
+      decoration: const BoxDecoration(
+        color: Color(0xFF191620),
+        border: Border(left: BorderSide(color: Color(0xFF2B2633), width: 1)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            height: 58,
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            decoration: const BoxDecoration(
+              color: Color(0xFF1D1925),
+              border: Border(
+                bottom: BorderSide(color: Color(0xFF2B2633), width: 1),
+              ),
+            ),
+            child: Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Участники',
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: Color(0xFFF3EEFF),
+                      fontSize: 14,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Обновить',
+                  onPressed: onRefresh,
+                  icon: const Icon(Icons.refresh_rounded),
+                  color: const Color(0xFFB8ADC8),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: members.isEmpty
+                ? const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(18),
+                      child: Text(
+                        'Участников пока нет',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Color(0xFF8F849F),
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  )
+                : ListView.separated(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: members.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 8),
+                    itemBuilder: (context, index) {
+                      final member = members[index];
+                      final user = member.user;
+                      final letter = user.username.isNotEmpty
+                          ? user.username.characters.first.toUpperCase()
+                          : '?';
+                      final canKick =
+                          isServerOwner &&
+                          member.userId != currentUserId &&
+                          member.id.isNotEmpty;
+
+                      return Row(
+                        children: [
+                          Container(
+                            width: 36,
+                            height: 36,
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF8D5CFF),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Center(
+                              child: Text(
+                                letter,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  user.username,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Color(0xFFF3EEFF),
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  user.status,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Color(0xFF8F849F),
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          if (canKick)
+                            IconButton(
+                              tooltip: 'Удалить участника',
+                              onPressed: () => onKickMember(member),
+                              icon: const Icon(Icons.person_remove_outlined),
+                              color: const Color(0xFFFF7A7A),
+                            ),
+                        ],
+                      );
+                    },
+                  ),
           ),
         ],
       ),
