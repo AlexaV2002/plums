@@ -1183,11 +1183,30 @@ class _MainShellState extends State<MainShell> {
       syncRealtimeServer(serverId);
       syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
+      final statusCode = error.response?.statusCode;
+
+      if (statusCode == 403 || statusCode == 404) {
+        await selectNextServerAfterRemoving(serverId);
+
+        if (!mounted) return;
+
+        showErrorSnackBar(
+          context,
+          'Вы больше не состоите на этом сервере',
+        );
+
+        return;
+      }
+
+      if (!mounted) return;
+
       setState(() {
         errorMessage = 'Ошибка загрузки каналов: ${error.response?.data}';
         isLoading = false;
       });
     } catch (error) {
+      if (!mounted) return;
+
       setState(() {
         errorMessage = 'Не удалось загрузить каналы: $error';
         isLoading = false;
@@ -1225,11 +1244,15 @@ class _MainShellState extends State<MainShell> {
       });
       syncRealtimeChannel(channel);
     } on DioException catch (error) {
+      if (!mounted) return;
+
       setState(() {
         errorMessage = 'Ошибка загрузки сообщений: ${error.response?.data}';
         isMessagesLoading = false;
       });
     } catch (error) {
+      if (!mounted) return;
+
       setState(() {
         errorMessage = 'Не удалось загрузить сообщения: $error';
         isMessagesLoading = false;
@@ -3800,9 +3823,10 @@ Future<void> showServerMembersDialog({
                     final letter = user.username.isNotEmpty
                         ? user.username.characters.first.toUpperCase()
                         : '?';
+
                     final canKick =
                         isServerOwner &&
-                        user.id != currentUserId &&
+                        member.userId != currentUserId &&
                         member.id.isNotEmpty;
 
                     return Container(
