@@ -1276,8 +1276,17 @@ class _MainShellState extends State<MainShell> {
 
   Future<void> kickMember(AppServerMember member) async {
     final serverId = selectedServerId;
+    final memberId = member.id;
 
     if (serverId == null) {
+      return;
+    }
+
+    if (memberId.isEmpty) {
+      showErrorSnackBar(
+        context,
+        'Не удалось удалить участника: пустой memberId',
+      );
       return;
     }
 
@@ -1293,18 +1302,13 @@ class _MainShellState extends State<MainShell> {
     }
 
     try {
-      await apiClient.kickServerMember(
-        serverId: serverId,
-        memberId: member.id,
-      );
-
-      final loadedMembers = await apiClient.getServerMembers(serverId);
-
-      setState(() {
-        members = loadedMembers;
-      });
+      await apiClient.kickServerMember(serverId: serverId, memberId: memberId);
 
       if (!mounted) return;
+
+      setState(() {
+        members = members.where((item) => item.id != memberId).toList();
+      });
 
       showErrorSnackBar(context, 'Участник удалён с сервера');
     } on DioException catch (error) {
@@ -3796,7 +3800,10 @@ Future<void> showServerMembersDialog({
                     final letter = user.username.isNotEmpty
                         ? user.username.characters.first.toUpperCase()
                         : '?';
-                    final canKick = isServerOwner && user.id != currentUserId;
+                    final canKick =
+                        isServerOwner &&
+                        user.id != currentUserId &&
+                        member.id.isNotEmpty;
 
                     return Container(
                       padding: const EdgeInsets.all(12),
