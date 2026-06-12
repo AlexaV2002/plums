@@ -323,6 +323,7 @@ class RealtimeClient {
   late final io.Socket socket;
 
   void connect({
+    required String accessToken,
     required ValueChanged<AppMessage> onMessageNew,
     required ValueChanged<AppMessage> onMessageUpdate,
     required ValueChanged<RealtimeMessageDelete> onMessageDelete,
@@ -330,7 +331,18 @@ class RealtimeClient {
     required ValueChanged<AppChannel> onChannelUpdate,
     required ValueChanged<RealtimeChannelDelete> onChannelDelete,
     required ValueChanged<RealtimeMemberLeave> onMemberLeave,
+    required ValueChanged<RealtimeUserStatus> onUserStatus,
   }) {
+    void identifyPresence() {
+      socket.emit('presence:identify', {'token': accessToken});
+    }
+
+    socket.onConnect((_) => identifyPresence());
+
+    if (socket.connected) {
+      identifyPresence();
+    }
+
     socket.on('message:new', (data) {
       if (data is Map) {
         onMessageNew(AppMessage.fromJson(Map<String, dynamic>.from(data)));
@@ -355,6 +367,14 @@ class RealtimeClient {
       if (data is Map) {
         onMemberLeave(
           RealtimeMemberLeave.fromJson(Map<String, dynamic>.from(data)),
+        );
+      }
+    });
+
+    socket.on('user:status', (data) {
+      if (data is Map) {
+        onUserStatus(
+          RealtimeUserStatus.fromJson(Map<String, dynamic>.from(data)),
         );
       }
     });
@@ -444,6 +464,20 @@ class RealtimeMemberLeave {
       userId: json['userId'] as String,
       memberId: json['memberId'] as String,
       reason: json['reason'] as String,
+    );
+  }
+}
+
+class RealtimeUserStatus {
+  const RealtimeUserStatus({required this.userId, required this.status});
+
+  final String userId;
+  final String status;
+
+  factory RealtimeUserStatus.fromJson(Map<String, dynamic> json) {
+    return RealtimeUserStatus(
+      userId: json['userId'] as String,
+      status: json['status'] as String,
     );
   }
 }
@@ -930,6 +964,7 @@ class _MainShellState extends State<MainShell> {
     super.initState();
     currentUser = widget.initialUser;
     realtimeClient.connect(
+      accessToken: apiClient.accessToken ?? '',
       onMessageNew: handleRealtimeMessage,
       onMessageUpdate: handleRealtimeMessageUpdate,
       onMessageDelete: handleRealtimeMessageDelete,
@@ -937,6 +972,7 @@ class _MainShellState extends State<MainShell> {
       onChannelUpdate: handleRealtimeChannelUpdate,
       onChannelDelete: handleRealtimeChannelDelete,
       onMemberLeave: handleRealtimeMemberLeave,
+      onUserStatus: handleRealtimeUserStatus,
     );
     loadInitialData();
   }
@@ -1062,6 +1098,28 @@ class _MainShellState extends State<MainShell> {
         event.reason == 'kick' ? 'Вас удалили с сервера' : 'Вы вышли с сервера',
       );
     }
+  }
+
+  void handleRealtimeUserStatus(RealtimeUserStatus event) {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      if (currentUser?.id == event.userId) {
+        currentUser = currentUser?.copyWith(status: event.status);
+      }
+
+      members = members
+          .map<AppServerMember>(
+            (member) => member.userId == event.userId
+                ? member.copyWith(
+                    user: member.user.copyWith(status: event.status),
+                  )
+                : member,
+          )
+          .toList();
+    });
   }
 
   void handleRealtimeChannelDelete(RealtimeChannelDelete channel) {
@@ -1194,9 +1252,13 @@ class _MainShellState extends State<MainShell> {
           firstChannel != null && firstChannel.type == ChannelType.text
           ? await apiClient.getMessages(firstChannel.id)
           : <AppMessage>[];
+      final currentMember = loadedMembers.cast<AppServerMember?>().firstWhere(
+        (member) => member?.userId == me.id,
+        orElse: () => null,
+      );
 
       setState(() {
-        currentUser = me;
+        currentUser = currentMember?.user ?? me;
         servers = loadedServers;
         selectedServerId = firstServerId;
         channels = loadedChannels;
@@ -2767,6 +2829,12 @@ class UserPanel extends StatelessWidget {
     final letter = user.username.isNotEmpty
         ? user.username.characters.first.toUpperCase()
         : '?';
+    final statusColor = switch (user.status) {
+      'ONLINE' => const Color(0xFF35D07F),
+      'AWAY' => const Color(0xFFFFC66D),
+      'DO_NOT_DISTURB' => const Color(0xFFFF5C7A),
+      _ => const Color(0xFF6F657C),
+    };
 
     return Container(
       height: 68,
@@ -2801,7 +2869,7 @@ class UserPanel extends StatelessWidget {
                   width: 13,
                   height: 13,
                   decoration: BoxDecoration(
-                    color: const Color(0xFF35D07F),
+                    color: statusColor,
                     borderRadius: BorderRadius.circular(99),
                     border: Border.all(
                       color: const Color(0xFF141119),
@@ -4421,6 +4489,24 @@ class AppUser {
       status: json['status'] as String,
     );
   }
+
+  AppUser copyWith({
+    String? id,
+    String? username,
+    String? email,
+    String? avatarUrl,
+    String? bio,
+    String? status,
+  }) {
+    return AppUser(
+      id: id ?? this.id,
+      username: username ?? this.username,
+      email: email ?? this.email,
+      avatarUrl: avatarUrl ?? this.avatarUrl,
+      bio: bio ?? this.bio,
+      status: status ?? this.status,
+    );
+  }
 }
 
 class AppServer {
@@ -4697,6 +4783,22 @@ class AppServerMember {
       userId: json['userId'] as String,
       joinedAt: DateTime.tryParse(json['joinedAt'] as String? ?? ''),
       user: AppUser.fromJson(json['user'] as Map<String, dynamic>),
+    );
+  }
+
+  AppServerMember copyWith({
+    String? id,
+    String? serverId,
+    String? userId,
+    DateTime? joinedAt,
+    AppUser? user,
+  }) {
+    return AppServerMember(
+      id: id ?? this.id,
+      serverId: serverId ?? this.serverId,
+      userId: userId ?? this.userId,
+      joinedAt: joinedAt ?? this.joinedAt,
+      user: user ?? this.user,
     );
   }
 }
