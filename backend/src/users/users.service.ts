@@ -1,10 +1,14 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { UpdateMeDto } from './dto/update-me.dto';
+import { UsersGateway } from './users.gateway';
 
 @Injectable()
 export class UsersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly usersGateway: UsersGateway,
+  ) {}
 
   findByEmail(email: string) {
     return this.prisma.user.findUnique({
@@ -55,7 +59,7 @@ export class UsersService {
   }
 
   async updateMe(userId: string, dto: UpdateMeDto) {
-    return this.prisma.user.update({
+    const user = await this.prisma.user.update({
       where: { id: userId },
       data: {
         username: dto.username,
@@ -73,6 +77,12 @@ export class UsersService {
         updatedAt: true,
       },
     });
+
+    if (dto.status) {
+      this.usersGateway.emitUserStatus(user.id, user.status);
+    }
+
+    return user;
   }
 
   toPublicUser(user: {
