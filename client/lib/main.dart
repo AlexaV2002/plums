@@ -16,10 +16,7 @@ class PlumsApp extends StatelessWidget {
     return MaterialApp(
       title: 'plums',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        fontFamily: 'Segoe UI',
-        scaffoldBackgroundColor: const Color(0xFF15131A),
-      ),
+      theme: ThemeData(scaffoldBackgroundColor: const Color(0xFF15131A)),
       home: const AuthGate(),
     );
   }
@@ -955,6 +952,15 @@ class _MainShellState extends State<MainShell> {
     await widget.onLoggedOut();
   }
 
+  bool handleUnauthorized(DioException error) {
+    if (error.response?.statusCode != 401) {
+      return false;
+    }
+
+    logout();
+    return true;
+  }
+
   void handleRealtimeMessage(AppMessage message) {
     if (!mounted || message.channelId != selectedChannelId) {
       return;
@@ -1026,10 +1032,16 @@ class _MainShellState extends State<MainShell> {
     }
 
     setState(() {
+      final hasChannel = channels.any((item) => item.id == channel.id);
+
       channels = sortChannels(
-        channels
-            .map<AppChannel>((item) => item.id == channel.id ? channel : item)
-            .toList(),
+        hasChannel
+            ? channels
+                  .map<AppChannel>(
+                    (item) => item.id == channel.id ? channel : item,
+                  )
+                  .toList()
+            : [...channels, channel],
       );
     });
   }
@@ -1196,6 +1208,7 @@ class _MainShellState extends State<MainShell> {
       syncRealtimeServer(firstServerId);
       syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
       setState(() {
         errorMessage = 'Ошибка загрузки данных: ${error.response?.data}';
         isLoading = false;
@@ -1241,6 +1254,7 @@ class _MainShellState extends State<MainShell> {
       syncRealtimeServer(serverId);
       syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
       final statusCode = error.response?.statusCode;
 
       if (statusCode == 403 || statusCode == 404) {
@@ -1299,6 +1313,8 @@ class _MainShellState extends State<MainShell> {
       });
       syncRealtimeChannel(channel);
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       setState(() {
@@ -1329,6 +1345,8 @@ class _MainShellState extends State<MainShell> {
         members = loadedMembers;
       });
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -1400,18 +1418,35 @@ class _MainShellState extends State<MainShell> {
       return;
     }
 
-    final sentMessage = await apiClient.sendMessage(
-      channelId: channelId,
-      content: content,
-    );
+    try {
+      final sentMessage = await apiClient.sendMessage(
+        channelId: channelId,
+        content: content,
+      );
 
-    setState(() {
-      if (messages.any((item) => item.id == sentMessage.id)) {
-        return;
-      }
+      if (!mounted) return;
 
-      messages = [...messages, sentMessage];
-    });
+      setState(() {
+        if (messages.any((item) => item.id == sentMessage.id)) {
+          return;
+        }
+
+        messages = [...messages, sentMessage];
+      });
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        'Ошибка отправки сообщения: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось отправить сообщение: $error');
+    }
   }
 
   Future<void> editMessage(AppMessage message) async {
@@ -1764,6 +1799,9 @@ class _MainShellState extends State<MainShell> {
       syncRealtimeServer(server.id);
       syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
+      if (!mounted) return;
       setState(() {
         errorMessage = 'Ошибка вступления на сервер: ${error.response?.data}';
         isLoading = false;
@@ -1790,6 +1828,8 @@ class _MainShellState extends State<MainShell> {
 
       await showInviteDialog(context: context, invite: invite);
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -1803,23 +1843,38 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
-  Future<void> createChannel() async {
+  Future<void> createChannel({
+    ChannelType initialType = ChannelType.text,
+  }) async {
     final serverId = selectedServerId;
 
     if (serverId == null) {
       return;
     }
 
-    final result = await showCreateChannelDialog(context: context);
+    final result = await showCreateChannelDialog(
+      context: context,
+      initialType: initialType,
+    );
 
     if (result == null) {
+      return;
+    }
+
+    final channelName = result.name.trim();
+
+    if (channelName.length < 2) {
+      showErrorSnackBar(
+        context,
+        'Название канала должно быть не короче 2 символов',
+      );
       return;
     }
 
     try {
       final channel = await apiClient.createChannel(
         serverId: serverId,
-        name: result.name,
+        name: channelName,
         type: result.type,
       );
 
@@ -1837,10 +1892,10 @@ class _MainShellState extends State<MainShell> {
         messages = [];
       });
 
-      if (channel.type == ChannelType.text) {
-        await selectChannel(channel.id);
-      }
+      await selectChannel(channel.id);
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -1901,14 +1956,24 @@ class _MainShellState extends State<MainShell> {
       confirmText: 'Сохранить',
     );
 
-    if (newName == null || newName.trim().isEmpty) {
+    if (newName == null) {
+      return;
+    }
+
+    final channelName = newName.trim();
+
+    if (channelName.length < 2) {
+      showErrorSnackBar(
+        context,
+        'Название канала должно быть не короче 2 символов',
+      );
       return;
     }
 
     try {
       final updatedChannel = await apiClient.updateChannel(
         channelId: channel.id,
-        name: newName.trim(),
+        name: channelName,
       );
 
       setState(() {
@@ -2104,7 +2169,15 @@ class _MainShellState extends State<MainShell> {
           ),
           Expanded(
             child: selectedChannel == null
-                ? const EmptyChatPlaceholder()
+                ? EmptyChatPlaceholder(
+                    hasSelectedServer: selectedServer != null,
+                    canCreateChannel:
+                        selectedServer != null && canManageChannels,
+                    onCreateTextChannel: () =>
+                        createChannel(initialType: ChannelType.text),
+                    onCreateVoiceChannel: () =>
+                        createChannel(initialType: ChannelType.voice),
+                  )
                 : ChatArea(
                     channel: selectedChannel,
                     messages: messages,
@@ -2767,19 +2840,97 @@ class UserPanel extends StatelessWidget {
 ========================= */
 
 class EmptyChatPlaceholder extends StatelessWidget {
-  const EmptyChatPlaceholder({super.key});
+  const EmptyChatPlaceholder({
+    super.key,
+    required this.hasSelectedServer,
+    required this.canCreateChannel,
+    required this.onCreateTextChannel,
+    required this.onCreateVoiceChannel,
+  });
+
+  final bool hasSelectedServer;
+  final bool canCreateChannel;
+  final VoidCallback onCreateTextChannel;
+  final VoidCallback onCreateVoiceChannel;
 
   @override
   Widget build(BuildContext context) {
     return Container(
       color: const Color(0xFF211C29),
-      child: const Center(
-        child: Text(
-          'На этом сервере пока нет каналов',
-          style: TextStyle(
-            color: Color(0xFFB8ADC8),
-            fontSize: 16,
-            fontWeight: FontWeight.w700,
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                hasSelectedServer
+                    ? Icons.forum_outlined
+                    : Icons.add_circle_outline_rounded,
+                color: const Color(0xFF8D5CFF),
+                size: 42,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                hasSelectedServer
+                    ? 'На этом сервере пока нет каналов'
+                    : 'Выберите или создайте сервер',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Color(0xFFF3EEFF),
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                hasSelectedServer
+                    ? canCreateChannel
+                          ? 'Создайте первый текстовый или голосовой канал.'
+                          : 'Попросите владельца сервера создать канал.'
+                    : 'Серверы появятся в левой панели.',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Color(0xFF8F849F),
+                  fontSize: 14,
+                  height: 1.35,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              if (hasSelectedServer && canCreateChannel) ...[
+                const SizedBox(height: 22),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    ElevatedButton.icon(
+                      onPressed: onCreateTextChannel,
+                      icon: const Icon(Icons.tag_rounded, size: 18),
+                      label: const Text('Текстовый'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF8D5CFF),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    OutlinedButton.icon(
+                      onPressed: onCreateVoiceChannel,
+                      icon: const Icon(Icons.volume_up_rounded, size: 18),
+                      label: const Text('Голосовой'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFFBFA7FF),
+                        side: const BorderSide(color: Color(0xFF40374D)),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ],
           ),
         ),
       ),
@@ -3558,9 +3709,10 @@ Future<void> showInviteDialog({
 
 Future<CreateChannelResult?> showCreateChannelDialog({
   required BuildContext context,
+  ChannelType initialType = ChannelType.text,
 }) {
   final controller = TextEditingController();
-  ChannelType selectedType = ChannelType.text;
+  ChannelType selectedType = initialType;
 
   return showDialog<CreateChannelResult>(
     context: context,
@@ -3901,31 +4053,48 @@ Future<ChannelPermissions?> showChannelPermissionsDialog({
                   onChanged: (value) {
                     setDialogState(() {
                       canView = value;
+
+                      if (!value) {
+                        canSendMessages = false;
+                        canConnect = false;
+                      }
                     });
                   },
                 ),
-                PermissionSwitchTile(
-                  title: 'Писать сообщения',
-                  subtitle:
-                      'Для текстовых каналов: можно отправлять сообщения.',
-                  value: canSendMessages,
-                  onChanged: (value) {
-                    setDialogState(() {
-                      canSendMessages = value;
-                    });
-                  },
-                ),
-                PermissionSwitchTile(
-                  title: 'Подключаться',
-                  subtitle:
-                      'Для голосовых каналов: можно подключаться к каналу.',
-                  value: canConnect,
-                  onChanged: (value) {
-                    setDialogState(() {
-                      canConnect = value;
-                    });
-                  },
-                ),
+                if (channel.type == ChannelType.text)
+                  PermissionSwitchTile(
+                    title: 'Писать сообщения',
+                    subtitle:
+                        'Для текстовых каналов: можно отправлять сообщения.',
+                    value: canSendMessages,
+                    enabled: canView,
+                    onChanged: (value) {
+                      if (!canView) {
+                        return;
+                      }
+
+                      setDialogState(() {
+                        canSendMessages = value;
+                      });
+                    },
+                  ),
+                if (channel.type == ChannelType.voice)
+                  PermissionSwitchTile(
+                    title: 'Подключаться',
+                    subtitle:
+                        'Для голосовых каналов: можно подключаться к каналу.',
+                    value: canConnect,
+                    enabled: canView,
+                    onChanged: (value) {
+                      if (!canView) {
+                        return;
+                      }
+
+                      setDialogState(() {
+                        canConnect = value;
+                      });
+                    },
+                  ),
                 const SizedBox(height: 22),
                 Row(
                   children: [
@@ -3988,32 +4157,34 @@ class PermissionSwitchTile extends StatelessWidget {
     required this.subtitle,
     required this.value,
     required this.onChanged,
+    this.enabled = true,
   });
 
   final String title;
   final String subtitle;
   final bool value;
   final ValueChanged<bool> onChanged;
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
     return SwitchListTile(
       value: value,
-      onChanged: onChanged,
+      onChanged: enabled ? onChanged : null,
       activeColor: const Color(0xFF8D5CFF),
       contentPadding: EdgeInsets.zero,
       title: Text(
         title,
-        style: const TextStyle(
-          color: Color(0xFFF3EEFF),
+        style: TextStyle(
+          color: enabled ? const Color(0xFFF3EEFF) : const Color(0xFF6F657C),
           fontSize: 14,
           fontWeight: FontWeight.w800,
         ),
       ),
       subtitle: Text(
         subtitle,
-        style: const TextStyle(
-          color: Color(0xFF8F849F),
+        style: TextStyle(
+          color: enabled ? const Color(0xFF8F849F) : const Color(0xFF5F566B),
           fontSize: 12,
           height: 1.3,
         ),
