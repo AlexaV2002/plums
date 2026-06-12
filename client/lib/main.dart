@@ -1398,6 +1398,8 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(context, 'Участник удалён с сервера');
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -1475,6 +1477,8 @@ class _MainShellState extends State<MainShell> {
             .toList();
       });
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -1510,6 +1514,8 @@ class _MainShellState extends State<MainShell> {
         messages = messages.where((item) => item.id != message.id).toList();
       });
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -1572,6 +1578,8 @@ class _MainShellState extends State<MainShell> {
         loadedChannels.isNotEmpty ? loadedChannels.first : null,
       );
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       setState(() {
@@ -1653,6 +1661,8 @@ class _MainShellState extends State<MainShell> {
             .toList();
       });
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -1683,6 +1693,8 @@ class _MainShellState extends State<MainShell> {
       await apiClient.deleteServer(serverId: server.id);
       await selectNextServerAfterRemoving(server.id);
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -1712,6 +1724,8 @@ class _MainShellState extends State<MainShell> {
       await apiClient.leaveServer(serverId: server.id);
       await selectNextServerAfterRemoving(server.id);
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -1933,6 +1947,8 @@ class _MainShellState extends State<MainShell> {
         currentUser = updatedUser;
       });
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -1984,6 +2000,8 @@ class _MainShellState extends State<MainShell> {
             .toList();
       });
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -2030,6 +2048,8 @@ class _MainShellState extends State<MainShell> {
         await selectChannel(nextChannel.id);
       }
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
@@ -2067,6 +2087,8 @@ class _MainShellState extends State<MainShell> {
             .toList();
       });
     } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
       if (!mounted) return;
 
       showErrorSnackBar(
