@@ -35,13 +35,94 @@ class ApiClient {
           receiveTimeout: const Duration(seconds: 5),
           headers: {'Content-Type': 'application/json'},
         ),
-      );
+      ) {
+    // Если access-токен истёк (401), пробуем тихо обновить его через refreshToken
+    // и повторить исходный запрос. Если обновить не удалось — отдаём исходную
+    // ошибку дальше, как раньше, и вызывающий код разлогинивает пользователя.
+    dio.interceptors.add(
+      InterceptorsWrapper(
+        onError: (error, handler) async {
+          final isUnauthorized = error.response?.statusCode == 401;
+          final isRefreshRequest = error.requestOptions.path == '/auth/refresh';
+          final alreadyRetried = error.requestOptions.extra['retried'] == true;
+
+          if (!isUnauthorized ||
+              isRefreshRequest ||
+              alreadyRetried ||
+              refreshToken == null) {
+            handler.next(error);
+            return;
+          }
+
+          try {
+            await _refreshTokens();
+          } catch (_) {
+            accessToken = null;
+            refreshToken = null;
+            await authStorage.clearTokens();
+            handler.next(error);
+            return;
+          }
+
+          final retryRequest = error.requestOptions;
+          retryRequest.headers['Authorization'] = 'Bearer $accessToken';
+          retryRequest.extra['retried'] = true;
+
+          try {
+            final response = await dio.fetch(retryRequest);
+            handler.resolve(response);
+          } on DioException catch (retryError) {
+            handler.next(retryError);
+          }
+        },
+      ),
+    );
+  }
 
   final Dio dio;
   String? accessToken;
+  String? refreshToken;
 
   Options get authOptions {
     return Options(headers: {'Authorization': 'Bearer $accessToken'});
+  }
+
+  Future<void> _refreshTokens() async {
+    final currentRefreshToken = refreshToken;
+
+    if (currentRefreshToken == null) {
+      throw StateError('Нет refresh-токена');
+    }
+
+    final response = await dio.post(
+      '/auth/refresh',
+      data: {'refreshToken': currentRefreshToken},
+    );
+
+    accessToken = response.data['accessToken'] as String;
+    refreshToken = response.data['refreshToken'] as String;
+
+    await authStorage.saveTokens(
+      accessToken: accessToken!,
+      refreshToken: refreshToken!,
+    );
+  }
+
+  Future<void> logout() async {
+    final currentRefreshToken = refreshToken;
+
+    if (currentRefreshToken == null) {
+      return;
+    }
+
+    try {
+      await dio.post(
+        '/auth/logout',
+        data: {'refreshToken': currentRefreshToken},
+      );
+    } catch (_) {
+      // Логаут на клиенте не должен блокироваться ошибкой бэкенда.
+    }
   }
 
   Future<void> register({
@@ -65,7 +146,9 @@ class ApiClient {
     );
 
     final token = response.data['accessToken'] as String;
+    final newRefreshToken = response.data['refreshToken'] as String;
     accessToken = token;
+    refreshToken = newRefreshToken;
 
     final userJson = response.data['user'] as Map<String, dynamic>;
 
@@ -160,6 +243,28 @@ class ApiClient {
     );
   }
 
+  Future<void> banServerMember({
+    required String serverId,
+    required String userId,
+    String? reason,
+  }) async {
+    await dio.post(
+      '/servers/$serverId/bans/$userId',
+      options: authOptions,
+      data: {if (reason != null && reason.isNotEmpty) 'reason': reason},
+    );
+  }
+
+  Future<void> unbanServerMember({
+    required String serverId,
+    required String userId,
+  }) async {
+    await dio.delete(
+      '/servers/$serverId/bans/$userId',
+      options: authOptions,
+    );
+  }
+
   Future<AppInvite> createInvite({required String serverId}) async {
     final response = await dio.post(
       '/servers/$serverId/invites',
@@ -242,10 +347,18 @@ class ApiClient {
     await dio.delete('/channels/$channelId', options: authOptions);
   }
 
-  Future<List<AppMessage>> getMessages(String channelId) async {
+  Future<List<AppMessage>> getMessages(
+    String channelId, {
+    int limit = 50,
+    String? before,
+  }) async {
     final response = await dio.get(
       '/channels/$channelId/messages',
       options: authOptions,
+      queryParameters: {
+        'limit': limit,
+        if (before != null) 'before': before,
+      },
     );
 
     final list = response.data as List;
@@ -292,10 +405,15 @@ final authStorage = AuthStorage();
 
 class AuthStorage {
   static const String _accessTokenKey = 'accessToken';
+  static const String _refreshTokenKey = 'refreshToken';
 
-  Future<void> saveAccessToken(String token) async {
+  Future<void> saveTokens({
+    required String accessToken,
+    required String refreshToken,
+  }) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_accessTokenKey, token);
+    await prefs.setString(_accessTokenKey, accessToken);
+    await prefs.setString(_refreshTokenKey, refreshToken);
   }
 
   Future<String?> readAccessToken() async {
@@ -303,9 +421,15 @@ class AuthStorage {
     return prefs.getString(_accessTokenKey);
   }
 
-  Future<void> clearAccessToken() async {
+  Future<String?> readRefreshToken() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_refreshTokenKey);
+  }
+
+  Future<void> clearTokens() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_accessTokenKey);
+    await prefs.remove(_refreshTokenKey);
   }
 }
 
@@ -519,6 +643,7 @@ class _AuthGateState extends State<AuthGate> {
 
   Future<void> restoreSession() async {
     final token = await authStorage.readAccessToken();
+    final storedRefreshToken = await authStorage.readRefreshToken();
 
     if (token == null || token.isEmpty) {
       if (!mounted) return;
@@ -532,6 +657,9 @@ class _AuthGateState extends State<AuthGate> {
 
     try {
       apiClient.accessToken = token;
+      apiClient.refreshToken = storedRefreshToken;
+      // Если accessToken уже истёк, ApiClient сам попробует тихо обновить его
+      // через refreshToken прямо во время этого запроса.
       final user = await apiClient.getMe();
 
       if (!mounted) return;
@@ -541,8 +669,9 @@ class _AuthGateState extends State<AuthGate> {
         isCheckingAuth = false;
       });
     } catch (_) {
-      await authStorage.clearAccessToken();
+      await authStorage.clearTokens();
       apiClient.accessToken = null;
+      apiClient.refreshToken = null;
 
       if (!mounted) return;
 
@@ -555,9 +684,16 @@ class _AuthGateState extends State<AuthGate> {
 
   Future<void> handleLogin(AppUser user) async {
     final token = apiClient.accessToken;
+    final refreshToken = apiClient.refreshToken;
 
-    if (token != null && token.isNotEmpty) {
-      await authStorage.saveAccessToken(token);
+    if (token != null &&
+        token.isNotEmpty &&
+        refreshToken != null &&
+        refreshToken.isNotEmpty) {
+      await authStorage.saveTokens(
+        accessToken: token,
+        refreshToken: refreshToken,
+      );
     }
 
     if (!mounted) return;
@@ -568,8 +704,10 @@ class _AuthGateState extends State<AuthGate> {
   }
 
   Future<void> handleLogout() async {
-    await authStorage.clearAccessToken();
+    await apiClient.logout();
+    await authStorage.clearTokens();
     apiClient.accessToken = null;
+    apiClient.refreshToken = null;
 
     if (!mounted) return;
 
@@ -957,6 +1095,8 @@ class _MainShellState extends State<MainShell> {
 
   bool isLoading = true;
   bool isMessagesLoading = false;
+  bool hasMoreMessages = false;
+  bool isLoadingMoreMessages = false;
   String? errorMessage;
 
   @override
@@ -1093,10 +1233,14 @@ class _MainShellState extends State<MainShell> {
 
     if (event.userId == currentUser?.id) {
       selectNextServerAfterRemoving(event.serverId);
-      showErrorSnackBar(
-        context,
-        event.reason == 'kick' ? 'Вас удалили с сервера' : 'Вы вышли с сервера',
-      );
+
+      final message = switch (event.reason) {
+        'kick' => 'Вас удалили с сервера',
+        'ban' => 'Вас забанили на сервере',
+        _ => 'Вы вышли с сервера',
+      };
+
+      showErrorSnackBar(context, message);
     }
   }
 
@@ -1265,6 +1409,7 @@ class _MainShellState extends State<MainShell> {
         members = loadedMembers;
         selectedChannelId = firstChannel?.id;
         messages = loadedMessages;
+        hasMoreMessages = loadedMessages.length >= 50;
         isLoading = false;
       });
       syncRealtimeServer(firstServerId);
@@ -1311,6 +1456,7 @@ class _MainShellState extends State<MainShell> {
         members = loadedMembers;
         selectedChannelId = firstChannel?.id;
         messages = loadedMessages;
+        hasMoreMessages = loadedMessages.length >= 50;
         isLoading = false;
       });
       syncRealtimeServer(serverId);
@@ -1355,6 +1501,7 @@ class _MainShellState extends State<MainShell> {
       selectedChannelId = channelId;
       messages = [];
       isMessagesLoading = channel.type == ChannelType.text;
+      hasMoreMessages = false;
       errorMessage = null;
     });
 
@@ -1367,10 +1514,15 @@ class _MainShellState extends State<MainShell> {
     }
 
     try {
-      final loadedMessages = await apiClient.getMessages(channel.id);
+      const pageSize = 50;
+      final loadedMessages = await apiClient.getMessages(
+        channel.id,
+        limit: pageSize,
+      );
 
       setState(() {
         messages = loadedMessages;
+        hasMoreMessages = loadedMessages.length >= pageSize;
         isMessagesLoading = false;
       });
       syncRealtimeChannel(channel);
@@ -1390,6 +1542,62 @@ class _MainShellState extends State<MainShell> {
         errorMessage = 'Не удалось загрузить сообщения: $error';
         isMessagesLoading = false;
       });
+    }
+  }
+
+  Future<void> loadMoreMessages() async {
+    final channelId = selectedChannelId;
+
+    if (channelId == null ||
+        messages.isEmpty ||
+        isLoadingMoreMessages ||
+        !hasMoreMessages) {
+      return;
+    }
+
+    setState(() {
+      isLoadingMoreMessages = true;
+    });
+
+    try {
+      const pageSize = 50;
+      final olderMessages = await apiClient.getMessages(
+        channelId,
+        limit: pageSize,
+        before: messages.first.id,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        messages = [...olderMessages, ...messages];
+        hasMoreMessages = olderMessages.length >= pageSize;
+        isLoadingMoreMessages = false;
+      });
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
+      if (!mounted) return;
+
+      setState(() {
+        isLoadingMoreMessages = false;
+      });
+
+      showErrorSnackBar(
+        context,
+        'Не удалось загрузить более старые сообщения: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        isLoadingMoreMessages = false;
+      });
+
+      showErrorSnackBar(
+        context,
+        'Не удалось загрузить более старые сообщения: $error',
+      );
     }
   }
 
@@ -1472,6 +1680,54 @@ class _MainShellState extends State<MainShell> {
       if (!mounted) return;
 
       showErrorSnackBar(context, 'Не удалось удалить участника: $error');
+    }
+  }
+
+  Future<void> banMember(AppServerMember member) async {
+    final serverId = selectedServerId;
+
+    if (serverId == null) {
+      return;
+    }
+
+    final confirmed = await showConfirmDialog(
+      context: context,
+      title: 'Забанить участника?',
+      message:
+          'Пользователь "${member.user.username}" будет удалён с сервера и не сможет вернуться по инвайт-ссылке.',
+      confirmText: 'Забанить',
+    );
+
+    if (confirmed != true) {
+      return;
+    }
+
+    try {
+      await apiClient.banServerMember(
+        serverId: serverId,
+        userId: member.userId,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        members = members.where((item) => item.id != member.id).toList();
+      });
+
+      showErrorSnackBar(context, 'Пользователь забанен на сервере');
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        'Ошибка бана участника: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось забанить участника: $error');
     }
   }
 
@@ -1870,6 +2126,7 @@ class _MainShellState extends State<MainShell> {
         members = loadedMembers;
         selectedChannelId = firstChannel?.id;
         messages = loadedMessages;
+        hasMoreMessages = loadedMessages.length >= 50;
         isLoading = false;
       });
       syncRealtimeServer(server.id);
@@ -2266,11 +2523,14 @@ class _MainShellState extends State<MainShell> {
                     channel: selectedChannel,
                     messages: messages,
                     isMessagesLoading: isMessagesLoading,
+                    hasMoreMessages: hasMoreMessages,
+                    isLoadingMoreMessages: isLoadingMoreMessages,
                     canSendMessages: canSendMessages,
                     onSendMessage: sendMessage,
                     onEditMessage: editMessage,
                     onDeleteMessage: deleteMessage,
                     onShowMembers: showMembers,
+                    onLoadMoreMessages: loadMoreMessages,
                   ),
           ),
           if (selectedServer != null)
@@ -2279,6 +2539,7 @@ class _MainShellState extends State<MainShell> {
               currentUserId: user.id,
               isServerOwner: canManageChannels,
               onKickMember: kickMember,
+              onBanMember: banMember,
               onRefresh: showMembers,
             ),
         ],
@@ -3034,21 +3295,27 @@ class ChatArea extends StatelessWidget {
     required this.channel,
     required this.messages,
     required this.isMessagesLoading,
+    required this.hasMoreMessages,
+    required this.isLoadingMoreMessages,
     required this.canSendMessages,
     required this.onSendMessage,
     required this.onEditMessage,
     required this.onDeleteMessage,
     required this.onShowMembers,
+    required this.onLoadMoreMessages,
   });
 
   final AppChannel channel;
   final List<AppMessage> messages;
   final bool isMessagesLoading;
+  final bool hasMoreMessages;
+  final bool isLoadingMoreMessages;
   final bool canSendMessages;
   final Future<void> Function(String content) onSendMessage;
   final ValueChanged<AppMessage> onEditMessage;
   final ValueChanged<AppMessage> onDeleteMessage;
   final VoidCallback onShowMembers;
+  final VoidCallback onLoadMoreMessages;
 
   @override
   Widget build(BuildContext context) {
@@ -3067,8 +3334,11 @@ class ChatArea extends StatelessWidget {
                         )
                       : MessagesList(
                           messages: messages,
+                          hasMoreMessages: hasMoreMessages,
+                          isLoadingMoreMessages: isLoadingMoreMessages,
                           onEditMessage: onEditMessage,
                           onDeleteMessage: onDeleteMessage,
+                          onLoadMoreMessages: onLoadMoreMessages,
                         )
                 : const VoiceChannelPlaceholder(),
           ),
@@ -3154,6 +3424,7 @@ class MembersSidebar extends StatelessWidget {
     required this.currentUserId,
     required this.isServerOwner,
     required this.onKickMember,
+    required this.onBanMember,
     required this.onRefresh,
   });
 
@@ -3161,6 +3432,7 @@ class MembersSidebar extends StatelessWidget {
   final String currentUserId;
   final bool isServerOwner;
   final ValueChanged<AppServerMember> onKickMember;
+  final ValueChanged<AppServerMember> onBanMember;
   final VoidCallback onRefresh;
 
   @override
@@ -3290,6 +3562,13 @@ class MembersSidebar extends StatelessWidget {
                               icon: const Icon(Icons.person_remove_outlined),
                               color: const Color(0xFFFF7A7A),
                             ),
+                          if (canKick)
+                            IconButton(
+                              tooltip: 'Забанить участника',
+                              onPressed: () => onBanMember(member),
+                              icon: const Icon(Icons.block_rounded),
+                              color: const Color(0xFFFF3B3B),
+                            ),
                         ],
                       );
                     },
@@ -3305,13 +3584,19 @@ class MessagesList extends StatelessWidget {
   const MessagesList({
     super.key,
     required this.messages,
+    required this.hasMoreMessages,
+    required this.isLoadingMoreMessages,
     required this.onEditMessage,
     required this.onDeleteMessage,
+    required this.onLoadMoreMessages,
   });
 
   final List<AppMessage> messages;
+  final bool hasMoreMessages;
+  final bool isLoadingMoreMessages;
   final ValueChanged<AppMessage> onEditMessage;
   final ValueChanged<AppMessage> onDeleteMessage;
+  final VoidCallback onLoadMoreMessages;
 
   @override
   Widget build(BuildContext context) {
@@ -3328,11 +3613,40 @@ class MessagesList extends StatelessWidget {
       );
     }
 
+    final itemCount = messages.length + (hasMoreMessages ? 1 : 0);
+
     return ListView.builder(
       padding: const EdgeInsets.fromLTRB(22, 24, 22, 18),
-      itemCount: messages.length,
+      itemCount: itemCount,
       itemBuilder: (context, index) {
-        final message = messages[index];
+        if (hasMoreMessages && index == 0) {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: Center(
+              child: isLoadingMoreMessages
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Color(0xFF8D5CFF),
+                      ),
+                    )
+                  : TextButton(
+                      onPressed: onLoadMoreMessages,
+                      child: const Text(
+                        'Загрузить более старые сообщения',
+                        style: TextStyle(
+                          color: Color(0xFF8D5CFF),
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+            ),
+          );
+        }
+
+        final message = messages[index - (hasMoreMessages ? 1 : 0)];
 
         return MessageBubble(
           message: message,
