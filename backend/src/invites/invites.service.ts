@@ -1,11 +1,7 @@
-import {
-  BadRequestException,
-  ForbiddenException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import { PermissionsService } from '../permissions/permissions.service';
 import { ServersGateway } from '../servers/servers.gateway';
 import { CreateInviteDto } from './dto/create-invite.dto';
 
@@ -14,26 +10,19 @@ export class InvitesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly serversGateway: ServersGateway,
+    private readonly permissionsService: PermissionsService,
   ) {}
 
+  // Владелец сервера всегда проходит эту проверку; для остальных участников
+  // решает эффективное право manageInvites (пока роли никому не назначены,
+  // поведение не отличается от прежней точечной проверки ownerId).
   private async getServerOwnerOrThrow(userId: string, serverId: string) {
-    const server = await this.prisma.server.findUnique({
-      where: {
-        id: serverId,
-      },
-    });
-
-    if (!server) {
-      throw new NotFoundException('Сервер не найден');
-    }
-
-    if (server.ownerId !== userId) {
-      throw new ForbiddenException(
-        'Только владелец сервера может создавать приглашения',
-      );
-    }
-
-    return server;
+    return this.permissionsService.assertPermission(
+      userId,
+      serverId,
+      'manageInvites',
+      'Только владелец сервера может создавать приглашения',
+    );
   }
 
   private async getUsableInviteOrThrow(code: string) {

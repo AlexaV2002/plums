@@ -29,6 +29,30 @@ export type MemberJoinPayload = {
   };
 };
 
+export type RolePayload = {
+  id: string;
+  name: string;
+  color: string | null;
+  position: number;
+};
+
+export type RoleEventPayload = {
+  serverId: string;
+  role: RolePayload;
+};
+
+export type RoleDeletePayload = {
+  serverId: string;
+  roleId: string;
+};
+
+export type MemberRolesUpdatePayload = {
+  serverId: string;
+  memberId: string;
+  userId: string;
+  roles: RolePayload[];
+};
+
 @WebSocketGateway({
   cors: {
     origin: '*',
@@ -68,6 +92,22 @@ export class ServersGateway {
 
   emitMemberJoin(payload: MemberJoinPayload) {
     this.server.to(this.getServerRoom(payload.serverId)).emit('member:join', payload);
+  }
+
+  emitRoleNew(payload: RoleEventPayload) {
+    this.server.to(this.getServerRoom(payload.serverId)).emit('role:new', payload);
+  }
+
+  emitRoleUpdate(payload: RoleEventPayload) {
+    this.server.to(this.getServerRoom(payload.serverId)).emit('role:update', payload);
+  }
+
+  emitRoleDelete(payload: RoleDeletePayload) {
+    this.server.to(this.getServerRoom(payload.serverId)).emit('role:delete', payload);
+  }
+
+  emitMemberRolesUpdate(payload: MemberRolesUpdatePayload) {
+    this.server.to(this.getServerRoom(payload.serverId)).emit('member:roles:update', payload);
   }
 
   private getServerRoom(serverId: string) {

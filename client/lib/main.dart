@@ -289,6 +289,79 @@ class ApiClient {
         .toList();
   }
 
+  Future<List<AppRole>> getServerRoles(String serverId) async {
+    final response = await dio.get(
+      '/servers/$serverId/roles',
+      options: authOptions,
+    );
+
+    final list = response.data as List;
+
+    return list
+        .map((item) => AppRole.fromJson(item as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<AppRole> createRole({
+    required String serverId,
+    required String name,
+    String? color,
+    required Map<String, bool> permissions,
+  }) async {
+    final response = await dio.post(
+      '/servers/$serverId/roles',
+      options: authOptions,
+      data: {
+        'name': name,
+        if (color != null) 'color': color,
+        ...permissions,
+      },
+    );
+
+    return AppRole.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<AppRole> updateRole({
+    required String roleId,
+    required String name,
+    String? color,
+    required Map<String, bool> permissions,
+  }) async {
+    final response = await dio.patch(
+      '/roles/$roleId',
+      options: authOptions,
+      data: {'name': name, 'color': color, ...permissions},
+    );
+
+    return AppRole.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<void> deleteRole({required String roleId}) async {
+    await dio.delete('/roles/$roleId', options: authOptions);
+  }
+
+  Future<void> assignRole({
+    required String serverId,
+    required String memberId,
+    required String roleId,
+  }) async {
+    await dio.post(
+      '/servers/$serverId/members/$memberId/roles/$roleId',
+      options: authOptions,
+    );
+  }
+
+  Future<void> unassignRole({
+    required String serverId,
+    required String memberId,
+    required String roleId,
+  }) async {
+    await dio.delete(
+      '/servers/$serverId/members/$memberId/roles/$roleId',
+      options: authOptions,
+    );
+  }
+
   Future<AppInvite> createInvite({required String serverId}) async {
     final response = await dio.post(
       '/servers/$serverId/invites',
@@ -482,6 +555,10 @@ class RealtimeClient {
     required ValueChanged<RealtimeMemberLeave> onMemberLeave,
     required ValueChanged<AppServerMember> onMemberJoin,
     required ValueChanged<RealtimeUserStatus> onUserStatus,
+    required ValueChanged<RealtimeRoleEvent> onRoleNew,
+    required ValueChanged<RealtimeRoleEvent> onRoleUpdate,
+    required ValueChanged<RealtimeRoleDelete> onRoleDelete,
+    required ValueChanged<RealtimeMemberRolesUpdate> onMemberRolesUpdate,
   }) {
     void identifyPresence() {
       socket.emit('presence:identify', {'token': accessToken});
@@ -568,6 +645,36 @@ class RealtimeClient {
       if (data is Map) {
         onChannelDelete(
           RealtimeChannelDelete.fromJson(Map<String, dynamic>.from(data)),
+        );
+      }
+    });
+
+    socket.on('role:new', (data) {
+      if (data is Map) {
+        onRoleNew(RealtimeRoleEvent.fromJson(Map<String, dynamic>.from(data)));
+      }
+    });
+
+    socket.on('role:update', (data) {
+      if (data is Map) {
+        onRoleUpdate(
+          RealtimeRoleEvent.fromJson(Map<String, dynamic>.from(data)),
+        );
+      }
+    });
+
+    socket.on('role:delete', (data) {
+      if (data is Map) {
+        onRoleDelete(
+          RealtimeRoleDelete.fromJson(Map<String, dynamic>.from(data)),
+        );
+      }
+    });
+
+    socket.on('member:roles:update', (data) {
+      if (data is Map) {
+        onMemberRolesUpdate(
+          RealtimeMemberRolesUpdate.fromJson(Map<String, dynamic>.from(data)),
         );
       }
     });
@@ -674,6 +781,63 @@ class RealtimeChannelDelete {
     return RealtimeChannelDelete(
       id: json['id'] as String,
       serverId: json['serverId'] as String,
+    );
+  }
+}
+
+class RealtimeRoleEvent {
+  const RealtimeRoleEvent({required this.serverId, required this.role});
+
+  final String serverId;
+  final AppRole role;
+
+  factory RealtimeRoleEvent.fromJson(Map<String, dynamic> json) {
+    return RealtimeRoleEvent(
+      serverId: json['serverId'] as String,
+      role: AppRole.fromJson(json['role'] as Map<String, dynamic>),
+    );
+  }
+}
+
+class RealtimeRoleDelete {
+  const RealtimeRoleDelete({required this.serverId, required this.roleId});
+
+  final String serverId;
+  final String roleId;
+
+  factory RealtimeRoleDelete.fromJson(Map<String, dynamic> json) {
+    return RealtimeRoleDelete(
+      serverId: json['serverId'] as String,
+      roleId: json['roleId'] as String,
+    );
+  }
+}
+
+class RealtimeMemberRolesUpdate {
+  const RealtimeMemberRolesUpdate({
+    required this.serverId,
+    required this.memberId,
+    required this.userId,
+    required this.roles,
+  });
+
+  final String serverId;
+  final String memberId;
+  final String userId;
+  final List<AppRole> roles;
+
+  factory RealtimeMemberRolesUpdate.fromJson(Map<String, dynamic> json) {
+    final rawRoles = json['roles'];
+
+    return RealtimeMemberRolesUpdate(
+      serverId: json['serverId'] as String,
+      memberId: json['memberId'] as String,
+      userId: json['userId'] as String,
+      roles: rawRoles is List
+          ? rawRoles
+              .map((item) => AppRole.fromJson(item as Map<String, dynamic>))
+              .toList()
+          : const [],
     );
   }
 }
@@ -1145,6 +1309,7 @@ class _MainShellState extends State<MainShell> {
   List<AppChannel> channels = [];
   List<AppMessage> messages = [];
   List<AppServerMember> members = [];
+  List<AppRole> serverRoles = [];
 
   String? selectedServerId;
   String? selectedChannelId;
@@ -1175,6 +1340,10 @@ class _MainShellState extends State<MainShell> {
       onMemberLeave: handleRealtimeMemberLeave,
       onMemberJoin: handleRealtimeMemberJoin,
       onUserStatus: handleRealtimeUserStatus,
+      onRoleNew: handleRealtimeRoleNew,
+      onRoleUpdate: handleRealtimeRoleUpdate,
+      onRoleDelete: handleRealtimeRoleDelete,
+      onMemberRolesUpdate: handleRealtimeMemberRolesUpdate,
     );
     loadInitialData();
   }
@@ -1348,6 +1517,93 @@ class _MainShellState extends State<MainShell> {
     });
   }
 
+  void handleRealtimeRoleNew(RealtimeRoleEvent event) {
+    if (!mounted || event.serverId != selectedServerId) {
+      return;
+    }
+
+    if (serverRoles.any((role) => role.id == event.role.id)) {
+      return;
+    }
+
+    setState(() {
+      serverRoles = [...serverRoles, event.role];
+    });
+  }
+
+  void handleRealtimeRoleUpdate(RealtimeRoleEvent event) {
+    if (!mounted || event.serverId != selectedServerId) {
+      return;
+    }
+
+    setState(() {
+      final hasRole = serverRoles.any((role) => role.id == event.role.id);
+
+      serverRoles = hasRole
+          ? serverRoles
+                .map<AppRole>(
+                  (role) => role.id == event.role.id ? event.role : role,
+                )
+                .toList()
+          : [...serverRoles, event.role];
+
+      members = members
+          .map<AppServerMember>(
+            (member) => member.roles.any((role) => role.id == event.role.id)
+                ? member.copyWith(
+                    roles: member.roles
+                        .map<AppRole>(
+                          (role) =>
+                              role.id == event.role.id ? event.role : role,
+                        )
+                        .toList(),
+                  )
+                : member,
+          )
+          .toList();
+    });
+  }
+
+  void handleRealtimeRoleDelete(RealtimeRoleDelete event) {
+    if (!mounted || event.serverId != selectedServerId) {
+      return;
+    }
+
+    setState(() {
+      serverRoles = serverRoles
+          .where((role) => role.id != event.roleId)
+          .toList();
+
+      members = members
+          .map<AppServerMember>(
+            (member) => member.roles.any((role) => role.id == event.roleId)
+                ? member.copyWith(
+                    roles: member.roles
+                        .where((role) => role.id != event.roleId)
+                        .toList(),
+                  )
+                : member,
+          )
+          .toList();
+    });
+  }
+
+  void handleRealtimeMemberRolesUpdate(RealtimeMemberRolesUpdate event) {
+    if (!mounted || event.serverId != selectedServerId) {
+      return;
+    }
+
+    setState(() {
+      members = members
+          .map<AppServerMember>(
+            (member) => member.id == event.memberId
+                ? member.copyWith(roles: event.roles)
+                : member,
+          )
+          .toList();
+    });
+  }
+
   void handleRealtimeUserStatus(RealtimeUserStatus event) {
     if (!mounted) {
       return;
@@ -1423,6 +1679,39 @@ class _MainShellState extends State<MainShell> {
     return isSelectedServerOwner || channel.resolvedPermissions.canView;
   }
 
+  // Владелец сервера всегда получает полный доступ (см. PermissionsService
+  // на бэкенде). У обычного участника права — это объединение permissions
+  // всех назначенных ему ролей: member.roles из /members содержит только
+  // id/name/color/position, поэтому реальные флаги берём из serverRoles
+  // (полный список ролей сервера с правами) по совпадению id.
+  AppPermissions get effectivePermissions {
+    if (isSelectedServerOwner) {
+      return AppPermissions.owner;
+    }
+
+    final userId = currentUser?.id;
+
+    if (userId == null) {
+      return AppPermissions.none;
+    }
+
+    final member = members.cast<AppServerMember?>().firstWhere(
+      (item) => item?.userId == userId,
+      orElse: () => null,
+    );
+
+    if (member == null) {
+      return AppPermissions.none;
+    }
+
+    final assignedRoleIds = member.roles.map((role) => role.id).toSet();
+    final matchedRoles = serverRoles.where(
+      (role) => assignedRoleIds.contains(role.id),
+    );
+
+    return AppPermissions.fromRoles(matchedRoles);
+  }
+
   List<AppChannel> sortChannels(List<AppChannel> items) {
     return [...items]..sort((left, right) {
       final positionCompare = left.position.compareTo(right.position);
@@ -1491,6 +1780,9 @@ class _MainShellState extends State<MainShell> {
       final loadedMembers = firstServerId != null
           ? await apiClient.getServerMembers(firstServerId)
           : <AppServerMember>[];
+      final loadedRoles = firstServerId != null
+          ? await apiClient.getServerRoles(firstServerId)
+          : <AppRole>[];
 
       final firstChannel = loadedChannels.isNotEmpty
           ? loadedChannels.first
@@ -1511,6 +1803,7 @@ class _MainShellState extends State<MainShell> {
         selectedServerId = firstServerId;
         channels = loadedChannels;
         members = loadedMembers;
+        serverRoles = loadedRoles;
         selectedChannelId = firstChannel?.id;
         messages = loadedMessages;
         hasMoreMessages = loadedMessages.length >= 50;
@@ -1538,6 +1831,7 @@ class _MainShellState extends State<MainShell> {
       selectedServerId = serverId;
       channels = [];
       members = [];
+      serverRoles = [];
       selectedChannelId = null;
       messages = [];
       isLoading = true;
@@ -1547,6 +1841,7 @@ class _MainShellState extends State<MainShell> {
     try {
       final loadedChannels = await apiClient.getChannels(serverId);
       final loadedMembers = await apiClient.getServerMembers(serverId);
+      final loadedRoles = await apiClient.getServerRoles(serverId);
       final firstChannel = loadedChannels.isNotEmpty
           ? loadedChannels.first
           : null;
@@ -1559,6 +1854,7 @@ class _MainShellState extends State<MainShell> {
       setState(() {
         channels = loadedChannels;
         members = loadedMembers;
+        serverRoles = loadedRoles;
         selectedChannelId = firstChannel?.id;
         messages = loadedMessages;
         hasMoreMessages = loadedMessages.length >= 50;
@@ -1926,6 +2222,227 @@ class _MainShellState extends State<MainShell> {
       }
 
       return false;
+    }
+  }
+
+  Future<void> manageServerRoles() async {
+    final serverId = selectedServerId;
+
+    if (serverId == null) {
+      return;
+    }
+
+    final canManageRoles = effectivePermissions.manageRoles;
+
+    await showManageRolesDialog(
+      context: context,
+      roles: serverRoles,
+      canManageRoles: canManageRoles,
+      onCreateRole: () => createRoleFlow(serverId),
+      onEditRole: (role) => editRoleFlow(role),
+      onDeleteRole: (role) => deleteServerRole(role),
+    );
+  }
+
+  Future<void> createRoleFlow(String serverId) async {
+    final result = await showRoleFormDialog(context: context);
+
+    if (result == null) {
+      return;
+    }
+
+    try {
+      final role = await apiClient.createRole(
+        serverId: serverId,
+        name: result.name,
+        color: result.color,
+        permissions: result.permissions,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        serverRoles = [...serverRoles, role];
+      });
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Ошибка создания роли: ${error.response?.data}');
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось создать роль: $error');
+    }
+  }
+
+  Future<void> editRoleFlow(AppRole role) async {
+    final result = await showRoleFormDialog(context: context, existing: role);
+
+    if (result == null) {
+      return;
+    }
+
+    try {
+      final updated = await apiClient.updateRole(
+        roleId: role.id,
+        name: result.name,
+        color: result.color,
+        permissions: result.permissions,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        serverRoles = serverRoles
+            .map<AppRole>((item) => item.id == updated.id ? updated : item)
+            .toList();
+        members = members
+            .map<AppServerMember>(
+              (member) => member.roles.any((item) => item.id == updated.id)
+                  ? member.copyWith(
+                      roles: member.roles
+                          .map<AppRole>(
+                            (item) =>
+                                item.id == updated.id ? updated : item,
+                          )
+                          .toList(),
+                    )
+                  : member,
+            )
+            .toList();
+      });
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Ошибка изменения роли: ${error.response?.data}');
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось изменить роль: $error');
+    }
+  }
+
+  Future<void> deleteServerRole(AppRole role) async {
+    final confirmed = await showConfirmDialog(
+      context: context,
+      title: 'Удалить роль?',
+      message: 'Роль "${role.name}" будет снята со всех участников.',
+      confirmText: 'Удалить',
+    );
+
+    if (confirmed != true) {
+      return;
+    }
+
+    try {
+      await apiClient.deleteRole(roleId: role.id);
+
+      if (!mounted) return;
+
+      setState(() {
+        serverRoles = serverRoles.where((item) => item.id != role.id).toList();
+        members = members
+            .map<AppServerMember>(
+              (member) => member.roles.any((item) => item.id == role.id)
+                  ? member.copyWith(
+                      roles: member.roles
+                          .where((item) => item.id != role.id)
+                          .toList(),
+                    )
+                  : member,
+            )
+            .toList();
+      });
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Ошибка удаления роли: ${error.response?.data}');
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось удалить роль: $error');
+    }
+  }
+
+  Future<void> manageMemberRoles(AppServerMember member) async {
+    await showMemberRolesDialog(
+      context: context,
+      member: member,
+      roles: serverRoles,
+      onToggle: (role, assign) =>
+          toggleMemberRole(member: member, role: role, assign: assign),
+    );
+  }
+
+  Future<void> toggleMemberRole({
+    required AppServerMember member,
+    required AppRole role,
+    required bool assign,
+  }) async {
+    final serverId = selectedServerId;
+
+    if (serverId == null) {
+      return;
+    }
+
+    try {
+      if (assign) {
+        await apiClient.assignRole(
+          serverId: serverId,
+          memberId: member.id,
+          roleId: role.id,
+        );
+      } else {
+        await apiClient.unassignRole(
+          serverId: serverId,
+          memberId: member.id,
+          roleId: role.id,
+        );
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        members = members
+            .map<AppServerMember>(
+              (item) => item.id == member.id
+                  ? item.copyWith(
+                      roles: assign
+                          ? (item.roles.any((r) => r.id == role.id)
+                                ? item.roles
+                                : [...item.roles, role])
+                          : item.roles
+                                .where((r) => r.id != role.id)
+                                .toList(),
+                    )
+                  : item,
+            )
+            .toList();
+      });
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        assign
+            ? 'Ошибка назначения роли: ${error.response?.data}'
+            : 'Ошибка снятия роли: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        assign ? 'Не удалось назначить роль: $error' : 'Не удалось снять роль: $error',
+      );
     }
   }
 
@@ -2672,7 +3189,8 @@ class _MainShellState extends State<MainShell> {
             orElse: () => channels.first,
           )
         : null;
-    final canManageChannels = selectedServer?.ownerId == user.id;
+    final permissions = effectivePermissions;
+    final canManageChannels = permissions.manageChannels;
     final canSendMessages =
         selectedChannel == null ||
         canManageChannels ||
@@ -2695,13 +3213,15 @@ class _MainShellState extends State<MainShell> {
             currentUser: user,
             canManageChannels: canManageChannels,
             hasSelectedServer: selectedServer != null,
-            canManageServer: canManageChannels,
+            canManageServer: permissions.manageServer,
+            canManageRoles: permissions.manageRoles,
             onChannelSelected: selectChannel,
             onCreateChannel: createChannel,
             onEditChannel: renameChannel,
             onDeleteChannel: deleteChannel,
             onEditChannelPermissions: editChannelPermissions,
             onCreateInvite: createInvite,
+            onManageRoles: selectedServer == null ? null : manageServerRoles,
             onRenameServer: selectedServer == null
                 ? null
                 : () => renameServer(selectedServer!),
@@ -2744,9 +3264,12 @@ class _MainShellState extends State<MainShell> {
             MembersSidebar(
               members: members,
               currentUserId: user.id,
-              isServerOwner: canManageChannels,
+              canKickMembers: permissions.manageMembers,
+              canBanMembers: permissions.manageBans,
+              canManageRoles: permissions.manageRoles,
               onKickMember: kickMember,
               onBanMember: banMember,
+              onManageMemberRoles: manageMemberRoles,
               onShowBans: showBans,
               onRefresh: showMembers,
             ),
@@ -2920,12 +3443,14 @@ class ChannelsPanel extends StatelessWidget {
     required this.canManageChannels,
     required this.hasSelectedServer,
     required this.canManageServer,
+    required this.canManageRoles,
     required this.onChannelSelected,
     required this.onCreateChannel,
     required this.onEditChannel,
     required this.onDeleteChannel,
     required this.onEditChannelPermissions,
     required this.onCreateInvite,
+    this.onManageRoles,
     required this.onRenameServer,
     required this.onDeleteServer,
     required this.onLeaveServer,
@@ -2940,12 +3465,14 @@ class ChannelsPanel extends StatelessWidget {
   final bool canManageChannels;
   final bool hasSelectedServer;
   final bool canManageServer;
+  final bool canManageRoles;
   final ValueChanged<String> onChannelSelected;
   final VoidCallback onCreateChannel;
   final ValueChanged<AppChannel> onEditChannel;
   final ValueChanged<AppChannel> onDeleteChannel;
   final ValueChanged<AppChannel> onEditChannelPermissions;
   final VoidCallback onCreateInvite;
+  final VoidCallback? onManageRoles;
   final VoidCallback? onRenameServer;
   final VoidCallback? onDeleteServer;
   final VoidCallback? onLeaveServer;
@@ -2971,8 +3498,10 @@ class ChannelsPanel extends StatelessWidget {
             serverName: serverName,
             hasSelectedServer: hasSelectedServer,
             canManageServer: canManageServer,
+            canManageRoles: canManageRoles,
             canCreateInvite: canManageChannels,
             onCreateInvite: onCreateInvite,
+            onManageRoles: onManageRoles,
             onRenameServer: onRenameServer,
             onDeleteServer: onDeleteServer,
             onLeaveServer: onLeaveServer,
@@ -3032,8 +3561,10 @@ class ServerHeader extends StatelessWidget {
     required this.serverName,
     required this.hasSelectedServer,
     required this.canManageServer,
+    required this.canManageRoles,
     required this.canCreateInvite,
     required this.onCreateInvite,
+    this.onManageRoles,
     required this.onRenameServer,
     required this.onDeleteServer,
     required this.onLeaveServer,
@@ -3042,8 +3573,10 @@ class ServerHeader extends StatelessWidget {
   final String serverName;
   final bool hasSelectedServer;
   final bool canManageServer;
+  final bool canManageRoles;
   final bool canCreateInvite;
   final VoidCallback onCreateInvite;
+  final VoidCallback? onManageRoles;
   final VoidCallback? onRenameServer;
   final VoidCallback? onDeleteServer;
   final VoidCallback? onLeaveServer;
@@ -3094,28 +3627,41 @@ class ServerHeader extends StatelessWidget {
                 case 'delete':
                   onDeleteServer?.call();
                   break;
+                case 'roles':
+                  onManageRoles?.call();
+                  break;
                 case 'leave':
                   onLeaveServer?.call();
                   break;
               }
             },
             itemBuilder: (context) {
-              if (canManageServer) {
-                return const [
-                  PopupMenuItem(
-                    value: 'rename',
-                    child: Text(
-                      'Переименовать сервер',
-                      style: TextStyle(color: Color(0xFFF3EEFF)),
+              if (canManageServer || canManageRoles) {
+                return [
+                  if (canManageServer)
+                    const PopupMenuItem(
+                      value: 'rename',
+                      child: Text(
+                        'Переименовать сервер',
+                        style: TextStyle(color: Color(0xFFF3EEFF)),
+                      ),
                     ),
-                  ),
-                  PopupMenuItem(
-                    value: 'delete',
-                    child: Text(
-                      'Удалить сервер',
-                      style: TextStyle(color: Color(0xFFFF7A7A)),
+                  if (canManageRoles)
+                    const PopupMenuItem(
+                      value: 'roles',
+                      child: Text(
+                        'Роли сервера',
+                        style: TextStyle(color: Color(0xFFF3EEFF)),
+                      ),
                     ),
-                  ),
+                  if (canManageServer)
+                    const PopupMenuItem(
+                      value: 'delete',
+                      child: Text(
+                        'Удалить сервер',
+                        style: TextStyle(color: Color(0xFFFF7A7A)),
+                      ),
+                    ),
                 ];
               }
 
@@ -3633,18 +4179,24 @@ class MembersSidebar extends StatelessWidget {
     super.key,
     required this.members,
     required this.currentUserId,
-    required this.isServerOwner,
+    required this.canKickMembers,
+    required this.canBanMembers,
+    required this.canManageRoles,
     required this.onKickMember,
     required this.onBanMember,
+    required this.onManageMemberRoles,
     required this.onShowBans,
     required this.onRefresh,
   });
 
   final List<AppServerMember> members;
   final String currentUserId;
-  final bool isServerOwner;
+  final bool canKickMembers;
+  final bool canBanMembers;
+  final bool canManageRoles;
   final ValueChanged<AppServerMember> onKickMember;
   final ValueChanged<AppServerMember> onBanMember;
+  final ValueChanged<AppServerMember> onManageMemberRoles;
   final VoidCallback onShowBans;
   final VoidCallback onRefresh;
 
@@ -3681,7 +4233,7 @@ class MembersSidebar extends StatelessWidget {
                     ),
                   ),
                 ),
-                if (isServerOwner)
+                if (canBanMembers)
                   IconButton(
                     tooltip: 'Забаненные',
                     onPressed: onShowBans,
@@ -3723,12 +4275,14 @@ class MembersSidebar extends StatelessWidget {
                       final letter = user.username.isNotEmpty
                           ? user.username.characters.first.toUpperCase()
                           : '?';
+                      final isSelf = member.userId == currentUserId;
                       final canKick =
-                          isServerOwner &&
-                          member.userId != currentUserId &&
-                          member.id.isNotEmpty;
+                          canKickMembers && !isSelf && member.id.isNotEmpty;
+                      final canBan =
+                          canBanMembers && !isSelf && member.id.isNotEmpty;
 
                       return Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Container(
                             width: 36,
@@ -3772,9 +4326,27 @@ class MembersSidebar extends StatelessWidget {
                                     fontWeight: FontWeight.w700,
                                   ),
                                 ),
+                                if (member.roles.isNotEmpty) ...[
+                                  const SizedBox(height: 4),
+                                  Wrap(
+                                    spacing: 4,
+                                    runSpacing: 4,
+                                    children: [
+                                      for (final role in member.roles)
+                                        RoleChip(role: role),
+                                    ],
+                                  ),
+                                ],
                               ],
                             ),
                           ),
+                          if (canManageRoles)
+                            IconButton(
+                              tooltip: 'Роли участника',
+                              onPressed: () => onManageMemberRoles(member),
+                              icon: const Icon(Icons.shield_outlined),
+                              color: const Color(0xFFB8ADC8),
+                            ),
                           if (canKick)
                             IconButton(
                               tooltip: 'Удалить участника',
@@ -3782,7 +4354,7 @@ class MembersSidebar extends StatelessWidget {
                               icon: const Icon(Icons.person_remove_outlined),
                               color: const Color(0xFFFF7A7A),
                             ),
-                          if (canKick)
+                          if (canBan)
                             IconButton(
                               tooltip: 'Забанить участника',
                               onPressed: () => onBanMember(member),
@@ -3795,6 +4367,35 @@ class MembersSidebar extends StatelessWidget {
                   ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class RoleChip extends StatelessWidget {
+  const RoleChip({super.key, required this.role});
+
+  final AppRole role;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = parseHexColor(role.color) ?? const Color(0xFF8D5CFF);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.18),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color),
+      ),
+      child: Text(
+        role.name,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          color: color,
+          fontSize: 10,
+          fontWeight: FontWeight.w800,
+        ),
       ),
     );
   }
@@ -5109,6 +5710,400 @@ void showErrorSnackBar(BuildContext context, String message) {
   ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
 }
 
+Color? parseHexColor(String? hex) {
+  if (hex == null || hex.isEmpty) {
+    return null;
+  }
+
+  final normalized = hex.replaceFirst('#', '');
+  final value = int.tryParse(
+    normalized.length == 6 ? 'FF$normalized' : normalized,
+    radix: 16,
+  );
+
+  return value == null ? null : Color(value);
+}
+
+const Map<String, String> rolePermissionLabels = {
+  'manageServer': 'Управление сервером',
+  'manageChannels': 'Управление каналами',
+  'manageMembers': 'Управление участниками (кик)',
+  'manageBans': 'Управление банами',
+  'manageInvites': 'Управление приглашениями',
+  'manageRoles': 'Управление ролями',
+};
+
+class RoleFormResult {
+  const RoleFormResult({
+    required this.name,
+    required this.color,
+    required this.permissions,
+  });
+
+  final String name;
+  final String? color;
+  final Map<String, bool> permissions;
+}
+
+Future<void> showManageRolesDialog({
+  required BuildContext context,
+  required List<AppRole> roles,
+  required bool canManageRoles,
+  required VoidCallback onCreateRole,
+  required ValueChanged<AppRole> onEditRole,
+  required ValueChanged<AppRole> onDeleteRole,
+}) {
+  final sortedRoles = [...roles]
+    ..sort((left, right) => left.position.compareTo(right.position));
+
+  return showDialog<void>(
+    context: context,
+    builder: (context) {
+      return PlumsDialog(
+        title: 'Роли сервера',
+        child: SizedBox(
+          width: 420,
+          height: 420,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (canManageRoles)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.pop(context);
+                      onCreateRole();
+                    },
+                    icon: const Icon(Icons.add),
+                    label: const Text('Создать роль'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFFBFA7FF),
+                      side: const BorderSide(color: Color(0xFF40374D)),
+                    ),
+                  ),
+                ),
+              Expanded(
+                child: sortedRoles.isEmpty
+                    ? const Center(
+                        child: Text(
+                          'Ролей пока нет',
+                          style: TextStyle(
+                            color: Color(0xFFB8ADC8),
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      )
+                    : ListView.separated(
+                        itemCount: sortedRoles.length,
+                        separatorBuilder: (_, __) => const SizedBox(height: 10),
+                        itemBuilder: (context, index) {
+                          final role = sortedRoles[index];
+                          final color =
+                              parseHexColor(role.color) ??
+                              const Color(0xFF8D5CFF);
+
+                          return Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF302A39),
+                              borderRadius: BorderRadius.circular(16),
+                              border: Border.all(color: const Color(0xFF40374D)),
+                            ),
+                            child: Row(
+                              children: [
+                                Container(
+                                  width: 12,
+                                  height: 12,
+                                  decoration: BoxDecoration(
+                                    color: color,
+                                    shape: BoxShape.circle,
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Text(
+                                    role.name,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Color(0xFFF3EEFF),
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ),
+                                if (canManageRoles) ...[
+                                  IconButton(
+                                    tooltip: 'Редактировать роль',
+                                    onPressed: () {
+                                      Navigator.pop(context);
+                                      onEditRole(role);
+                                    },
+                                    icon: const Icon(Icons.edit_outlined),
+                                    color: const Color(0xFFB8ADC8),
+                                  ),
+                                  IconButton(
+                                    tooltip: 'Удалить роль',
+                                    onPressed: () {
+                                      Navigator.pop(context);
+                                      onDeleteRole(role);
+                                    },
+                                    icon: const Icon(Icons.delete_outline),
+                                    color: const Color(0xFFFF7A7A),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+Future<RoleFormResult?> showRoleFormDialog({
+  required BuildContext context,
+  AppRole? existing,
+}) {
+  final nameController = TextEditingController(text: existing?.name ?? '');
+  final colorController = TextEditingController(text: existing?.color ?? '');
+  final permissions = <String, bool>{
+    for (final key in rolePermissionLabels.keys) key: existing?.has(key) ?? false,
+  };
+
+  const fieldBorder = OutlineInputBorder(
+    borderRadius: BorderRadius.all(Radius.circular(14)),
+    borderSide: BorderSide(color: Color(0xFF40374D)),
+  );
+  const focusedFieldBorder = OutlineInputBorder(
+    borderRadius: BorderRadius.all(Radius.circular(14)),
+    borderSide: BorderSide(color: Color(0xFF8D5CFF), width: 1.5),
+  );
+
+  return showDialog<RoleFormResult>(
+    context: context,
+    builder: (context) {
+      return StatefulBuilder(
+        builder: (context, setDialogState) {
+          return PlumsDialog(
+            title: existing == null ? 'Новая роль' : 'Изменить роль',
+            child: SizedBox(
+              width: 420,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextField(
+                    controller: nameController,
+                    style: const TextStyle(color: Color(0xFFF3EEFF)),
+                    decoration: const InputDecoration(
+                      labelText: 'Название роли',
+                      labelStyle: TextStyle(color: Color(0xFF8F849F)),
+                      enabledBorder: fieldBorder,
+                      focusedBorder: focusedFieldBorder,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: colorController,
+                    style: const TextStyle(color: Color(0xFFF3EEFF)),
+                    decoration: const InputDecoration(
+                      labelText: 'Цвет (#RRGGBB)',
+                      labelStyle: TextStyle(color: Color(0xFF8F849F)),
+                      enabledBorder: fieldBorder,
+                      focusedBorder: focusedFieldBorder,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: 240,
+                    child: ListView(
+                      children: [
+                        for (final entry in rolePermissionLabels.entries)
+                          CheckboxListTile(
+                            value: permissions[entry.key] ?? false,
+                            activeColor: const Color(0xFF8D5CFF),
+                            checkColor: Colors.white,
+                            contentPadding: EdgeInsets.zero,
+                            controlAffinity: ListTileControlAffinity.leading,
+                            title: Text(
+                              entry.value,
+                              style: const TextStyle(
+                                color: Color(0xFFF3EEFF),
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            onChanged: (value) {
+                              setDialogState(() {
+                                permissions[entry.key] = value ?? false;
+                              });
+                            },
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => Navigator.pop(context),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: const Color(0xFFB8ADC8),
+                            side: const BorderSide(color: Color(0xFF40374D)),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                          ),
+                          child: const Text('Отмена'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: () {
+                            final name = nameController.text.trim();
+
+                            if (name.isEmpty) {
+                              return;
+                            }
+
+                            Navigator.pop(
+                              context,
+                              RoleFormResult(
+                                name: name,
+                                color: colorController.text.trim().isEmpty
+                                    ? null
+                                    : colorController.text.trim(),
+                                permissions: permissions,
+                              ),
+                            );
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF8D5CFF),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                          ),
+                          child: const Text(
+                            'Сохранить',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    },
+  );
+}
+
+Future<void> showMemberRolesDialog({
+  required BuildContext context,
+  required AppServerMember member,
+  required List<AppRole> roles,
+  required Future<void> Function(AppRole role, bool assign) onToggle,
+}) {
+  final sortedRoles = [...roles]
+    ..sort((left, right) => left.position.compareTo(right.position));
+  final assignedIds = <String>{for (final role in member.roles) role.id};
+
+  return showDialog<void>(
+    context: context,
+    builder: (context) {
+      return StatefulBuilder(
+        builder: (context, setDialogState) {
+          return PlumsDialog(
+            title: 'Роли участника "${member.user.username}"',
+            child: SizedBox(
+              width: 380,
+              height: 380,
+              child: sortedRoles.isEmpty
+                  ? const Center(
+                      child: Text(
+                        'На сервере пока нет ролей',
+                        style: TextStyle(
+                          color: Color(0xFFB8ADC8),
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    )
+                  : ListView.separated(
+                      itemCount: sortedRoles.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 4),
+                      itemBuilder: (context, index) {
+                        final role = sortedRoles[index];
+                        final assigned = assignedIds.contains(role.id);
+                        final color =
+                            parseHexColor(role.color) ?? const Color(0xFF8D5CFF);
+
+                        return CheckboxListTile(
+                          value: assigned,
+                          activeColor: const Color(0xFF8D5CFF),
+                          checkColor: Colors.white,
+                          contentPadding: EdgeInsets.zero,
+                          controlAffinity: ListTileControlAffinity.leading,
+                          title: Row(
+                            children: [
+                              Container(
+                                width: 10,
+                                height: 10,
+                                decoration: BoxDecoration(
+                                  color: color,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                role.name,
+                                style: const TextStyle(
+                                  color: Color(0xFFF3EEFF),
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ),
+                          onChanged: (value) async {
+                            final assign = value ?? false;
+
+                            setDialogState(() {
+                              if (assign) {
+                                assignedIds.add(role.id);
+                              } else {
+                                assignedIds.remove(role.id);
+                              }
+                            });
+
+                            await onToggle(role, assign);
+                          },
+                        );
+                      },
+                    ),
+            ),
+          );
+        },
+      );
+    },
+  );
+}
+
 /* =========================
    MODELS
 ========================= */
@@ -5419,6 +6414,80 @@ class EditProfileResult {
   final String status;
 }
 
+class AppRole {
+  const AppRole({
+    required this.id,
+    required this.name,
+    this.color,
+    this.position = 0,
+    this.permissions = const {},
+  });
+
+  final String id;
+  final String name;
+  final String? color;
+  final int position;
+  final Map<String, bool> permissions;
+
+  bool has(String key) => permissions[key] == true;
+
+  factory AppRole.fromJson(Map<String, dynamic> json) {
+    final rawPermissions = json['permissions'];
+
+    return AppRole(
+      id: json['id'] as String,
+      name: json['name'] as String,
+      color: json['color'] as String?,
+      position: json['position'] as int? ?? 0,
+      permissions: rawPermissions is Map
+          ? rawPermissions.map(
+              (key, value) => MapEntry(key as String, value == true),
+            )
+          : const {},
+    );
+  }
+}
+
+// Зеркалит SERVER_PERMISSION_KEYS на бэкенде (backend/src/permissions/permission-keys.ts).
+class AppPermissions {
+  const AppPermissions({
+    this.manageServer = false,
+    this.manageChannels = false,
+    this.manageMembers = false,
+    this.manageBans = false,
+    this.manageInvites = false,
+    this.manageRoles = false,
+  });
+
+  final bool manageServer;
+  final bool manageChannels;
+  final bool manageMembers;
+  final bool manageBans;
+  final bool manageInvites;
+  final bool manageRoles;
+
+  static const AppPermissions none = AppPermissions();
+  static const AppPermissions owner = AppPermissions(
+    manageServer: true,
+    manageChannels: true,
+    manageMembers: true,
+    manageBans: true,
+    manageInvites: true,
+    manageRoles: true,
+  );
+
+  factory AppPermissions.fromRoles(Iterable<AppRole> roles) {
+    return AppPermissions(
+      manageServer: roles.any((role) => role.has('manageServer')),
+      manageChannels: roles.any((role) => role.has('manageChannels')),
+      manageMembers: roles.any((role) => role.has('manageMembers')),
+      manageBans: roles.any((role) => role.has('manageBans')),
+      manageInvites: roles.any((role) => role.has('manageInvites')),
+      manageRoles: roles.any((role) => role.has('manageRoles')),
+    );
+  }
+}
+
 class AppServerMember {
   const AppServerMember({
     required this.id,
@@ -5426,6 +6495,7 @@ class AppServerMember {
     required this.userId,
     required this.joinedAt,
     required this.user,
+    this.roles = const [],
   });
 
   final String id;
@@ -5433,14 +6503,22 @@ class AppServerMember {
   final String userId;
   final DateTime? joinedAt;
   final AppUser user;
+  final List<AppRole> roles;
 
   factory AppServerMember.fromJson(Map<String, dynamic> json) {
+    final rawRoles = json['roles'];
+
     return AppServerMember(
       id: json['id'] as String,
       serverId: json['serverId'] as String,
       userId: json['userId'] as String,
       joinedAt: DateTime.tryParse(json['joinedAt'] as String? ?? ''),
       user: AppUser.fromJson(json['user'] as Map<String, dynamic>),
+      roles: rawRoles is List
+          ? rawRoles
+              .map((item) => AppRole.fromJson(item as Map<String, dynamic>))
+              .toList()
+          : const [],
     );
   }
 
@@ -5450,6 +6528,7 @@ class AppServerMember {
     String? userId,
     DateTime? joinedAt,
     AppUser? user,
+    List<AppRole>? roles,
   }) {
     return AppServerMember(
       id: id ?? this.id,
@@ -5457,6 +6536,7 @@ class AppServerMember {
       userId: userId ?? this.userId,
       joinedAt: joinedAt ?? this.joinedAt,
       user: user ?? this.user,
+      roles: roles ?? this.roles,
     );
   }
 }

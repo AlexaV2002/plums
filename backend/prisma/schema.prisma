@@ -66,6 +66,7 @@ model Server {
   channels Channel[]
   invites  Invite[]
   bans     ServerBan[]
+  roles    Role[]
 
   @@map("servers")
 }
@@ -78,9 +79,27 @@ model ServerMember {
 
   server Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roles  Role[] @relation("MemberRoles")
 
   @@unique([serverId, userId])
   @@map("server_members")
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  serverId    String
+  name        String
+  color       String?
+  position    Int      @default(0)
+  permissions Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  server  Server         @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  members ServerMember[] @relation("MemberRoles")
+
+  @@unique([serverId, name])
+  @@map("roles")
 }
 
 model Channel {

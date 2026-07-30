@@ -5,6 +5,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { PermissionsService } from '../permissions/permissions.service';
+import { ServerPermissionKey } from '../permissions/permission-keys';
 import { BanMemberDto } from './dto/ban-member.dto';
 import { CreateServerDto } from './dto/create-server.dto';
 import { UpdateServerDto } from './dto/update-server.dto';
@@ -15,32 +17,30 @@ export class ServersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly serversGateway: ServersGateway,
+    private readonly permissionsService: PermissionsService,
   ) {}
 
   private async getServerOrThrow(serverId: string) {
-    const server = await this.prisma.server.findUnique({
-      where: {
-        id: serverId,
-      },
-    });
-
-    if (!server) {
-      throw new NotFoundException('Сервер не найден');
-    }
-
-    return server;
+    return this.permissionsService.getServerOrThrow(serverId);
   }
 
-  private async getServerOwnerOrThrow(userId: string, serverId: string) {
-    const server = await this.getServerOrThrow(serverId);
-
-    if (server.ownerId !== userId) {
-      throw new ForbiddenException(
-        'Только владелец сервера может управлять сервером',
-      );
-    }
-
-    return server;
+  // Владелец сервера всегда проходит эту проверку. Пока участникам не
+  // назначены роли с соответствующим правом, поведение для не-владельцев
+  // не меняется — эффективные права такого участника пусты, как и раньше
+  // при точечной проверке ownerId. Ключ права передаётся вызывающим кодом,
+  // чтобы разные действия (управление сервером / участниками / банами)
+  // впоследствии можно было разрешать разными ролями, а не только владельцу.
+  private async getServerOwnerOrThrow(
+    userId: string,
+    serverId: string,
+    key: ServerPermissionKey = 'manageServer',
+  ) {
+    return this.permissionsService.assertPermission(
+      userId,
+      serverId,
+      key,
+      'Только владелец сервера может управлять сервером',
+    );
   }
 
   private async getServerMemberOrThrow(userId: string, serverId: string) {
@@ -121,6 +121,15 @@ export class ServersService {
                 bio: true,
               },
             },
+            roles: {
+              select: {
+                id: true,
+                name: true,
+                color: true,
+                position: true,
+              },
+              orderBy: { position: 'asc' },
+            },
           },
         },
       },
@@ -163,6 +172,15 @@ export class ServersService {
             status: true,
             bio: true,
           },
+        },
+        roles: {
+          select: {
+            id: true,
+            name: true,
+            color: true,
+            position: true,
+          },
+          orderBy: { position: 'asc' },
         },
       },
     });
@@ -235,7 +253,11 @@ export class ServersService {
   }
 
   async kickServerMember(userId: string, serverId: string, memberId: string) {
-    const server = await this.getServerOwnerOrThrow(userId, serverId);
+    const server = await this.getServerOwnerOrThrow(
+      userId,
+      serverId,
+      'manageMembers',
+    );
 
     const member = await this.prisma.serverMember.findUnique({
       where: {
@@ -275,7 +297,11 @@ export class ServersService {
     targetUserId: string,
     dto: BanMemberDto,
   ) {
-    const server = await this.getServerOwnerOrThrow(userId, serverId);
+    const server = await this.getServerOwnerOrThrow(
+      userId,
+      serverId,
+      'manageBans',
+    );
 
     if (targetUserId === server.ownerId) {
       throw new ForbiddenException('Нельзя забанить владельца сервера');
@@ -340,7 +366,7 @@ export class ServersService {
     serverId: string,
     targetUserId: string,
   ) {
-    await this.getServerOwnerOrThrow(userId, serverId);
+    await this.getServerOwnerOrThrow(userId, serverId, 'manageBans');
 
     const ban = await this.prisma.serverBan.findUnique({
       where: {
@@ -365,7 +391,7 @@ export class ServersService {
   }
 
   async getServerBans(userId: string, serverId: string) {
-    await this.getServerOwnerOrThrow(userId, serverId);
+    await this.getServerOwnerOrThrow(userId, serverId, 'manageBans');
 
     return this.prisma.serverBan.findMany({
       where: { serverId },

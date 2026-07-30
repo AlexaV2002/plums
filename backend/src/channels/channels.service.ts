@@ -1,9 +1,6 @@
-import {
-  ForbiddenException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { PermissionsService } from '../permissions/permissions.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
 import { UpdateChannelPermissionsDto } from './dto/update-channel-permissions.dto';
 import { UpdateChannelDto } from './dto/update-channel.dto';
@@ -20,6 +17,7 @@ export class ChannelsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly channelsGateway: ChannelsGateway,
+    private readonly permissionsService: PermissionsService,
   ) {}
 
   private async checkServerAccess(userId: string, serverId: string) {
@@ -39,24 +37,16 @@ export class ChannelsService {
     return member;
   }
 
+  // Владелец сервера всегда проходит эту проверку; для остальных участников
+  // решает эффективное право manageChannels (пока роли никому не назначены,
+  // поведение не отличается от прежней точечной проверки ownerId).
   private async checkServerOwner(userId: string, serverId: string) {
-    const server = await this.prisma.server.findUnique({
-      where: {
-        id: serverId,
-      },
-    });
-
-    if (!server) {
-      throw new NotFoundException('Сервер не найден');
-    }
-
-    if (server.ownerId !== userId) {
-      throw new ForbiddenException(
-        'Только владелец сервера может управлять каналами',
-      );
-    }
-
-    return server;
+    return this.permissionsService.assertPermission(
+      userId,
+      serverId,
+      'manageChannels',
+      'Только владелец сервера может управлять каналами',
+    );
   }
 
   private async getChannelOrThrow(channelId: string) {
