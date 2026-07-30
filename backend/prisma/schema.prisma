@@ -111,6 +111,7 @@ model Message {
   channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
   author  User    @relation(fields: [authorId], references: [id], onDelete: Cascade)
 
+  @@index([channelId, createdAt])
   @@map("messages")
 }
 

@@ -12,6 +12,7 @@ import {
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CreateMessageDto } from './dto/create-message.dto';
+import { GetMessagesQueryDto } from './dto/get-messages-query.dto';
 import { MessagesService } from './messages.service';
 import { UpdateMessageDto } from './dto/update-message.dto';
 
@@ -38,13 +39,9 @@ export class MessagesController {
   findByChannel(
     @CurrentUser() user: JwtPayload,
     @Param('channelId') channelId: string,
-    @Query('limit') limit?: string,
-    @Query('before') before?: string,
+    @Query() query: GetMessagesQueryDto,
   ) {
-    return this.messagesService.findByChannel(channelId, user.sub, {
-      limit: limit ? Number.parseInt(limit, 10) : undefined,
-      before,
-    });
+    return this.messagesService.findByChannel(channelId, user.sub, query);
   }
 
   @Patch('messages/:messageId')

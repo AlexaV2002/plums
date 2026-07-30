@@ -383,6 +383,8 @@ export class ServersService {
             username: true,
             email: true,
             avatarUrl: true,
+            status: true,
+            bio: true,
           },
         },
       },

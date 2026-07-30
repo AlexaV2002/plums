@@ -82,12 +82,23 @@ class ApiClient {
   final Dio dio;
   String? accessToken;
   String? refreshToken;
+  Future<void>? _refreshInFlight;
 
   Options get authOptions {
     return Options(headers: {'Authorization': 'Bearer $accessToken'});
   }
 
-  Future<void> _refreshTokens() async {
+  // Ротация на бэкенде отзывает refresh-токен сразу после использования, поэтому
+  // параллельные 401 не должны запускать обновление токена дважды — один
+  // конкурентный запрос выиграет гонку, а второй получит уже отозванный токен.
+  // Все обращения идут через один и тот же in-flight Future.
+  Future<void> _refreshTokens() {
+    return _refreshInFlight ??= _performRefresh().whenComplete(() {
+      _refreshInFlight = null;
+    });
+  }
+
+  Future<void> _performRefresh() async {
     final currentRefreshToken = refreshToken;
 
     if (currentRefreshToken == null) {
@@ -263,6 +274,19 @@ class ApiClient {
       '/servers/$serverId/bans/$userId',
       options: authOptions,
     );
+  }
+
+  Future<List<AppServerBan>> getServerBans(String serverId) async {
+    final response = await dio.get(
+      '/servers/$serverId/bans',
+      options: authOptions,
+    );
+
+    final list = response.data as List;
+
+    return list
+        .map((item) => AppServerBan.fromJson(item as Map<String, dynamic>))
+        .toList();
   }
 
   Future<AppInvite> createInvite({required String serverId}) async {
@@ -1731,6 +1755,68 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
+  Future<void> showBans() async {
+    final serverId = selectedServerId;
+
+    if (serverId == null) {
+      return;
+    }
+
+    try {
+      final bans = await apiClient.getServerBans(serverId);
+
+      if (!mounted) return;
+
+      await showServerBansDialog(
+        context: context,
+        bans: bans,
+        onUnban: (ban) => unbanMember(serverId, ban),
+      );
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+
+      if (!mounted) return;
+
+      showErrorSnackBar(
+        context,
+        'Ошибка загрузки списка банов: ${error.response?.data}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      showErrorSnackBar(context, 'Не удалось загрузить список банов: $error');
+    }
+  }
+
+  Future<bool> unbanMember(String serverId, AppServerBan ban) async {
+    try {
+      await apiClient.unbanServerMember(serverId: serverId, userId: ban.userId);
+
+      if (mounted) {
+        showErrorSnackBar(
+          context,
+          'Пользователь "${ban.user.username}" разбанен',
+        );
+      }
+
+      return true;
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return false;
+
+      if (mounted) {
+        showErrorSnackBar(context, 'Ошибка разбана: ${error.response?.data}');
+      }
+
+      return false;
+    } catch (error) {
+      if (mounted) {
+        showErrorSnackBar(context, 'Не удалось разбанить участника: $error');
+      }
+
+      return false;
+    }
+  }
+
   Future<void> sendMessage(String content) async {
     final channelId = selectedChannelId;
 
@@ -2540,6 +2626,7 @@ class _MainShellState extends State<MainShell> {
               isServerOwner: canManageChannels,
               onKickMember: kickMember,
               onBanMember: banMember,
+              onShowBans: showBans,
               onRefresh: showMembers,
             ),
         ],
@@ -3425,6 +3512,7 @@ class MembersSidebar extends StatelessWidget {
     required this.isServerOwner,
     required this.onKickMember,
     required this.onBanMember,
+    required this.onShowBans,
     required this.onRefresh,
   });
 
@@ -3433,6 +3521,7 @@ class MembersSidebar extends StatelessWidget {
   final bool isServerOwner;
   final ValueChanged<AppServerMember> onKickMember;
   final ValueChanged<AppServerMember> onBanMember;
+  final VoidCallback onShowBans;
   final VoidCallback onRefresh;
 
   @override
@@ -3468,6 +3557,13 @@ class MembersSidebar extends StatelessWidget {
                     ),
                   ),
                 ),
+                if (isServerOwner)
+                  IconButton(
+                    tooltip: 'Забаненные',
+                    onPressed: onShowBans,
+                    icon: const Icon(Icons.block_rounded),
+                    color: const Color(0xFFB8ADC8),
+                  ),
                 IconButton(
                   tooltip: 'Обновить',
                   onPressed: onRefresh,
@@ -4723,6 +4819,127 @@ Future<void> showServerMembersDialog({
   );
 }
 
+Future<void> showServerBansDialog({
+  required BuildContext context,
+  required List<AppServerBan> bans,
+  required Future<bool> Function(AppServerBan ban) onUnban,
+}) {
+  final mutableBans = List<AppServerBan>.of(bans);
+
+  return showDialog<void>(
+    context: context,
+    builder: (context) {
+      return StatefulBuilder(
+        builder: (context, setDialogState) {
+          return PlumsDialog(
+            title: 'Забаненные участники',
+            child: SizedBox(
+              width: 420,
+              height: 420,
+              child: mutableBans.isEmpty
+                  ? const Center(
+                      child: Text(
+                        'Забаненных пока нет',
+                        style: TextStyle(
+                          color: Color(0xFFB8ADC8),
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    )
+                  : ListView.separated(
+                      itemCount: mutableBans.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 10),
+                      itemBuilder: (context, index) {
+                        final ban = mutableBans[index];
+                        final user = ban.user;
+                        final letter = user.username.isNotEmpty
+                            ? user.username.characters.first.toUpperCase()
+                            : '?';
+
+                        return Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF302A39),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: const Color(0xFF40374D)),
+                          ),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 42,
+                                height: 42,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF8D5CFF),
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                                child: Center(
+                                  child: Text(
+                                    letter,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      user.username,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Color(0xFFF3EEFF),
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w800,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 3),
+                                    Text(
+                                      ban.reason?.isNotEmpty == true
+                                          ? ban.reason!
+                                          : user.email,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Color(0xFF8F849F),
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              IconButton(
+                                tooltip: 'Разбанить',
+                                onPressed: () async {
+                                  final success = await onUnban(ban);
+
+                                  if (success) {
+                                    setDialogState(() {
+                                      mutableBans.removeAt(index);
+                                    });
+                                  }
+                                },
+                                icon: const Icon(Icons.lock_open_rounded),
+                                color: const Color(0xFF7ADE9C),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          );
+        },
+      );
+    },
+  );
+}
+
 class PlumsDialog extends StatelessWidget {
   const PlumsDialog({super.key, required this.title, required this.child});
 
@@ -5113,6 +5330,35 @@ class AppServerMember {
       userId: userId ?? this.userId,
       joinedAt: joinedAt ?? this.joinedAt,
       user: user ?? this.user,
+    );
+  }
+}
+
+class AppServerBan {
+  const AppServerBan({
+    required this.id,
+    required this.serverId,
+    required this.userId,
+    required this.reason,
+    required this.createdAt,
+    required this.user,
+  });
+
+  final String id;
+  final String serverId;
+  final String userId;
+  final String? reason;
+  final DateTime? createdAt;
+  final AppUser user;
+
+  factory AppServerBan.fromJson(Map<String, dynamic> json) {
+    return AppServerBan(
+      id: json['id'] as String,
+      serverId: json['serverId'] as String,
+      userId: json['userId'] as String,
+      reason: json['reason'] as String?,
+      createdAt: DateTime.tryParse(json['createdAt'] as String? ?? ''),
+      user: AppUser.fromJson(json['user'] as Map<String, dynamic>),
     );
   }
 }

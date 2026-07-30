@@ -169,22 +169,25 @@ Implemented:
 ```text
 Registration
 Login
-JWT Bearer auth
+JWT Bearer auth (access token, 15 minutes TTL)
+Refresh token (opaque, hashed at rest, 30-day TTL, rotated on use)
+Backend logout endpoint (revokes refresh token)
 Desktop login screen
 Desktop registration screen
 Token persistence with shared_preferences
-Session restore after app restart
+Session restore after app restart, including silent access token refresh
 Logout button
 ```
 
 Expected behavior:
 
 ```text
-After login, accessToken is saved locally.
-After app restart, the app restores the token and calls GET /users/me.
-If token is valid, the app opens the main screen.
-If token is invalid, the token is cleared and login screen opens.
-Logout clears the saved token and returns to login screen.
+After login, accessToken and refreshToken are saved locally.
+After app restart, the app restores both tokens and calls GET /users/me.
+If accessToken is expired, the client silently calls POST /auth/refresh and retries the original request once.
+If refresh fails, tokens are cleared and login screen opens.
+Refresh token rotates on every use: the previous refresh token is revoked immediately.
+Logout calls POST /auth/logout to revoke the refresh token, then clears local storage.
 ```
 
 Relevant backend endpoints:
@@ -192,16 +195,19 @@ Relevant backend endpoints:
 ```text
 POST /auth/register
 POST /auth/login
+POST /auth/refresh
+POST /auth/logout
 GET /users/me
 ```
 
 Do not break:
 
 ```text
-accessToken response from login
+accessToken/refreshToken response from login and refresh
 Authorization: Bearer <token>
 GET /users/me session restore
-logout token clearing
+refresh token rotation (old token must become unusable after refresh)
+logout token clearing (client and server side)
 ```
 
 ---
@@ -361,6 +367,9 @@ Implemented:
 Get server members
 Display server members in desktop UI
 Kick server member
+Ban server member (separate from kick, blocks rejoining by invite)
+Unban server member
+List server bans
 ```
 
 Relevant backend endpoints:
@@ -368,25 +377,31 @@ Relevant backend endpoints:
 ```text
 GET /servers/:id/members
 DELETE /servers/:id/members/:memberId
+GET /servers/:id/bans
+POST /servers/:id/bans/:userId
+DELETE /servers/:id/bans/:userId
 ```
 
 Expected behavior:
 
 ```text
 Any server member can view the server member list.
-Only server owner can kick members.
-Owner cannot kick themselves.
-Owner cannot be kicked.
+Only server owner can kick or ban members.
+Owner cannot kick or ban themselves.
+Owner cannot be kicked or banned.
 Member cannot be kicked from a different server through wrong serverId.
 After kick, membership is removed from server_members.
+Ban removes membership (if present) and records a ServerBan row.
+A banned user is blocked from rejoining the server through any invite until unbanned.
+Unban removes the ServerBan row; it does not restore membership.
 ```
 
 Desktop UI implemented:
 
 ```text
 Members button in chat header
-Members dialog
-Kick button for owner
+Members sidebar with kick and ban buttons
+Banned members dialog with unban button (owner only)
 ```
 
 Do not break:
@@ -395,6 +410,8 @@ Do not break:
 server_members relation
 GET /servers filtering by membership
 owner protection
+server_bans unique constraint on (serverId, userId)
+invite join must check server_bans before creating membership
 ```
 
 ---
@@ -477,7 +494,7 @@ Implemented:
 
 ```text
 Send message
-Get message history
+Get message history with cursor-based pagination (limit + before)
 Edit own message
 Delete own message
 Soft delete through deletedAt
@@ -488,7 +505,7 @@ Relevant backend endpoints:
 
 ```text
 POST /channels/:channelId/messages
-GET /channels/:channelId/messages
+GET /channels/:channelId/messages?limit=&before=
 PATCH /messages/:messageId
 DELETE /messages/:messageId
 ```
@@ -497,6 +514,11 @@ Expected behavior:
 
 ```text
 Messages can only be sent to TEXT channels.
+GET history defaults to the latest 50 messages, newest-first internally, returned in chronological order.
+limit is validated to an integer between 1 and 100; invalid values return 400.
+before takes a message id; the server resolves it to a compound (createdAt, id) cursor so
+messages sharing the same createdAt millisecond are never skipped or duplicated across pages.
+before must reference a message that exists in the same channel; otherwise the request returns 400.
 Users can edit only their own messages.
 Users can delete only their own messages.
 Deleted messages are hidden from history.
@@ -507,6 +529,7 @@ Desktop UI implemented:
 
 ```text
 Message history
+Load-more-messages control at the top of the history (pagination)
 Message input
 Send message
 Edit message
@@ -845,6 +868,9 @@ Server members list
 Save auth token after app restart
 Add logout button
 Add server member actions: kick user
+Add server member actions: ban / unban user
+Add refresh token with rotation and backend logout endpoint
+Add cursor-based pagination for message history
 ```
 
 Backlog examples:
@@ -880,17 +906,21 @@ Do not break:
 ```text
 Auth flow
 Token persistence
-Logout
-Session restore
+Refresh token rotation (old refresh token must be revoked after use)
+Logout (client-side clearing and backend revocation)
+Session restore, including silent access-token refresh on 401
 Server list loading
 Invite join flow
+Server ban check on invite join
 Server ownership checks
 Server member checks
 Channel CRUD
 Channel permissions
 Text message CRUD
+Message history pagination (limit/before contract)
 Realtime message updates
 Realtime channel updates
+Realtime member leave reasons (leave / kick / ban)
 Owner permission bypass
 Normal member permission restrictions
 ```

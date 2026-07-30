@@ -142,19 +142,30 @@ export class MessagesService {
       );
     }
 
-    const limit = Math.min(Math.max(options?.limit ?? 50, 1), 100);
+    const limit = options?.limit ?? 50;
 
-    let cursorFilter: { createdAt: { lt: Date } } | undefined;
+    let cursorFilter:
+      | { OR: [{ createdAt: { lt: Date } }, { createdAt: Date; id: { lt: string } }] }
+      | undefined;
 
     if (options?.before) {
       const cursorMessage = await this.prisma.message.findUnique({
         where: { id: options.before },
-        select: { createdAt: true },
+        select: { createdAt: true, channelId: true },
       });
 
-      if (cursorMessage) {
-        cursorFilter = { createdAt: { lt: cursorMessage.createdAt } };
+      if (!cursorMessage || cursorMessage.channelId !== channelId) {
+        throw new BadRequestException('Некорректный курсор пагинации');
       }
+
+      // Составной курсор (createdAt, id): защищает от потери сообщений
+      // с одинаковым createdAt на границе страницы.
+      cursorFilter = {
+        OR: [
+          { createdAt: { lt: cursorMessage.createdAt } },
+          { createdAt: cursorMessage.createdAt, id: { lt: options.before } },
+        ],
+      };
     }
 
     const messages = await this.prisma.message.findMany({
@@ -163,9 +174,7 @@ export class MessagesService {
         deletedAt: null,
         ...cursorFilter,
       },
-      orderBy: {
-        createdAt: 'desc',
-      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit,
       include: {
         author: {
