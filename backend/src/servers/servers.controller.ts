@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { BanMemberDto } from './dto/ban-member.dto';
 import { CreateServerDto } from './dto/create-server.dto';
 import { UpdateServerDto } from './dto/update-server.dto';
 import { ServersService } from './servers.service';
@@ -70,5 +71,29 @@ export class ServersController {
     @Param('memberId') memberId: string,
   ) {
     return this.serversService.kickServerMember(user.sub, id, memberId);
+  }
+
+  @Get(':id/bans')
+  getServerBans(@CurrentUser() user: JwtPayload, @Param('id') id: string) {
+    return this.serversService.getServerBans(user.sub, id);
+  }
+
+  @Post(':id/bans/:userId')
+  banServerMember(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Param('userId') userId: string,
+    @Body() dto: BanMemberDto,
+  ) {
+    return this.serversService.banServerMember(user.sub, id, userId, dto);
+  }
+
+  @Delete(':id/bans/:userId')
+  unbanServerMember(
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Param('userId') userId: string,
+  ) {
+    return this.serversService.unbanServerMember(user.sub, id, userId);
   }
 }

@@ -133,6 +133,19 @@ export class InvitesService {
   async joinInvite(userId: string, code: string) {
     const invite = await this.getUsableInviteOrThrow(code);
 
+    const ban = await this.prisma.serverBan.findUnique({
+      where: {
+        serverId_userId: {
+          serverId: invite.serverId,
+          userId,
+        },
+      },
+    });
+
+    if (ban) {
+      throw new ForbiddenException('Вы забанены на этом сервере');
+    }
+
     const existingMember = await this.prisma.serverMember.findUnique({
       where: {
         serverId_userId: {

@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
@@ -37,8 +38,13 @@ export class MessagesController {
   findByChannel(
     @CurrentUser() user: JwtPayload,
     @Param('channelId') channelId: string,
+    @Query('limit') limit?: string,
+    @Query('before') before?: string,
   ) {
-    return this.messagesService.findByChannel(channelId, user.sub);
+    return this.messagesService.findByChannel(channelId, user.sub, {
+      limit: limit ? Number.parseInt(limit, 10) : undefined,
+      before,
+    });
   }
 
   @Patch('messages/:messageId')

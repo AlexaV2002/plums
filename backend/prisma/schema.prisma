@@ -33,8 +33,24 @@ model User {
   memberships  ServerMember[]
   messages     Message[]
   createdInvites Invite[]     @relation("InviteCreator")
+  refreshTokens  RefreshToken[]
+  bannedFrom     ServerBan[]  @relation("BannedUser")
+  bansIssued     ServerBan[]  @relation("BannedByUser")
 
   @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("refresh_tokens")
 }
 
 model Server {
@@ -49,6 +65,7 @@ model Server {
   members  ServerMember[]
   channels Channel[]
   invites  Invite[]
+  bans     ServerBan[]
 
   @@map("servers")
 }
@@ -111,4 +128,20 @@ model Invite {
   creator User   @relation("InviteCreator", fields: [createdBy], references: [id], onDelete: Cascade)
 
   @@map("invites")
+}
+
+model ServerBan {
+  id        String   @id @default(uuid())
+  serverId  String
+  userId    String
+  bannedBy  String
+  reason    String?
+  createdAt DateTime @default(now())
+
+  server       Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  user         User   @relation("BannedUser", fields: [userId], references: [id], onDelete: Cascade)
+  bannedByUser User   @relation("BannedByUser", fields: [bannedBy], references: [id], onDelete: Cascade)
+
+  @@unique([serverId, userId])
+  @@map("server_bans")
 }

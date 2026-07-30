@@ -1,9 +1,11 @@
 import {
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { BanMemberDto } from './dto/ban-member.dto';
 import { CreateServerDto } from './dto/create-server.dto';
 import { UpdateServerDto } from './dto/update-server.dto';
 import { ServersGateway } from './servers.gateway';
@@ -265,5 +267,125 @@ export class ServersService {
     return {
       message: 'Участник удалён с сервера',
     };
+  }
+
+  async banServerMember(
+    userId: string,
+    serverId: string,
+    targetUserId: string,
+    dto: BanMemberDto,
+  ) {
+    const server = await this.getServerOwnerOrThrow(userId, serverId);
+
+    if (targetUserId === server.ownerId) {
+      throw new ForbiddenException('Нельзя забанить владельца сервера');
+    }
+
+    const existingBan = await this.prisma.serverBan.findUnique({
+      where: {
+        serverId_userId: {
+          serverId,
+          userId: targetUserId,
+        },
+      },
+    });
+
+    if (existingBan) {
+      throw new ConflictException('Пользователь уже забанен на этом сервере');
+    }
+
+    const member = await this.prisma.serverMember.findUnique({
+      where: {
+        serverId_userId: {
+          serverId,
+          userId: targetUserId,
+        },
+      },
+    });
+
+    await this.prisma.$transaction([
+      this.prisma.serverBan.create({
+        data: {
+          serverId,
+          userId: targetUserId,
+          bannedBy: userId,
+          reason: dto.reason,
+        },
+      }),
+      ...(member
+        ? [
+            this.prisma.serverMember.delete({
+              where: { id: member.id },
+            }),
+          ]
+        : []),
+    ]);
+
+    if (member) {
+      this.serversGateway.emitMemberLeave({
+        serverId,
+        userId: targetUserId,
+        memberId: member.id,
+        reason: 'ban',
+      });
+    }
+
+    return {
+      message: 'Пользователь забанен на сервере',
+    };
+  }
+
+  async unbanServerMember(
+    userId: string,
+    serverId: string,
+    targetUserId: string,
+  ) {
+    await this.getServerOwnerOrThrow(userId, serverId);
+
+    const ban = await this.prisma.serverBan.findUnique({
+      where: {
+        serverId_userId: {
+          serverId,
+          userId: targetUserId,
+        },
+      },
+    });
+
+    if (!ban) {
+      throw new NotFoundException('Пользователь не забанен на этом сервере');
+    }
+
+    await this.prisma.serverBan.delete({
+      where: { id: ban.id },
+    });
+
+    return {
+      message: 'Пользователь разбанен',
+    };
+  }
+
+  async getServerBans(userId: string, serverId: string) {
+    await this.getServerOwnerOrThrow(userId, serverId);
+
+    return this.prisma.serverBan.findMany({
+      where: { serverId },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        serverId: true,
+        userId: true,
+        bannedBy: true,
+        reason: true,
+        createdAt: true,
+        user: {
+          select: {
+            id: true,
+            username: true,
+            email: true,
+            avatarUrl: true,
+          },
+        },
+      },
+    });
   }
 }

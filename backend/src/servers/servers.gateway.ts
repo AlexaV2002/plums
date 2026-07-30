@@ -11,7 +11,7 @@ export type MemberLeavePayload = {
   serverId: string;
   userId: string;
   memberId: string;
-  reason: 'leave' | 'kick';
+  reason: 'leave' | 'kick' | 'ban';
 };
 
 @WebSocketGateway({

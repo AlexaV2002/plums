@@ -122,7 +122,11 @@ export class MessagesService {
     return message;
   }
 
-  async findByChannel(channelId: string, userId: string) {
+  async findByChannel(
+    channelId: string,
+    userId: string,
+    options?: { limit?: number; before?: string },
+  ) {
     const channel = await this.getChannelForUser(channelId, userId);
 
     const isOwner = this.isServerOwner(channel, userId);
@@ -138,14 +142,31 @@ export class MessagesService {
       );
     }
 
-    return this.prisma.message.findMany({
+    const limit = Math.min(Math.max(options?.limit ?? 50, 1), 100);
+
+    let cursorFilter: { createdAt: { lt: Date } } | undefined;
+
+    if (options?.before) {
+      const cursorMessage = await this.prisma.message.findUnique({
+        where: { id: options.before },
+        select: { createdAt: true },
+      });
+
+      if (cursorMessage) {
+        cursorFilter = { createdAt: { lt: cursorMessage.createdAt } };
+      }
+    }
+
+    const messages = await this.prisma.message.findMany({
       where: {
         channelId,
         deletedAt: null,
+        ...cursorFilter,
       },
       orderBy: {
-        createdAt: 'asc',
+        createdAt: 'desc',
       },
+      take: limit,
       include: {
         author: {
           select: {
@@ -158,6 +179,9 @@ export class MessagesService {
         },
       },
     });
+
+    // Отдаём страницу в хронологическом порядке (от старых к новым), как и раньше.
+    return messages.reverse();
   }
 
   async update(messageId: string, userId: string, dto: UpdateMessageDto) {
