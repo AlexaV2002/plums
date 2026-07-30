@@ -6,11 +6,15 @@ import {
 } from '@nestjs/common';
 import { randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import { ServersGateway } from '../servers/servers.gateway';
 import { CreateInviteDto } from './dto/create-invite.dto';
 
 @Injectable()
 export class InvitesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly serversGateway: ServersGateway,
+  ) {}
 
   private async getServerOwnerOrThrow(userId: string, serverId: string) {
     const server = await this.prisma.server.findUnique({
@@ -159,11 +163,23 @@ export class InvitesService {
       return invite.server;
     }
 
-    await this.prisma.$transaction([
+    const [member] = await this.prisma.$transaction([
       this.prisma.serverMember.create({
         data: {
           serverId: invite.serverId,
           userId,
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              username: true,
+              email: true,
+              avatarUrl: true,
+              status: true,
+              bio: true,
+            },
+          },
         },
       }),
       this.prisma.invite.update({
@@ -177,6 +193,8 @@ export class InvitesService {
         },
       }),
     ]);
+
+    this.serversGateway.emitMemberJoin(member);
 
     return invite.server;
   }

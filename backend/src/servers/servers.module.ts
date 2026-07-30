@@ -9,5 +9,6 @@ import { ServersGateway } from './servers.gateway';
   imports: [PrismaModule, JwtModule],
   controllers: [ServersController],
   providers: [ServersService, ServersGateway],
+  exports: [ServersGateway],
 })
 export class ServersModule {}

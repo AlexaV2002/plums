@@ -469,6 +469,7 @@ class RealtimeClient {
   }
 
   late final io.Socket socket;
+  String? _currentServerId;
 
   void connect({
     required String accessToken,
@@ -479,16 +480,34 @@ class RealtimeClient {
     required ValueChanged<AppChannel> onChannelUpdate,
     required ValueChanged<RealtimeChannelDelete> onChannelDelete,
     required ValueChanged<RealtimeMemberLeave> onMemberLeave,
+    required ValueChanged<AppServerMember> onMemberJoin,
     required ValueChanged<RealtimeUserStatus> onUserStatus,
   }) {
     void identifyPresence() {
       socket.emit('presence:identify', {'token': accessToken});
     }
 
-    socket.onConnect((_) => identifyPresence());
+    // На каждое (пере)подключение сокета комнаты сервера нужно вступать заново —
+    // членство в socket.io-комнате привязано к конкретному соединению и не
+    // переживает реконнект. Без этого server:join, отправленный до того как
+    // сокет реально подключился (или после обрыва связи), молча терялся, и
+    // владелец сервера переставал получать member:join/member:leave.
+    void rejoinCurrentServerRoom() {
+      final serverId = _currentServerId;
+
+      if (serverId != null) {
+        socket.emit('server:join', {'serverId': serverId});
+      }
+    }
+
+    socket.onConnect((_) {
+      identifyPresence();
+      rejoinCurrentServerRoom();
+    });
 
     if (socket.connected) {
       identifyPresence();
+      rejoinCurrentServerRoom();
     }
 
     socket.on('message:new', (data) {
@@ -516,6 +535,12 @@ class RealtimeClient {
         onMemberLeave(
           RealtimeMemberLeave.fromJson(Map<String, dynamic>.from(data)),
         );
+      }
+    });
+
+    socket.on('member:join', (data) {
+      if (data is Map) {
+        onMemberJoin(AppServerMember.fromJson(Map<String, dynamic>.from(data)));
       }
     });
 
@@ -551,14 +576,23 @@ class RealtimeClient {
   }
 
   void joinServer(String serverId) {
+    _currentServerId = serverId;
+
     if (!socket.connected) {
+      // Комната будет занята через rejoinCurrentServerRoom(), как только
+      // сокет реально подключится (см. connect()).
       socket.connect();
+      return;
     }
 
     socket.emit('server:join', {'serverId': serverId});
   }
 
   void leaveServer(String serverId) {
+    if (_currentServerId == serverId) {
+      _currentServerId = null;
+    }
+
     socket.emit('server:leave', {'serverId': serverId});
   }
 
@@ -1123,10 +1157,13 @@ class _MainShellState extends State<MainShell> {
   bool isLoadingMoreMessages = false;
   String? errorMessage;
 
+  final ScrollController messagesScrollController = ScrollController();
+
   @override
   void initState() {
     super.initState();
     currentUser = widget.initialUser;
+    messagesScrollController.addListener(_handleMessagesScroll);
     realtimeClient.connect(
       accessToken: apiClient.accessToken ?? '',
       onMessageNew: handleRealtimeMessage,
@@ -1136,6 +1173,7 @@ class _MainShellState extends State<MainShell> {
       onChannelUpdate: handleRealtimeChannelUpdate,
       onChannelDelete: handleRealtimeChannelDelete,
       onMemberLeave: handleRealtimeMemberLeave,
+      onMemberJoin: handleRealtimeMemberJoin,
       onUserStatus: handleRealtimeUserStatus,
     );
     loadInitialData();
@@ -1143,8 +1181,36 @@ class _MainShellState extends State<MainShell> {
 
   @override
   void dispose() {
+    messagesScrollController.removeListener(_handleMessagesScroll);
+    messagesScrollController.dispose();
     realtimeClient.dispose();
     super.dispose();
+  }
+
+  void _handleMessagesScroll() {
+    if (!messagesScrollController.hasClients) {
+      return;
+    }
+
+    // Подгружаем более старые сообщения, когда пользователь подскроллил
+    // близко к верхней границе списка (список не reversed: верх = старые сообщения).
+    const loadMoreThreshold = 200.0;
+
+    if (messagesScrollController.position.pixels <= loadMoreThreshold) {
+      loadMoreMessages();
+    }
+  }
+
+  void _scrollMessagesToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !messagesScrollController.hasClients) {
+        return;
+      }
+
+      messagesScrollController.jumpTo(
+        messagesScrollController.position.maxScrollExtent,
+      );
+    });
   }
 
   Future<void> logout() async {
@@ -1266,6 +1332,20 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(context, message);
     }
+  }
+
+  void handleRealtimeMemberJoin(AppServerMember member) {
+    if (!mounted || member.serverId != selectedServerId) {
+      return;
+    }
+
+    if (members.any((item) => item.id == member.id)) {
+      return;
+    }
+
+    setState(() {
+      members = [...members, member];
+    });
   }
 
   void handleRealtimeUserStatus(RealtimeUserStatus event) {
@@ -1436,6 +1516,7 @@ class _MainShellState extends State<MainShell> {
         hasMoreMessages = loadedMessages.length >= 50;
         isLoading = false;
       });
+      _scrollMessagesToBottom();
       syncRealtimeServer(firstServerId);
       syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
@@ -1483,6 +1564,7 @@ class _MainShellState extends State<MainShell> {
         hasMoreMessages = loadedMessages.length >= 50;
         isLoading = false;
       });
+      _scrollMessagesToBottom();
       syncRealtimeServer(serverId);
       syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
@@ -1544,23 +1626,28 @@ class _MainShellState extends State<MainShell> {
         limit: pageSize,
       );
 
+      // Пользователь мог успеть выбрать другой канал, пока шёл запрос —
+      // тогда этот ответ устарел и не должен перетирать уже открытый канал.
+      if (!mounted || selectedChannelId != channelId) return;
+
       setState(() {
         messages = loadedMessages;
         hasMoreMessages = loadedMessages.length >= pageSize;
         isMessagesLoading = false;
       });
+      _scrollMessagesToBottom();
       syncRealtimeChannel(channel);
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
 
-      if (!mounted) return;
+      if (!mounted || selectedChannelId != channelId) return;
 
       setState(() {
         errorMessage = 'Ошибка загрузки сообщений: ${error.response?.data}';
         isMessagesLoading = false;
       });
     } catch (error) {
-      if (!mounted) return;
+      if (!mounted || selectedChannelId != channelId) return;
 
       setState(() {
         errorMessage = 'Не удалось загрузить сообщения: $error';
@@ -1591,17 +1678,42 @@ class _MainShellState extends State<MainShell> {
         before: messages.first.id,
       );
 
-      if (!mounted) return;
+      // Пользователь мог переключить канал, пока грузились старые сообщения —
+      // тогда эта страница относится к уже неактуальному каналу.
+      if (!mounted || selectedChannelId != channelId) return;
+
+      // Запоминаем текущую позицию и высоту прокрутки до того, как в начало
+      // списка добавятся старые сообщения, чтобы после перестройки списка
+      // восстановить ту же видимую точку и не "прыгать" к низу.
+      final hasScrollPosition = messagesScrollController.hasClients;
+      final previousPixels = hasScrollPosition
+          ? messagesScrollController.position.pixels
+          : 0.0;
+      final previousMaxScrollExtent = hasScrollPosition
+          ? messagesScrollController.position.maxScrollExtent
+          : 0.0;
 
       setState(() {
         messages = [...olderMessages, ...messages];
         hasMoreMessages = olderMessages.length >= pageSize;
         isLoadingMoreMessages = false;
       });
+
+      if (hasScrollPosition) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || !messagesScrollController.hasClients) return;
+
+          final addedExtent =
+              messagesScrollController.position.maxScrollExtent -
+              previousMaxScrollExtent;
+
+          messagesScrollController.jumpTo(previousPixels + addedExtent);
+        });
+      }
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
 
-      if (!mounted) return;
+      if (!mounted || selectedChannelId != channelId) return;
 
       setState(() {
         isLoadingMoreMessages = false;
@@ -1612,7 +1724,7 @@ class _MainShellState extends State<MainShell> {
         'Не удалось загрузить более старые сообщения: ${error.response?.data}',
       );
     } catch (error) {
-      if (!mounted) return;
+      if (!mounted || selectedChannelId != channelId) return;
 
       setState(() {
         isLoadingMoreMessages = false;
@@ -2189,7 +2301,6 @@ class _MainShellState extends State<MainShell> {
 
     setState(() {
       isLoading = true;
-      errorMessage = null;
     });
 
     try {
@@ -2215,21 +2326,30 @@ class _MainShellState extends State<MainShell> {
         hasMoreMessages = loadedMessages.length >= 50;
         isLoading = false;
       });
+      _scrollMessagesToBottom();
       syncRealtimeServer(server.id);
       syncRealtimeChannel(firstChannel);
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
 
       if (!mounted) return;
+
       setState(() {
-        errorMessage = 'Ошибка вступления на сервер: ${error.response?.data}';
         isLoading = false;
       });
+
+      showErrorSnackBar(
+        context,
+        'Ошибка вступления на сервер: ${error.response?.data}',
+      );
     } catch (error) {
+      if (!mounted) return;
+
       setState(() {
-        errorMessage = 'Не удалось вступить на сервер: $error';
         isLoading = false;
       });
+
+      showErrorSnackBar(context, 'Не удалось вступить на сервер: $error');
     }
   }
 
@@ -2612,6 +2732,7 @@ class _MainShellState extends State<MainShell> {
                     hasMoreMessages: hasMoreMessages,
                     isLoadingMoreMessages: isLoadingMoreMessages,
                     canSendMessages: canSendMessages,
+                    messagesScrollController: messagesScrollController,
                     onSendMessage: sendMessage,
                     onEditMessage: editMessage,
                     onDeleteMessage: deleteMessage,
@@ -3385,6 +3506,7 @@ class ChatArea extends StatelessWidget {
     required this.hasMoreMessages,
     required this.isLoadingMoreMessages,
     required this.canSendMessages,
+    required this.messagesScrollController,
     required this.onSendMessage,
     required this.onEditMessage,
     required this.onDeleteMessage,
@@ -3398,6 +3520,7 @@ class ChatArea extends StatelessWidget {
   final bool hasMoreMessages;
   final bool isLoadingMoreMessages;
   final bool canSendMessages;
+  final ScrollController messagesScrollController;
   final Future<void> Function(String content) onSendMessage;
   final ValueChanged<AppMessage> onEditMessage;
   final ValueChanged<AppMessage> onDeleteMessage;
@@ -3423,6 +3546,7 @@ class ChatArea extends StatelessWidget {
                           messages: messages,
                           hasMoreMessages: hasMoreMessages,
                           isLoadingMoreMessages: isLoadingMoreMessages,
+                          scrollController: messagesScrollController,
                           onEditMessage: onEditMessage,
                           onDeleteMessage: onDeleteMessage,
                           onLoadMoreMessages: onLoadMoreMessages,
@@ -3682,6 +3806,7 @@ class MessagesList extends StatelessWidget {
     required this.messages,
     required this.hasMoreMessages,
     required this.isLoadingMoreMessages,
+    required this.scrollController,
     required this.onEditMessage,
     required this.onDeleteMessage,
     required this.onLoadMoreMessages,
@@ -3690,6 +3815,7 @@ class MessagesList extends StatelessWidget {
   final List<AppMessage> messages;
   final bool hasMoreMessages;
   final bool isLoadingMoreMessages;
+  final ScrollController scrollController;
   final ValueChanged<AppMessage> onEditMessage;
   final ValueChanged<AppMessage> onDeleteMessage;
   final VoidCallback onLoadMoreMessages;
@@ -3712,6 +3838,7 @@ class MessagesList extends StatelessWidget {
     final itemCount = messages.length + (hasMoreMessages ? 1 : 0);
 
     return ListView.builder(
+      controller: scrollController,
       padding: const EdgeInsets.fromLTRB(22, 24, 22, 18),
       itemCount: itemCount,
       itemBuilder: (context, index) {

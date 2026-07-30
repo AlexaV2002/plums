@@ -14,6 +14,21 @@ export type MemberLeavePayload = {
   reason: 'leave' | 'kick' | 'ban';
 };
 
+export type MemberJoinPayload = {
+  id: string;
+  serverId: string;
+  userId: string;
+  joinedAt: Date;
+  user: {
+    id: string;
+    username: string;
+    email: string;
+    avatarUrl: string | null;
+    status: string;
+    bio: string | null;
+  };
+};
+
 @WebSocketGateway({
   cors: {
     origin: '*',
@@ -49,6 +64,10 @@ export class ServersGateway {
 
   emitMemberLeave(payload: MemberLeavePayload) {
     this.server.to(this.getServerRoom(payload.serverId)).emit('member:leave', payload);
+  }
+
+  emitMemberJoin(payload: MemberJoinPayload) {
+    this.server.to(this.getServerRoom(payload.serverId)).emit('member:join', payload);
   }
 
   private getServerRoom(serverId: string) {
