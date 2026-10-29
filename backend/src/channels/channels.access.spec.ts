@@ -6,7 +6,10 @@ describe('channel room revocation', () => {
     const owner = { data: { userId: 'owner' }, leave: jest.fn() };
     const member = { data: { userId: 'member' }, leave: jest.fn() };
     const fetchSockets = jest.fn().mockResolvedValue([owner, member]);
-    const gateway = new ChannelsGateway();
+    const gatewayPrisma = {
+      server: { findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner' }) },
+    };
+    const gateway = new ChannelsGateway(gatewayPrisma as never);
     gateway.server = {
       in: jest.fn().mockReturnValue({ fetchSockets }),
     } as never;
@@ -37,6 +40,49 @@ describe('channel room revocation', () => {
     });
     expect(owner.leave).not.toHaveBeenCalled();
     expect(member.leave).toHaveBeenCalledWith('channel:channel-1');
-    expect(emitChannelUpdate).toHaveBeenCalled();
+    // The update is still broadcast, but service must tell the gateway the
+    // channel is now hidden so it doesn't leak to server:<id> for everyone.
+    expect(emitChannelUpdate).toHaveBeenCalledWith(
+      'server-1',
+      expect.objectContaining({ id: 'channel-1' }),
+      true,
+    );
+  });
+
+  it('keeps broadcasting to the whole server room for visible channels', async () => {
+    const gatewayPrisma = {
+      server: { findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner' }) },
+    };
+    const gateway = new ChannelsGateway(gatewayPrisma as never);
+    gateway.server = { in: jest.fn() } as never;
+
+    const prisma = {
+      channel: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'channel-2',
+          serverId: 'server-1',
+          permissions: { canView: true },
+        }),
+        update: jest.fn().mockResolvedValue({
+          id: 'channel-2',
+          serverId: 'server-1',
+          name: 'renamed',
+          permissions: { canView: true },
+        }),
+      },
+    };
+    const service = new ChannelsService(prisma as never, gateway, {
+      assertPermission: jest.fn().mockResolvedValue({}),
+    } as never);
+    const emitChannelUpdate = jest.fn();
+    gateway.emitChannelUpdate = emitChannelUpdate;
+
+    await service.updateChannel('owner', 'channel-2', { name: 'renamed' });
+
+    expect(emitChannelUpdate).toHaveBeenCalledWith(
+      'server-1',
+      expect.objectContaining({ id: 'channel-2' }),
+      false,
+    );
   });
 });

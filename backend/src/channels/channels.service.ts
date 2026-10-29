@@ -109,7 +109,11 @@ export class ChannelsService {
       },
     });
 
-    this.channelsGateway.emitChannelNew(serverId, channel);
+    await this.channelsGateway.emitChannelNew(
+      serverId,
+      channel,
+      this.getPermissions(channel.permissions).canView === false,
+    );
 
     return channel;
   }
@@ -165,9 +169,10 @@ export class ChannelsService {
       },
     });
 
-    this.channelsGateway.emitChannelUpdate(
+    await this.channelsGateway.emitChannelUpdate(
       updatedChannel.serverId,
       updatedChannel,
+      this.getPermissions(channel.permissions).canView === false,
     );
 
     return updatedChannel;
@@ -184,10 +189,14 @@ export class ChannelsService {
       },
     });
 
-    this.channelsGateway.emitChannelDelete(channel.serverId, {
-      id: channel.id,
-      serverId: channel.serverId,
-    });
+    await this.channelsGateway.emitChannelDelete(
+      channel.serverId,
+      {
+        id: channel.id,
+        serverId: channel.serverId,
+      },
+      this.getPermissions(channel.permissions).canView === false,
+    );
     this.channelsGateway.evictChannel(channelId);
 
     return {
@@ -218,7 +227,10 @@ export class ChannelsService {
       },
     });
 
-    if (this.getPermissions(updatedChannel.permissions).canView === false) {
+    const isNowHidden =
+      this.getPermissions(updatedChannel.permissions).canView === false;
+
+    if (isNowHidden) {
       const server = await this.prisma.server.findUnique({
         where: { id: updatedChannel.serverId },
         select: { ownerId: true },
@@ -231,9 +243,10 @@ export class ChannelsService {
       }
     }
 
-    this.channelsGateway.emitChannelUpdate(
+    await this.channelsGateway.emitChannelUpdate(
       updatedChannel.serverId,
       updatedChannel,
+      isNowHidden,
     );
 
     return updatedChannel;
