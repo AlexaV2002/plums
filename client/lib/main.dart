@@ -1393,6 +1393,12 @@ class _MainShellState extends State<MainShell> {
   bool isLoadingMoreMessages = false;
   String? errorMessage;
 
+  // Защита от параллельного запуска докачки пропущенных сообщений: если
+  // соединение мигает (упало-поднялось несколько раз подряд), не даём
+  // второму вызову handleRealtimeReconnected стартовать новый цикл докачки,
+  // пока предыдущий ещё не завершился.
+  bool _reconnectCatchUpInProgress = false;
+
   final ScrollController messagesScrollController = ScrollController();
 
   @override
@@ -1487,10 +1493,12 @@ class _MainShellState extends State<MainShell> {
     if (!mounted ||
         channelId == null ||
         channelId != selectedChannelId ||
-        isMessagesLoading) {
+        isMessagesLoading ||
+        _reconnectCatchUpInProgress) {
       return;
     }
 
+    _reconnectCatchUpInProgress = true;
     try {
       const pageSize = 50;
       // Крайний случай: список сообщений канала ещё пуст (например, канал не
@@ -1513,8 +1521,39 @@ class _MainShellState extends State<MainShell> {
       // курсору `after`, начиная от последнего известного клиенту сообщения,
       // а не только последнюю страницу — иначе длинный обрыв (>50 сообщений)
       // молча потеряет часть истории.
-      var cursor = messages.last.id;
-      const maxPages = 40; // защита от зависания при аномально долгом обрыве
+      await _catchUpMessagesAfter(channelId, messages.last.id);
+    } catch (_) {
+      // Молча игнорируем: список сообщений уже отображён (не завис в
+      // загрузке), а пропущенные сообщения всё равно продолжат приходить
+      // по realtime-событиям или догрузятся при следующем переподключении.
+    } finally {
+      _reconnectCatchUpInProgress = false;
+    }
+  }
+
+  // Постранично догружает сообщения после курсора [startCursor]. Каждая
+  // полученная страница сливается с текущим списком через
+  // mergeMessagesChronologically — это защищает от гонки, когда во время
+  // докачки по этому же восстановленному соединению приходит новое live
+  // сообщение (handleRealtimeMessage успевает выполниться между двумя
+  // await этого цикла): простое добавление в конец списка поставило бы его
+  // раньше более старых, но ещё не докачанных страниц.
+  //
+  // Если за maxPages страниц не догнали реальное состояние канала
+  // (последняя полученная страница всё ещё полная — значит, вероятно, есть
+  // ещё данные), не завершаемся молча: показываем snackbar с кнопкой
+  // "Повторить", которая продолжит докачку с последнего достигнутого
+  // курсора, а не с начала.
+  Future<void> _catchUpMessagesAfter(
+    String channelId,
+    String startCursor,
+  ) async {
+    const pageSize = 50;
+    const maxPages = 40; // защита от зависания при аномально долгом обрыве
+    var cursor = startCursor;
+    var lastPageWasFull = false;
+
+    try {
       for (var page = 0; page < maxPages; page++) {
         final next = await apiClient.getMessages(
           channelId,
@@ -1525,28 +1564,50 @@ class _MainShellState extends State<MainShell> {
         if (!mounted || selectedChannelId != channelId) return;
 
         if (next.isNotEmpty) {
-          final existingIds = messages.map((item) => item.id).toSet();
-          final missing =
-              next.where((item) => !existingIds.contains(item.id)).toList();
-
-          if (missing.isNotEmpty) {
-            setState(() {
-              messages = [...messages, ...missing];
-            });
-          }
-
+          setState(() {
+            messages = mergeMessagesChronologically(messages, next);
+          });
           cursor = next.last.id;
         }
 
-        if (next.length < pageSize) {
+        lastPageWasFull = next.length >= pageSize;
+        if (!lastPageWasFull) {
           // Страница короче лимита — догнали realtime, дальше можно не идти.
-          break;
+          return;
         }
       }
     } catch (_) {
-      // Молча игнорируем: список сообщений уже отображён (не завис в
-      // загрузке), а пропущенные сообщения всё равно продолжат приходить
-      // по realtime-событиям или догрузятся при следующем переподключении.
+      // Молча игнорируем ошибку отдельной страницы докачки: список уже
+      // отображён, а попытка повторится при следующем переподключении или
+      // по кнопке "Повторить" ниже.
+      return;
+    }
+
+    if (!mounted || selectedChannelId != channelId) return;
+
+    showErrorSnackBar(
+      context,
+      'Не удалось полностью восстановить историю сообщений после '
+      'переподключения',
+      action: SnackBarAction(
+        label: 'Повторить',
+        onPressed: () => unawaited(_retryCatchUp(channelId, cursor)),
+      ),
+    );
+  }
+
+  // Отдельная обёртка для кнопки "Повторить": использует тот же guard, что
+  // и handleRealtimeReconnected, чтобы повторный реконнект во время ожидания
+  // нажатия (или сразу после него) не запустил второй параллельный цикл
+  // докачки для того же канала.
+  Future<void> _retryCatchUp(String channelId, String cursor) async {
+    if (_reconnectCatchUpInProgress) return;
+
+    _reconnectCatchUpInProgress = true;
+    try {
+      await _catchUpMessagesAfter(channelId, cursor);
+    } finally {
+      _reconnectCatchUpInProgress = false;
     }
   }
 
@@ -5928,8 +5989,47 @@ class PlumsDialog extends StatelessWidget {
   }
 }
 
-void showErrorSnackBar(BuildContext context, String message) {
-  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+void showErrorSnackBar(
+  BuildContext context,
+  String message, {
+  SnackBarAction? action,
+}) {
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(content: Text(message), action: action),
+  );
+}
+
+// Сливает текущий список сообщений канала с новыми (докачанными после
+// реконнекта или пришедшими по live realtime-событию), убирает дубликаты по
+// `id` и восстанавливает хронологический порядок по тому же критерию, что
+// backend использует для курсора пагинации: сначала по `createdAt`, при
+// равенстве — по `id`. Это чистая функция без побочных эффектов, вынесенная
+// отдельно, чтобы её можно было покрыть unit-тестами без виджетов и сети.
+List<AppMessage> mergeMessagesChronologically(
+  List<AppMessage> current,
+  Iterable<AppMessage> incoming,
+) {
+  final byId = <String, AppMessage>{};
+
+  for (final message in current) {
+    byId[message.id] = message;
+  }
+  for (final message in incoming) {
+    byId[message.id] = message;
+  }
+
+  final merged = byId.values.toList()
+    ..sort((a, b) {
+      final aCreatedAt =
+          a.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final bCreatedAt =
+          b.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final createdAtCompare = aCreatedAt.compareTo(bCreatedAt);
+      if (createdAtCompare != 0) return createdAtCompare;
+      return a.id.compareTo(b.id);
+    });
+
+  return merged;
 }
 
 Color? parseHexColor(String? hex) {
