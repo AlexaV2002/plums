@@ -1,4 +1,5 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { PermissionsService } from '../permissions/permissions.service';
@@ -152,39 +153,66 @@ export class InvitesService {
       return invite.server;
     }
 
-    const [member] = await this.prisma.$transaction([
-      this.prisma.serverMember.create({
-        data: {
-          serverId: invite.serverId,
-          userId,
-        },
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              email: true,
-              avatarUrl: true,
-              status: true,
-              bio: true,
+    try {
+      const member = await this.prisma.$transaction(async (tx) => {
+        // Атомарная условная проверка лимита: UPDATE ... WHERE currentUses < maxUses
+        // берёт row-lock на строку приглашения, поэтому параллельные join-транзакции
+        // сериализуются на этом условии и не могут вдвоём "пройти" один и тот же лимит.
+        if (invite.maxUses !== null) {
+          const incremented = await tx.invite.updateMany({
+            where: {
+              id: invite.id,
+              currentUses: { lt: invite.maxUses },
+            },
+            data: {
+              currentUses: { increment: 1 },
+            },
+          });
+
+          if (incremented.count === 0) {
+            throw new BadRequestException('Лимит использований приглашения исчерпан');
+          }
+        } else {
+          await tx.invite.update({
+            where: { id: invite.id },
+            data: { currentUses: { increment: 1 } },
+          });
+        }
+
+        return tx.serverMember.create({
+          data: {
+            serverId: invite.serverId,
+            userId,
+          },
+          include: {
+            user: {
+              select: {
+                id: true,
+                username: true,
+                email: true,
+                avatarUrl: true,
+                status: true,
+                bio: true,
+              },
             },
           },
-        },
-      }),
-      this.prisma.invite.update({
-        where: {
-          id: invite.id,
-        },
-        data: {
-          currentUses: {
-            increment: 1,
-          },
-        },
-      }),
-    ]);
+        });
+      });
 
-    this.serversGateway.emitMemberJoin(member);
+      this.serversGateway.emitMemberJoin(member);
 
-    return invite.server;
+      return invite.server;
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        // Параллельный join того же нового пользователя уже создал ServerMember
+        // в своей транзакции первым; инкремент currentUses этой транзакции был
+        // откатён вместе с ней, так что лишнее использование инвайта не тратится.
+        return invite.server;
+      }
+      throw error;
+    }
   }
 }
