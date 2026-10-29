@@ -11,7 +11,11 @@ describe('MessagesGateway rooms', () => {
   beforeEach(() => jest.clearAllMocks());
 
   const client = () => ({
-    data: { userId: 'user-1' },
+    data: {
+      userId: 'user-1',
+      authExpiresAt: Date.now() + 60000,
+      identityVersion: 1,
+    },
     join: jest.fn(),
     emit: jest.fn(),
   });
@@ -53,5 +57,13 @@ describe('MessagesGateway rooms', () => {
     socket.data.userId = 'owner';
     await gateway.joinChannel({ channelId: 'channel-1' }, socket as never);
     expect(socket.join).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a channel join after JWT expiry', async () => {
+    const socket = client();
+    socket.data.authExpiresAt = Date.now() - 1;
+    await gateway.joinChannel({ channelId: 'channel-1' }, socket as never);
+    expect(prisma.channel.findUnique).not.toHaveBeenCalled();
+    expect(socket.join).not.toHaveBeenCalled();
   });
 });

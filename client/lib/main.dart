@@ -548,12 +548,13 @@ class AuthStorage {
 }
 
 class RealtimeClient {
-  RealtimeClient() {
+  RealtimeClient({String? socketUrl}) {
     try {
       socket = io.io(
-        apiBaseUrl,
+        socketUrl ?? apiBaseUrl,
         io.OptionBuilder()
             .setTransports(['websocket'])
+            .enableForceNew()
             .disableAutoConnect()
             .build(),
       );
@@ -566,6 +567,7 @@ class RealtimeClient {
         'http://localhost:3000',
         io.OptionBuilder()
             .setTransports(['websocket'])
+            .enableForceNew()
             .disableAutoConnect()
             .build(),
       );
@@ -577,6 +579,7 @@ class RealtimeClient {
   String? _currentChannelId;
   bool _identified = false;
   bool _disposed = false;
+  bool _handlersInstalled = false;
   int _connectionEpoch = 0;
 
   void connect({
@@ -597,6 +600,9 @@ class RealtimeClient {
     required ValueChanged<RealtimeMemberRolesUpdate> onMemberRolesUpdate,
     required ValueChanged<String?> onReconnected,
   }) {
+    if (_disposed || _handlersInstalled) return;
+    _handlersInstalled = true;
+
     Future<void> identifyAndRejoin() async {
       final epoch = ++_connectionEpoch;
       _identified = false;
@@ -640,7 +646,13 @@ class RealtimeClient {
       _identified = false;
       _connectionEpoch++;
     });
-    if (socket.connected) identifyAndRejoin();
+    socket.on('session:expired', (_) {
+      if (_disposed || !socket.connected) return;
+      // Backend уже удалил защищённые комнаты. Получаем актуальный JWT через
+      // getMe (401 запускает refresh), затем вступаем обратно только после ack.
+      _identified = false;
+      identifyAndRejoin();
+    });
 
     socket.on('message:new', (data) {
       if (data is Map) {
@@ -734,6 +746,7 @@ class RealtimeClient {
       }
     });
 
+    if (socket.connected) identifyAndRejoin();
     socket.connect();
   }
 

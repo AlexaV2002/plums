@@ -67,13 +67,10 @@ describe('DmGateway', () => {
       const client = createSocket();
       await gateway.joinConversation({ conversationId }, client as never);
 
-      expect(client.emit).toHaveBeenCalledWith(
-        'dm:error',
-        expect.objectContaining({
-          conversationId,
-          error: expect.stringContaining('presence:identify'),
-        }),
-      );
+      expect(client.emit).toHaveBeenCalledWith('dm:error', {
+        conversationId,
+        error: 'Требуется presence:identify перед вступлением в диалог',
+      });
       expect(client.join).not.toHaveBeenCalled();
       expect(prisma.directConversation.findUnique).not.toHaveBeenCalled();
     });
@@ -85,11 +82,16 @@ describe('DmGateway', () => {
 
       const client = createSocket();
       client.data.userId = 'user-b';
+      client.data.authExpiresAt = Date.now() + 60000;
+      client.data.identityVersion = 1;
 
       await gateway.joinConversation({ conversationId }, client as never);
 
       expect(client.join).toHaveBeenCalledWith(roomName);
-      expect(client.emit).not.toHaveBeenCalledWith('dm:error', expect.anything());
+      expect(client.emit).not.toHaveBeenCalledWith(
+        'dm:error',
+        expect.anything(),
+      );
     });
 
     it('should reject join for a user who is not a participant', async () => {
@@ -99,6 +101,8 @@ describe('DmGateway', () => {
 
       const client = createSocket();
       client.data.userId = 'user-c';
+      client.data.authExpiresAt = Date.now() + 60000;
+      client.data.identityVersion = 1;
 
       await gateway.joinConversation({ conversationId }, client as never);
 
@@ -114,6 +118,8 @@ describe('DmGateway', () => {
 
       const client = createSocket();
       client.data.userId = 'user-a';
+      client.data.authExpiresAt = Date.now() + 60000;
+      client.data.identityVersion = 1;
 
       await gateway.joinConversation({ conversationId }, client as never);
 
@@ -124,6 +130,16 @@ describe('DmGateway', () => {
           error: 'Диалог не найден',
         }),
       );
+      expect(client.join).not.toHaveBeenCalled();
+    });
+
+    it('rejects a DM join after JWT expiry', async () => {
+      const client = createSocket();
+      client.data.userId = 'user-a';
+      client.data.authExpiresAt = Date.now() - 1;
+      client.data.identityVersion = 1;
+      await gateway.joinConversation({ conversationId }, client as never);
+      expect(prisma.directConversation.findUnique).not.toHaveBeenCalled();
       expect(client.join).not.toHaveBeenCalled();
     });
   });
@@ -164,9 +180,11 @@ describe('DmGateway', () => {
   describe('reconnect scenario (identify -> dm:join)', () => {
     it('should accept dm:join after presence:identify acknowledged the user', async () => {
       const jwtService = {
-        verifyAsync: jest
-          .fn()
-          .mockResolvedValue({ sub: 'user-a', email: 'user-a@plums.test' }),
+        verifyAsync: jest.fn().mockResolvedValue({
+          sub: 'user-a',
+          email: 'user-a@plums.test',
+          exp: Date.now() / 1000 + 60,
+        }),
       };
       const usersPrisma = { user: { update: jest.fn().mockResolvedValue({}) } };
 
@@ -184,7 +202,11 @@ describe('DmGateway', () => {
       const ack = jest.fn();
 
       // 1. Переподключение: клиент сначала подтверждает идентификацию.
-      await usersGateway.identify({ token: 'valid-token' }, client as never, ack);
+      await usersGateway.identify(
+        { token: 'valid-token' },
+        client as never,
+        ack,
+      );
       expect(ack).toHaveBeenCalledWith({ userId: 'user-a' });
 
       // 2. Только затем вступает в комнату диалога.
@@ -194,7 +216,10 @@ describe('DmGateway', () => {
       await gateway.joinConversation({ conversationId }, client as never);
 
       expect(client.join).toHaveBeenCalledWith(roomName);
-      expect(client.emit).not.toHaveBeenCalledWith('dm:error', expect.anything());
+      expect(client.emit).not.toHaveBeenCalledWith(
+        'dm:error',
+        expect.anything(),
+      );
     });
   });
 });

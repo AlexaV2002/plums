@@ -7,6 +7,11 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  getActiveSocketIdentity,
+  isSocketIdentityCurrent,
+  joinProtectedRoom,
+} from '../users/users.gateway';
 
 export type MemberLeavePayload = {
   serverId: string;
@@ -70,17 +75,21 @@ export class ServersGateway {
     @MessageBody() payload: { serverId?: string },
     @ConnectedSocket() client: Socket,
   ) {
-    const userId = (client.data as { userId?: string }).userId;
-    if (typeof payload?.serverId !== 'string' || !userId) {
+    const identity = getActiveSocketIdentity(client);
+    if (typeof payload?.serverId !== 'string' || !identity) {
       return;
     }
 
     const member = await this.prisma.serverMember.findUnique({
       where: {
-        serverId_userId: { serverId: payload.serverId, userId },
+        serverId_userId: {
+          serverId: payload.serverId,
+          userId: identity.userId,
+        },
       },
     });
-    if (!member || (client.data as { userId?: string }).userId !== userId) {
+    if (!isSocketIdentityCurrent(client, identity)) return;
+    if (!member) {
       client.emit('server:error', {
         serverId: payload.serverId,
         error: 'Нет доступа к серверу',
@@ -88,7 +97,8 @@ export class ServersGateway {
       return;
     }
 
-    await client.join(this.getServerRoom(payload.serverId));
+    const room = this.getServerRoom(payload.serverId);
+    await joinProtectedRoom(client, room, identity);
   }
 
   @SubscribeMessage('server:leave')

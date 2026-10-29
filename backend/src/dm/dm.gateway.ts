@@ -7,6 +7,11 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  getActiveSocketIdentity,
+  isSocketIdentityCurrent,
+  joinProtectedRoom,
+} from '../users/users.gateway';
 
 @WebSocketGateway({
   cors: {
@@ -32,9 +37,9 @@ export class DmGateway {
       return;
     }
 
-    const userId = client.data.userId as string | undefined;
+    const identity = getActiveSocketIdentity(client);
 
-    if (!userId) {
+    if (!identity) {
       client.emit('dm:error', {
         conversationId,
         error: 'Требуется presence:identify перед вступлением в диалог',
@@ -51,7 +56,11 @@ export class DmGateway {
       return;
     }
 
-    if (conversation.userA !== userId && conversation.userB !== userId) {
+    if (!isSocketIdentityCurrent(client, identity)) return;
+    if (
+      conversation.userA !== identity.userId &&
+      conversation.userB !== identity.userId
+    ) {
       client.emit('dm:error', {
         conversationId,
         error: 'Вы не участник этого диалога',
@@ -59,7 +68,8 @@ export class DmGateway {
       return;
     }
 
-    client.join(this.getRoom(conversationId));
+    const room = this.getRoom(conversationId);
+    await joinProtectedRoom(client, room, identity);
   }
 
   @SubscribeMessage('dm:leave')
@@ -71,7 +81,7 @@ export class DmGateway {
       return;
     }
 
-    client.leave(this.getRoom(payload.conversationId));
+    void client.leave(this.getRoom(payload.conversationId));
   }
 
   emitMessageNew(conversationId: string, message: unknown) {

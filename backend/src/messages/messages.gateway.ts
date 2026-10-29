@@ -7,6 +7,11 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  getActiveSocketIdentity,
+  isSocketIdentityCurrent,
+  joinProtectedRoom,
+} from '../users/users.gateway';
 
 @WebSocketGateway({
   cors: {
@@ -24,8 +29,8 @@ export class MessagesGateway {
     @MessageBody() payload: { channelId?: string },
     @ConnectedSocket() client: Socket,
   ) {
-    const userId = (client.data as { userId?: string }).userId;
-    if (typeof payload?.channelId !== 'string' || !userId) {
+    const identity = getActiveSocketIdentity(client);
+    if (typeof payload?.channelId !== 'string' || !identity) {
       return;
     }
 
@@ -42,7 +47,10 @@ export class MessagesGateway {
     }
     const member = await this.prisma.serverMember.findUnique({
       where: {
-        serverId_userId: { serverId: channel.serverId, userId },
+        serverId_userId: {
+          serverId: channel.serverId,
+          userId: identity.userId,
+        },
       },
     });
     const permissions = channel.permissions;
@@ -51,11 +59,8 @@ export class MessagesGateway {
       typeof permissions === 'object' &&
       !Array.isArray(permissions) &&
       (permissions as { canView?: boolean }).canView === false;
-    if (
-      !member ||
-      (client.data as { userId?: string }).userId !== userId ||
-      (hidden && channel.server.ownerId !== userId)
-    ) {
+    if (!member || (hidden && channel.server.ownerId !== identity.userId)) {
+      if (!isSocketIdentityCurrent(client, identity)) return;
       client.emit('channel:error', {
         channelId: payload.channelId,
         error: 'Нет доступа к каналу',
@@ -63,7 +68,9 @@ export class MessagesGateway {
       return;
     }
 
-    await client.join(this.getChannelRoom(payload.channelId));
+    if (!isSocketIdentityCurrent(client, identity)) return;
+    const room = this.getChannelRoom(payload.channelId);
+    await joinProtectedRoom(client, room, identity);
   }
 
   @SubscribeMessage('channel:leave')
