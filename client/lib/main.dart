@@ -28,11 +28,24 @@ class PlumsApp extends StatelessWidget {
    API
 ========================= */
 
+const String _apiBaseUrlRaw = String.fromEnvironment(
+  'API_BASE_URL',
+  defaultValue: 'http://localhost:3000',
+);
+
+// Адрес backend для HTTP (ApiClient) и Socket.IO (RealtimeClient), а также
+// для ссылок-приглашений. Настраивается через --dart-define=API_BASE_URL=...,
+// без него поведение не меняется (localhost:3000). Убираем завершающий "/",
+// чтобы не получить "//" при конкатенации путей (например, "/invites/...").
+final String apiBaseUrl = _apiBaseUrlRaw.endsWith('/')
+    ? _apiBaseUrlRaw.substring(0, _apiBaseUrlRaw.length - 1)
+    : _apiBaseUrlRaw;
+
 class ApiClient {
   ApiClient()
     : dio = Dio(
         BaseOptions(
-          baseUrl: 'http://localhost:3000',
+          baseUrl: apiBaseUrl,
           connectTimeout: const Duration(seconds: 5),
           receiveTimeout: const Duration(seconds: 5),
           headers: {'Content-Type': 'application/json'},
@@ -536,13 +549,27 @@ class AuthStorage {
 
 class RealtimeClient {
   RealtimeClient() {
-    socket = io.io(
-      'http://localhost:3000',
-      io.OptionBuilder()
-          .setTransports(['websocket'])
-          .disableAutoConnect()
-          .build(),
-    );
+    try {
+      socket = io.io(
+        apiBaseUrl,
+        io.OptionBuilder()
+            .setTransports(['websocket'])
+            .disableAutoConnect()
+            .build(),
+      );
+    } catch (_) {
+      // Совсем некорректный API_BASE_URL (например, пустая строка) может
+      // привести к синхронному исключению внутри io.io(). Не даём этому
+      // уронить запуск приложения — откатываемся на дефолтный адрес,
+      // ошибки подключения всё равно обработает onError/connect_error ниже.
+      socket = io.io(
+        'http://localhost:3000',
+        io.OptionBuilder()
+            .setTransports(['websocket'])
+            .disableAutoConnect()
+            .build(),
+      );
+    }
   }
 
   late final io.Socket socket;
@@ -5017,7 +5044,7 @@ Future<void> showInviteDialog({
   required BuildContext context,
   required AppInvite invite,
 }) {
-  final inviteUrl = 'http://localhost:3000/invites/${invite.code}';
+  final inviteUrl = '$apiBaseUrl/invites/${invite.code}';
 
   return showDialog<void>(
     context: context,
