@@ -41,6 +41,68 @@ final String apiBaseUrl = _apiBaseUrlRaw.endsWith('/')
     ? _apiBaseUrlRaw.substring(0, _apiBaseUrlRaw.length - 1)
     : _apiBaseUrlRaw;
 
+// Единая точка превращения ошибки запроса в сообщение для пользователя.
+// Раньше каждое место строило текст вручную из error.response?.statusCode и
+// error.response?.data — если backend недоступен (connection refused/timeout),
+// у DioException вообще нет response, и пользователь видел буквально
+// «Ошибка null: null». Эта функция различает таймаут, отсутствие соединения,
+// конкретные статусы и некорректную структуру ответа, не печатая сырые
+// значения (в т.ч. заголовки/токены) напрямую.
+String describeRequestError(Object error) {
+  if (error is DioException) {
+    switch (error.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.receiveTimeout:
+        return 'Сервер не отвечает, проверьте соединение и попробуйте ещё раз';
+      case DioExceptionType.connectionError:
+        return 'Не удалось подключиться к серверу';
+      case DioExceptionType.cancel:
+        return 'Запрос отменён';
+      case DioExceptionType.badCertificate:
+        return 'Небезопасное соединение с сервером';
+      case DioExceptionType.badResponse:
+      case DioExceptionType.unknown:
+        break;
+    }
+
+    final response = error.response;
+
+    if (response == null) {
+      return 'Не удалось подключиться к серверу';
+    }
+
+    switch (response.statusCode) {
+      case 401:
+        return 'Сессия истекла, войдите снова';
+      case 403:
+        return 'Недостаточно прав для этого действия';
+      case 429:
+        return 'Слишком много запросов, попробуйте позже';
+    }
+
+    final statusCode = response.statusCode;
+
+    if (statusCode != null && statusCode >= 500) {
+      return 'Сервер временно недоступен, попробуйте позже';
+    }
+
+    final data = response.data;
+
+    if (data is Map && data['message'] is String) {
+      return data['message'] as String;
+    }
+
+    if (data is String && data.isNotEmpty) {
+      return data;
+    }
+
+    return 'Сервер вернул некорректный ответ (код ${statusCode ?? 'неизвестен'})';
+  }
+
+  return 'Непредвиденная ошибка, попробуйте ещё раз';
+}
+
 class ApiClient {
   ApiClient()
     : dio = Dio(
@@ -625,12 +687,42 @@ class RealtimeClient {
 
         _identified = true;
         final serverId = _currentServerId;
-        final channelId = _currentChannelId;
         if (serverId != null) socket.emit('server:join', {'serverId': serverId});
-        if (channelId != null) socket.emit('channel:join', {'channelId': channelId});
-        // Восстановление комнаты Socket.IO не возвращает сообщения, пропущенные
-        // во время обрыва связи — явно просим клиента дозагрузить текущий канал.
-        onReconnected(channelId);
+        var channelId = _currentChannelId;
+        while (channelId != null) {
+          // Догрузка должна начинаться после фактического входа в комнату:
+          // иначе сообщение между REST-ответом и join теряется.
+          final joinAck = await socket.timeout(5000).emitWithAckAsync(
+            'channel:join',
+            {'channelId': channelId},
+          );
+          if (_disposed || !socket.connected || epoch != _connectionEpoch) return;
+          if (_currentChannelId != channelId) {
+            socket.emit('channel:leave', {'channelId': channelId});
+            channelId = _currentChannelId;
+            continue;
+          }
+          if (joinAck is! Map ||
+              joinAck['joined'] != true ||
+              joinAck['channelId'] != channelId) {
+            if (joinAck is Map &&
+                (joinAck['reason'] == 'forbidden' ||
+                    joinAck['reason'] == 'not_found') &&
+                _currentServerId != null) {
+              onChannelDelete(
+                RealtimeChannelDelete(
+                  id: channelId,
+                  serverId: _currentServerId!,
+                ),
+              );
+              return;
+            }
+            throw StateError('Не получено подтверждение входа в канал');
+          }
+          onReconnected(channelId);
+          return;
+        }
+        onReconnected(null);
       } catch (_) {
         if (_disposed || !socket.connected || epoch != _connectionEpoch) return;
         Future.delayed(const Duration(seconds: 5), () {
@@ -1075,16 +1167,16 @@ class _LoginScreenState extends State<LoginScreen> {
       );
 
       widget.onLoggedIn(result.user);
-    } on DioException catch (error) {
-      final data = error.response?.data;
-      final statusCode = error.response?.statusCode;
+    } catch (error) {
+      // На экране входа 401 означает неверный email/пароль, а не истёкшую
+      // сессию — общая формулировка describeRequestError здесь не подходит.
+      final isInvalidCredentials =
+          error is DioException && error.response?.statusCode == 401;
 
       setState(() {
-        errorMessage = 'Ошибка $statusCode: $data';
-      });
-    } catch (error) {
-      setState(() {
-        errorMessage = 'Неизвестная ошибка входа: $error';
+        errorMessage = isInvalidCredentials
+            ? 'Неверный email или пароль'
+            : 'Не удалось войти: ${describeRequestError(error)}';
       });
     } finally {
       if (mounted) {
@@ -1114,16 +1206,16 @@ class _LoginScreenState extends State<LoginScreen> {
       );
 
       widget.onLoggedIn(result.user);
-    } on DioException catch (error) {
-      final data = error.response?.data;
-      final statusCode = error.response?.statusCode;
+    } catch (error) {
+      // Авторегистрация сразу логинится — 401 здесь тоже означает неверные
+      // учётные данные, а не истёкшую сессию (см. submitLogin).
+      final isInvalidCredentials =
+          error is DioException && error.response?.statusCode == 401;
 
       setState(() {
-        errorMessage = 'Ошибка $statusCode: $data';
-      });
-    } catch (error) {
-      setState(() {
-        errorMessage = 'Неизвестная ошибка регистрации: $error';
+        errorMessage = isInvalidCredentials
+            ? 'Неверный email или пароль'
+            : 'Не удалось зарегистрироваться: ${describeRequestError(error)}';
       });
     } finally {
       if (mounted) {
@@ -1838,12 +1930,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Не удалось обновить роли: ${error.response?.data ?? error.message ?? error}',
+        'Не удалось обновить роли: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted || serverId != selectedServerId) return;
 
-      showErrorSnackBar(context, 'Не удалось обновить роли: $error');
+      showErrorSnackBar(context, 'Не удалось обновить роли: ${describeRequestError(error)}');
     }
   }
 
@@ -2098,12 +2190,12 @@ class _MainShellState extends State<MainShell> {
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
       setState(() {
-        errorMessage = 'Ошибка загрузки данных: ${error.response?.data}';
+        errorMessage = 'Ошибка загрузки данных: ${describeRequestError(error)}';
         isLoading = false;
       });
     } catch (error) {
       setState(() {
-        errorMessage = 'Не удалось загрузить данные приложения: $error';
+        errorMessage = 'Не удалось загрузить данные приложения: ${describeRequestError(error)}';
         isLoading = false;
       });
     }
@@ -2163,14 +2255,14 @@ class _MainShellState extends State<MainShell> {
       if (!mounted) return;
 
       setState(() {
-        errorMessage = 'Ошибка загрузки каналов: ${error.response?.data}';
+        errorMessage = 'Ошибка загрузки каналов: ${describeRequestError(error)}';
         isLoading = false;
       });
     } catch (error) {
       if (!mounted) return;
 
       setState(() {
-        errorMessage = 'Не удалось загрузить каналы: $error';
+        errorMessage = 'Не удалось загрузить каналы: ${describeRequestError(error)}';
         isLoading = false;
       });
     }
@@ -2222,14 +2314,14 @@ class _MainShellState extends State<MainShell> {
       if (!mounted || selectedChannelId != channelId) return;
 
       setState(() {
-        errorMessage = 'Ошибка загрузки сообщений: ${error.response?.data}';
+        errorMessage = 'Ошибка загрузки сообщений: ${describeRequestError(error)}';
         isMessagesLoading = false;
       });
     } catch (error) {
       if (!mounted || selectedChannelId != channelId) return;
 
       setState(() {
-        errorMessage = 'Не удалось загрузить сообщения: $error';
+        errorMessage = 'Не удалось загрузить сообщения: ${describeRequestError(error)}';
         isMessagesLoading = false;
       });
     }
@@ -2300,7 +2392,7 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Не удалось загрузить более старые сообщения: ${error.response?.data}',
+        'Не удалось загрузить более старые сообщения: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted || selectedChannelId != channelId) return;
@@ -2311,7 +2403,7 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Не удалось загрузить более старые сообщения: $error',
+        'Не удалось загрузить более старые сообщения: ${describeRequestError(error)}',
       );
     }
   }
@@ -2336,12 +2428,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка загрузки участников: ${error.response?.data}',
+        'Ошибка загрузки участников: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось загрузить участников: $error');
+      showErrorSnackBar(context, 'Не удалось загрузить участников: ${describeRequestError(error)}');
     }
   }
 
@@ -2389,12 +2481,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка удаления участника: ${error.response?.data}',
+        'Ошибка удаления участника: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось удалить участника: $error');
+      showErrorSnackBar(context, 'Не удалось удалить участника: ${describeRequestError(error)}');
     }
   }
 
@@ -2437,12 +2529,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка бана участника: ${error.response?.data}',
+        'Ошибка бана участника: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось забанить участника: $error');
+      showErrorSnackBar(context, 'Не удалось забанить участника: ${describeRequestError(error)}');
     }
   }
 
@@ -2470,12 +2562,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка загрузки списка банов: ${error.response?.data}',
+        'Ошибка загрузки списка банов: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось загрузить список банов: $error');
+      showErrorSnackBar(context, 'Не удалось загрузить список банов: ${describeRequestError(error)}');
     }
   }
 
@@ -2495,13 +2587,13 @@ class _MainShellState extends State<MainShell> {
       if (handleUnauthorized(error)) return false;
 
       if (mounted) {
-        showErrorSnackBar(context, 'Ошибка разбана: ${error.response?.data}');
+        showErrorSnackBar(context, 'Ошибка разбана: ${describeRequestError(error)}');
       }
 
       return false;
     } catch (error) {
       if (mounted) {
-        showErrorSnackBar(context, 'Не удалось разбанить участника: $error');
+        showErrorSnackBar(context, 'Не удалось разбанить участника: ${describeRequestError(error)}');
       }
 
       return false;
@@ -2552,11 +2644,11 @@ class _MainShellState extends State<MainShell> {
 
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Ошибка создания роли: ${error.response?.data}');
+      showErrorSnackBar(context, 'Ошибка создания роли: ${describeRequestError(error)}');
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось создать роль: $error');
+      showErrorSnackBar(context, 'Не удалось создать роль: ${describeRequestError(error)}');
     }
   }
 
@@ -2601,11 +2693,11 @@ class _MainShellState extends State<MainShell> {
 
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Ошибка изменения роли: ${error.response?.data}');
+      showErrorSnackBar(context, 'Ошибка изменения роли: ${describeRequestError(error)}');
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось изменить роль: $error');
+      showErrorSnackBar(context, 'Не удалось изменить роль: ${describeRequestError(error)}');
     }
   }
 
@@ -2645,11 +2737,11 @@ class _MainShellState extends State<MainShell> {
 
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Ошибка удаления роли: ${error.response?.data}');
+      showErrorSnackBar(context, 'Ошибка удаления роли: ${describeRequestError(error)}');
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось удалить роль: $error');
+      showErrorSnackBar(context, 'Не удалось удалить роль: ${describeRequestError(error)}');
     }
   }
 
@@ -2716,24 +2808,32 @@ class _MainShellState extends State<MainShell> {
       showErrorSnackBar(
         context,
         assign
-            ? 'Ошибка назначения роли: ${error.response?.data}'
-            : 'Ошибка снятия роли: ${error.response?.data}',
+            ? 'Ошибка назначения роли: ${describeRequestError(error)}'
+            : 'Ошибка снятия роли: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
       showErrorSnackBar(
         context,
-        assign ? 'Не удалось назначить роль: $error' : 'Не удалось снять роль: $error',
+        assign ? 'Не удалось назначить роль: ${describeRequestError(error)}' : 'Не удалось снять роль: ${describeRequestError(error)}',
       );
     }
   }
 
-  Future<void> sendMessage(String content) async {
+  // Возвращает true, если сообщение подтверждено backend и добавлено в
+  // messages, и false при любой ошибке (уже показанной пользователю здесь же
+  // через describeRequestError) — вызывающий код (MessageInput) решает, можно
+  // ли очищать поле ввода. Известное ограничение: без server-side
+  // idempotency-ключа повторная отправка после разрыва связи, при котором
+  // сообщение реально дошло до backend, но ответ не вернулся клиенту, создаст
+  // дубликат на сервере — это требует минимального изменения backend и не
+  // входит в эту задачу.
+  Future<bool> sendMessage(String content) async {
     final channelId = selectedChannelId;
 
     if (channelId == null) {
-      return;
+      return false;
     }
 
     try {
@@ -2742,7 +2842,7 @@ class _MainShellState extends State<MainShell> {
         content: content,
       );
 
-      if (!mounted) return;
+      if (!mounted) return true;
 
       setState(() {
         if (messages.any((item) => item.id == sentMessage.id)) {
@@ -2751,19 +2851,25 @@ class _MainShellState extends State<MainShell> {
 
         messages = [...messages, sentMessage];
       });
-    } on DioException catch (error) {
-      if (handleUnauthorized(error)) return;
 
-      if (!mounted) return;
+      return true;
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return false;
+
+      if (!mounted) return false;
 
       showErrorSnackBar(
         context,
-        'Ошибка отправки сообщения: ${error.response?.data}',
+        'Ошибка отправки сообщения: ${describeRequestError(error)}',
       );
-    } catch (error) {
-      if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось отправить сообщение: $error');
+      return false;
+    } catch (error) {
+      if (!mounted) return false;
+
+      showErrorSnackBar(context, 'Не удалось отправить сообщение: ${describeRequestError(error)}');
+
+      return false;
     }
   }
 
@@ -2799,14 +2905,14 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка редактирования сообщения: ${error.response?.data}',
+        'Ошибка редактирования сообщения: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
       showErrorSnackBar(
         context,
-        'Не удалось отредактировать сообщение: $error',
+        'Не удалось отредактировать сообщение: ${describeRequestError(error)}',
       );
     }
   }
@@ -2836,12 +2942,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка удаления сообщения: ${error.response?.data}',
+        'Ошибка удаления сообщения: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось удалить сообщение: $error');
+      showErrorSnackBar(context, 'Не удалось удалить сообщение: ${describeRequestError(error)}');
     }
   }
 
@@ -2904,7 +3010,7 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка создания сервера: ${error.response?.data}',
+        'Ошибка создания сервера: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
@@ -2913,7 +3019,7 @@ class _MainShellState extends State<MainShell> {
         isLoading = false;
       });
 
-      showErrorSnackBar(context, 'Не удалось создать сервер: $error');
+      showErrorSnackBar(context, 'Не удалось создать сервер: ${describeRequestError(error)}');
     }
   }
 
@@ -2983,12 +3089,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка переименования сервера: ${error.response?.data}',
+        'Ошибка переименования сервера: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось переименовать сервер: $error');
+      showErrorSnackBar(context, 'Не удалось переименовать сервер: ${describeRequestError(error)}');
     }
   }
 
@@ -3015,12 +3121,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка удаления сервера: ${error.response?.data}',
+        'Ошибка удаления сервера: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось удалить сервер: $error');
+      showErrorSnackBar(context, 'Не удалось удалить сервер: ${describeRequestError(error)}');
     }
   }
 
@@ -3046,12 +3152,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка выхода с сервера: ${error.response?.data}',
+        'Ошибка выхода с сервера: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось выйти с сервера: $error');
+      showErrorSnackBar(context, 'Не удалось выйти с сервера: ${describeRequestError(error)}');
     }
   }
 
@@ -3140,7 +3246,7 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка вступления на сервер: ${error.response?.data}',
+        'Ошибка вступления на сервер: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
@@ -3149,7 +3255,7 @@ class _MainShellState extends State<MainShell> {
         isLoading = false;
       });
 
-      showErrorSnackBar(context, 'Не удалось вступить на сервер: $error');
+      showErrorSnackBar(context, 'Не удалось вступить на сервер: ${describeRequestError(error)}');
     }
   }
 
@@ -3173,12 +3279,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка создания приглашения: ${error.response?.data}',
+        'Ошибка создания приглашения: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось создать приглашение: $error');
+      showErrorSnackBar(context, 'Не удалось создать приглашение: ${describeRequestError(error)}');
     }
   }
 
@@ -3239,12 +3345,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка создания канала: ${error.response?.data}',
+        'Ошибка создания канала: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось создать канал: $error');
+      showErrorSnackBar(context, 'Не удалось создать канал: ${describeRequestError(error)}');
     }
   }
 
@@ -3278,12 +3384,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка обновления профиля: ${error.response?.data}',
+        'Ошибка обновления профиля: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось обновить профиль: $error');
+      showErrorSnackBar(context, 'Не удалось обновить профиль: ${describeRequestError(error)}');
     }
   }
 
@@ -3331,12 +3437,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка переименования канала: ${error.response?.data}',
+        'Ошибка переименования канала: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось переименовать канал: $error');
+      showErrorSnackBar(context, 'Не удалось переименовать канал: ${describeRequestError(error)}');
     }
   }
 
@@ -3379,12 +3485,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка удаления канала: ${error.response?.data}',
+        'Ошибка удаления канала: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось удалить канал: $error');
+      showErrorSnackBar(context, 'Не удалось удалить канал: ${describeRequestError(error)}');
     }
   }
 
@@ -3418,12 +3524,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(
         context,
-        'Ошибка изменения прав канала: ${error.response?.data}',
+        'Ошибка изменения прав канала: ${describeRequestError(error)}',
       );
     } catch (error) {
       if (!mounted) return;
 
-      showErrorSnackBar(context, 'Не удалось изменить права канала: $error');
+      showErrorSnackBar(context, 'Не удалось изменить права канала: ${describeRequestError(error)}');
     }
   }
 
@@ -4350,7 +4456,7 @@ class ChatArea extends StatelessWidget {
   final bool isLoadingMoreMessages;
   final bool canSendMessages;
   final ScrollController messagesScrollController;
-  final Future<void> Function(String content) onSendMessage;
+  final Future<bool> Function(String content) onSendMessage;
   final ValueChanged<AppMessage> onEditMessage;
   final ValueChanged<AppMessage> onDeleteMessage;
   final VoidCallback onShowMembers;
@@ -4894,7 +5000,7 @@ class MessageInput extends StatefulWidget {
 
   final String channelName;
   final bool canSendMessages;
-  final Future<void> Function(String content) onSendMessage;
+  final Future<bool> Function(String content) onSendMessage;
 
   @override
   State<MessageInput> createState() => _MessageInputState();
@@ -4922,12 +5028,13 @@ class _MessageInputState extends State<MessageInput> {
     });
 
     try {
-      await widget.onSendMessage(text);
-      controller.clear();
-    } catch (_) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Не удалось отправить сообщение')),
-      );
+      // sendMessage сам показывает snackbar при ошибке и не бросает
+      // исключения — здесь только решаем, очищать ли поле ввода.
+      final sent = await widget.onSendMessage(text);
+
+      if (sent) {
+        controller.clear();
+      }
     } finally {
       if (mounted) {
         setState(() {

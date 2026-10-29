@@ -43,6 +43,17 @@ export class ChannelsGateway {
     }
   }
 
+  // Участник мог уже загрузить видимый канал. При скрытии отправляем только
+  // ранее известный id, чтобы клиент убрал его и сообщения из локального UI.
+  async notifyChannelHidden(serverId: string, channelId: string, ownerId: string) {
+    const payload = { id: channelId, serverId };
+    for (const socket of await this.server.in(this.getServerRoom(serverId)).fetchSockets()) {
+      if ((socket.data as { userId?: string }).userId !== ownerId) {
+        socket.emit('channel:delete', payload);
+      }
+    }
+  }
+
   evictChannel(channelId: string) {
     const room = `channel:${channelId}`;
     this.server.in(room).socketsLeave(room);

@@ -12,6 +12,9 @@ class _SocketIoProbe {
   WebSocket? socket;
   bool holdIdentifyAck = false;
   String? pendingAckId;
+  bool holdChannelAck = false;
+  String? pendingChannelAckId;
+  String? pendingChannelId;
 
   static Future<_SocketIoProbe> start() async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -46,6 +49,16 @@ class _SocketIoProbe {
           } else {
             connected.add('43$ackId[{"userId":"user-1"}]');
           }
+        } else if (name == 'channel:join' && ackId.isNotEmpty) {
+          final channelId = (body[1] as Map)['channelId'] as String;
+          if (holdChannelAck) {
+            pendingChannelAckId = ackId;
+            pendingChannelId = channelId;
+          } else {
+            connected.add(
+              '43$ackId[${jsonEncode({'joined': true, 'channelId': channelId})}]',
+            );
+          }
         }
       });
     }
@@ -58,6 +71,24 @@ class _SocketIoProbe {
   void releaseIdentifyAck() {
     socket!.add('43$pendingAckId[{"userId":"user-1"}]');
     pendingAckId = null;
+  }
+
+  void releaseChannelAck() {
+    socket!.add(
+      '43$pendingChannelAckId[${jsonEncode({'joined': true, 'channelId': pendingChannelId})}]',
+    );
+    pendingChannelAckId = null;
+    pendingChannelId = null;
+  }
+
+  Future<void> waitForCondition(bool Function() condition) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (!condition()) {
+      if (DateTime.now().isAfter(deadline)) {
+        throw StateError('Timed out waiting for callback');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
   }
 
   Future<void> waitFor(String name, int count) async {
@@ -101,6 +132,7 @@ void main() {
 
       var token = 'old-token';
       var loggedOut = false;
+      final reconnectedChannels = <String?>[];
       void connect() => client.connect(
         getAccessToken: () async => token,
         onSessionExpired: () => loggedOut = true,
@@ -117,7 +149,7 @@ void main() {
         onRoleUpdate: (_) {},
         onRoleDelete: (_) {},
         onMemberRolesUpdate: (_) {},
-        onReconnected: (_) {},
+        onReconnected: reconnectedChannels.add,
       );
 
       connect();
@@ -125,6 +157,9 @@ void main() {
       client.joinServer('server-1');
       client.joinChannel('channel-old');
       await probe.waitFor('channel:join', 1);
+      await probe.waitForCondition(
+        () => reconnectedChannels.contains('channel-old'),
+      );
       expect(
         probe.events.where((event) => event.$1 == 'presence:identify'),
         hasLength(1),
@@ -132,6 +167,7 @@ void main() {
 
       token = 'new-token';
       probe.holdIdentifyAck = true;
+      probe.holdChannelAck = true;
       probe.expireSession();
       await probe.waitFor('presence:identify', 2);
       client.leaveChannel('channel-old');
@@ -143,6 +179,11 @@ void main() {
 
       probe.releaseIdentifyAck();
       await probe.waitFor('channel:join', 2);
+      expect(reconnectedChannels, isNot(contains('channel-new')));
+      probe.releaseChannelAck();
+      await probe.waitForCondition(
+        () => reconnectedChannels.contains('channel-new'),
+      );
       final joins = probe.events
           .where((event) => event.$1 == 'channel:join')
           .toList();

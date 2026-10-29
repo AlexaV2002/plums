@@ -240,6 +240,13 @@ export class ChannelsService {
           channelId,
           server.ownerId,
         );
+        if (currentPermissions.canView) {
+          await this.channelsGateway.notifyChannelHidden(
+            updatedChannel.serverId,
+            channelId,
+            server.ownerId,
+          );
+        }
       }
     }
 

@@ -210,7 +210,7 @@ describe('channel visibility realtime leak (e2e)', () => {
     await waitForRoom(`server:${serverId}`, member.id, true);
     await waitForRoom(`channel:${channelId}`, member.id, true);
 
-    // Hide the channel: owner must still learn about it, the member must not.
+    // Owner receives full metadata; member receives only the old id to clear UI.
     await request(app.getHttpServer())
       .patch(`/channels/${channelId}/permissions`)
       .set(auth(owner.token))
@@ -218,6 +218,10 @@ describe('channel visibility realtime leak (e2e)', () => {
       .expect(200);
     expect(await ownerSocket.event('channel:update')).toMatchObject({
       id: channelId,
+    });
+    expect(await memberSocket.event('channel:delete')).toEqual({
+      id: channelId,
+      serverId,
     });
     await memberSocket.expectNoEvent('channel:update');
 

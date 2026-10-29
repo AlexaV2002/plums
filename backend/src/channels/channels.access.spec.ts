@@ -3,8 +3,8 @@ import { ChannelsService } from './channels.service';
 
 describe('channel room revocation', () => {
   it('removes non-owners when canView is revoked', async () => {
-    const owner = { data: { userId: 'owner' }, leave: jest.fn() };
-    const member = { data: { userId: 'member' }, leave: jest.fn() };
+    const owner = { data: { userId: 'owner' }, leave: jest.fn(), emit: jest.fn() };
+    const member = { data: { userId: 'member' }, leave: jest.fn(), emit: jest.fn() };
     const fetchSockets = jest.fn().mockResolvedValue([owner, member]);
     const gatewayPrisma = {
       server: { findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner' }) },
@@ -40,8 +40,12 @@ describe('channel room revocation', () => {
     });
     expect(owner.leave).not.toHaveBeenCalled();
     expect(member.leave).toHaveBeenCalledWith('channel:channel-1');
-    // The update is still broadcast, but service must tell the gateway the
-    // channel is now hidden so it doesn't leak to server:<id> for everyone.
+    expect(owner.emit).not.toHaveBeenCalled();
+    expect(member.emit).toHaveBeenCalledWith('channel:delete', {
+      id: 'channel-1',
+      serverId: 'server-1',
+    });
+    // Full metadata still goes only to the owner after the channel is hidden.
     expect(emitChannelUpdate).toHaveBeenCalledWith(
       'server-1',
       expect.objectContaining({ id: 'channel-1' }),
