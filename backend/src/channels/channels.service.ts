@@ -1,4 +1,8 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { PermissionsService } from '../permissions/permissions.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
@@ -63,7 +67,9 @@ export class ChannelsService {
     return channel;
   }
 
-  private getPermissions(rawPermissions: unknown): Required<ChannelPermissions> {
+  private getPermissions(
+    rawPermissions: unknown,
+  ): Required<ChannelPermissions> {
     if (
       !rawPermissions ||
       typeof rawPermissions !== 'object' ||
@@ -182,6 +188,7 @@ export class ChannelsService {
       id: channel.id,
       serverId: channel.serverId,
     });
+    this.channelsGateway.evictChannel(channelId);
 
     return {
       message: 'Канал удалён',
@@ -210,6 +217,19 @@ export class ChannelsService {
         },
       },
     });
+
+    if (this.getPermissions(updatedChannel.permissions).canView === false) {
+      const server = await this.prisma.server.findUnique({
+        where: { id: updatedChannel.serverId },
+        select: { ownerId: true },
+      });
+      if (server) {
+        await this.channelsGateway.evictChannelViewers(
+          channelId,
+          server.ownerId,
+        );
+      }
+    }
 
     this.channelsGateway.emitChannelUpdate(
       updatedChannel.serverId,

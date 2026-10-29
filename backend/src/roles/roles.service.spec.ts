@@ -293,30 +293,34 @@ describe('RolesService', () => {
       );
     });
 
-    it('treats a concurrent missing disconnect (P2017) as already-unassigned without emitting', async () => {
-      prisma.serverMember.findUnique.mockResolvedValue({
-        id: memberId,
-        serverId,
-        userId: 'target-user',
-        roles: [{ id: roleId }],
-      });
-      prisma.role.findUnique.mockResolvedValue({ id: roleId, serverId });
-      prisma.role.update.mockRejectedValue(
-        new Prisma.PrismaClientKnownRequestError(
-          'The records for relation are not connected',
-          {
-            code: 'P2017',
-            clientVersion: 'test',
-          },
-        ),
-      );
+    it.each(['P2017', 'P2025'])(
+      'treats a concurrent missing disconnect (%s) as already-unassigned without emitting',
+      async (code) => {
+        prisma.serverMember.findUnique.mockResolvedValue({
+          id: memberId,
+          serverId,
+          userId: 'target-user',
+          roles: [{ id: roleId }],
+        });
+        prisma.role.findUnique.mockResolvedValue({ id: roleId, serverId });
+        prisma.role.update.mockRejectedValue(
+          new Prisma.PrismaClientKnownRequestError(
+            'The records for relation are not connected',
+            {
+              code,
+              clientVersion: 'test',
+            },
+          ),
+        );
 
-      await expect(
-        service.unassignRole(userId, serverId, memberId, roleId),
-      ).rejects.toThrow(NotFoundException);
+        const promise = service.unassignRole(userId, serverId, memberId, roleId);
 
-      expect(serversGateway.emitMemberRolesUpdate).not.toHaveBeenCalled();
-    });
+        await expect(promise).rejects.toThrow(
+          new NotFoundException('Роль не назначена этому участнику'),
+        );
+        expect(serversGateway.emitMemberRolesUpdate).not.toHaveBeenCalled();
+      },
+    );
 
     it('rejects operating on a member from a different server', async () => {
       prisma.serverMember.findUnique.mockResolvedValue({

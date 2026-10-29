@@ -16,6 +16,23 @@ export class UsersService {
     });
   }
 
+  async search(q: string, excludeId: string, limit?: number) {
+    return this.prisma.user.findMany({
+      where: {
+        username: { contains: q, mode: 'insensitive' },
+        NOT: { id: excludeId },
+      },
+      select: {
+        id: true,
+        username: true,
+        avatarUrl: true,
+        status: true,
+      },
+      orderBy: { username: 'asc' },
+      take: limit ?? 10,
+    });
+  }
+
   async findPublicById(id: string) {
     const user = await this.prisma.user.findUnique({
       where: { id },

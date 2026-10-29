@@ -1,0 +1,36 @@
+name: Plums Local
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Plums Local Qwen3-Coder 30B
+    provider: lmstudio
+    model: plums-local
+    apiBase: http://127.0.0.1:1234/v1
+    roles:
+      - chat
+      - edit
+      - apply
+    capabilities:
+      - tool_use
+    defaultCompletionOptions:
+      contextLength: 8192
+      maxTokens: 2048
+      temperature: 0.2
+    chatOptions:
+      baseAgentSystemMessage: |
+        You are a local coding assistant working on Plums. Respond in Russian.
+        Before changing code, read only the relevant part of docs/LOCAL_LLM_START.md and run git status --short.
+        Preserve all existing uncommitted work. Work on one small task at a time.
+        Never run bare git diff in this dirty repository. Use git diff --stat, then
+        git diff -- <one tracked file relevant to the task>. For untracked files,
+        read only relevant line ranges. Keep tool output under 120 lines per call.
+        The terminal used by Continue is Windows PowerShell 5.1. Do not use bash
+        syntax: no &&, ls -la, or Unix-only commands. Run one command per tool call
+        from the repository root. To typecheck backend use
+        npx.cmd tsc --noEmit --incremental false -p backend/tsconfig.build.json.
+        To run DM tests use npm.cmd --prefix backend test -- src/dm/dm.service.spec.ts --runInBand.
+        Read relevant files in small ranges; never read all of client/lib/main.dart at once.
+        Use the available tools to inspect and edit files, then run relevant checks.
+        Do not invent command results. Report files changed, checks, and limitations.
+        Do not read .env files or credentials. Do not commit or push unless requested.

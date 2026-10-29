@@ -1,4 +1,5 @@
 import {
+  Ack,
   ConnectedSocket,
   MessageBody,
   OnGatewayConnection,
@@ -23,9 +24,7 @@ type UserStatus = 'ONLINE' | 'OFFLINE' | 'AWAY' | 'DO_NOT_DISTURB';
     origin: '*',
   },
 })
-export class UsersGateway
-  implements OnGatewayConnection, OnGatewayDisconnect
-{
+export class UsersGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server!: Server;
 
@@ -44,19 +43,52 @@ export class UsersGateway
   async identify(
     @MessageBody() payload: { token?: string },
     @ConnectedSocket() client: Socket,
+    // Ack-подтверждение идентификации. Клиент обязан присоединяться к
+    // комнатам dm:* только после получения этого ack: установка
+    // client.data.userId происходит асинхронно относительно emitWithAck
+    // на клиенте, и dm:join без подтверждённого userId будет отклонён.
+    @Ack() ack?: (response?: { userId: string }) => void,
   ) {
-    const userId = await this.getUserIdFromToken(payload.token);
+    const userId = await this.getUserIdFromToken(payload?.token);
+    const data = client.data as { userId?: string };
 
     if (!userId) {
+      // Сокет отключается — ack до клиента не дойдёт.
       client.disconnect(true);
       return;
     }
 
-    if (client.data.userId === userId) {
+    if (data.userId === userId) {
+      // Повторная идентификация того же пользователя (например,
+      // переподключение сокета): комнаты уже принадлежат этому
+      // пользователю, подтверждаем и выходим.
+      ack?.({ userId });
       return;
     }
 
-    client.data.userId = userId;
+    // Смена аккаунта на одном сокете требует очистить все защищённые комнаты.
+    const previousUserId = data.userId;
+    if (previousUserId) {
+      for (const room of [...client.rooms]) {
+        if (
+          room.startsWith('dm:') ||
+          room.startsWith('server:') ||
+          room.startsWith('channel:')
+        ) {
+          await client.leave(room);
+        }
+      }
+      const previousConnections =
+        this.connectionsByUser.get(previousUserId) ?? 0;
+      if (previousConnections <= 1) {
+        this.connectionsByUser.delete(previousUserId);
+        await this.updateAndEmitStatus(previousUserId, 'OFFLINE');
+      } else {
+        this.connectionsByUser.set(previousUserId, previousConnections - 1);
+      }
+    }
+
+    data.userId = userId;
 
     const connections = this.connectionsByUser.get(userId) ?? 0;
     this.connectionsByUser.set(userId, connections + 1);
@@ -64,10 +96,12 @@ export class UsersGateway
     if (connections === 0) {
       await this.updateAndEmitStatus(userId, 'ONLINE');
     }
+
+    ack?.({ userId });
   }
 
   async handleDisconnect(client: Socket) {
-    const userId = client.data.userId as string | undefined;
+    const userId = (client.data as { userId?: string }).userId;
 
     if (!userId) {
       return;

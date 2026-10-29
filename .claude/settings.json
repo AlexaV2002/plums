@@ -1,0 +1,6 @@
+{
+  "agent": "plums-coordinator",
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true
+  }
+}

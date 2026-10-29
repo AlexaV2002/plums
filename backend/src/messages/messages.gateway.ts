@@ -6,6 +6,7 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
+import { PrismaService } from '../prisma/prisma.service';
 
 @WebSocketGateway({
   cors: {
@@ -16,28 +17,65 @@ export class MessagesGateway {
   @WebSocketServer()
   server!: Server;
 
+  constructor(private readonly prisma: PrismaService) {}
+
   @SubscribeMessage('channel:join')
-  joinChannel(
+  async joinChannel(
     @MessageBody() payload: { channelId?: string },
     @ConnectedSocket() client: Socket,
   ) {
-    if (!payload.channelId) {
+    const userId = (client.data as { userId?: string }).userId;
+    if (typeof payload?.channelId !== 'string' || !userId) {
       return;
     }
 
-    client.join(this.getChannelRoom(payload.channelId));
+    const channel = await this.prisma.channel.findUnique({
+      where: { id: payload.channelId },
+      include: { server: true },
+    });
+    if (!channel) {
+      client.emit('channel:error', {
+        channelId: payload.channelId,
+        error: 'Канал не найден',
+      });
+      return;
+    }
+    const member = await this.prisma.serverMember.findUnique({
+      where: {
+        serverId_userId: { serverId: channel.serverId, userId },
+      },
+    });
+    const permissions = channel.permissions;
+    const hidden =
+      permissions &&
+      typeof permissions === 'object' &&
+      !Array.isArray(permissions) &&
+      (permissions as { canView?: boolean }).canView === false;
+    if (
+      !member ||
+      (client.data as { userId?: string }).userId !== userId ||
+      (hidden && channel.server.ownerId !== userId)
+    ) {
+      client.emit('channel:error', {
+        channelId: payload.channelId,
+        error: 'Нет доступа к каналу',
+      });
+      return;
+    }
+
+    await client.join(this.getChannelRoom(payload.channelId));
   }
 
   @SubscribeMessage('channel:leave')
-  leaveChannel(
+  async leaveChannel(
     @MessageBody() payload: { channelId?: string },
     @ConnectedSocket() client: Socket,
   ) {
-    if (!payload.channelId) {
+    if (typeof payload?.channelId !== 'string') {
       return;
     }
 
-    client.leave(this.getChannelRoom(payload.channelId));
+    await client.leave(this.getChannelRoom(payload.channelId));
   }
 
   emitMessageNew(channelId: string, message: unknown) {

@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AuthModule } from './auth/auth.module';
 import { ChannelsModule } from './channels/channels.module';
+import { DmModule } from './dm/dm.module';
 import { InvitesModule } from './invites/invites.module';
 import { MessagesModule } from './messages/messages.module';
 import { PermissionsModule } from './permissions/permissions.module';
@@ -24,6 +25,7 @@ import { UsersModule } from './users/users.module';
     MessagesModule,
     InvitesModule,
     RolesModule,
+    DmModule,
   ],
 })
 export class AppModule {}

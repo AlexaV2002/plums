@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -181,9 +183,9 @@ class ApiClient {
       '/users/me',
       options: authOptions,
       data: {
-        if (username != null) 'username': username,
-        if (bio != null) 'bio': bio,
-        if (status != null) 'status': status,
+        'username': ?username,
+        'bio': ?bio,
+        'status': ?status,
       },
     );
 
@@ -313,7 +315,7 @@ class ApiClient {
       options: authOptions,
       data: {
         'name': name,
-        if (color != null) 'color': color,
+        'color': ?color,
         ...permissions,
       },
     );
@@ -448,13 +450,15 @@ class ApiClient {
     String channelId, {
     int limit = 50,
     String? before,
+    String? after,
   }) async {
     final response = await dio.get(
       '/channels/$channelId/messages',
       options: authOptions,
       queryParameters: {
         'limit': limit,
-        if (before != null) 'before': before,
+        'before': ?before,
+        'after': ?after,
       },
     );
 
@@ -543,9 +547,14 @@ class RealtimeClient {
 
   late final io.Socket socket;
   String? _currentServerId;
+  String? _currentChannelId;
+  bool _identified = false;
+  bool _disposed = false;
+  int _connectionEpoch = 0;
 
   void connect({
-    required String accessToken,
+    required Future<String?> Function() getAccessToken,
+    required VoidCallback onSessionExpired,
     required ValueChanged<AppMessage> onMessageNew,
     required ValueChanged<AppMessage> onMessageUpdate,
     required ValueChanged<RealtimeMessageDelete> onMessageDelete,
@@ -559,33 +568,52 @@ class RealtimeClient {
     required ValueChanged<RealtimeRoleEvent> onRoleUpdate,
     required ValueChanged<RealtimeRoleDelete> onRoleDelete,
     required ValueChanged<RealtimeMemberRolesUpdate> onMemberRolesUpdate,
+    required ValueChanged<String?> onReconnected,
   }) {
-    void identifyPresence() {
-      socket.emit('presence:identify', {'token': accessToken});
-    }
+    Future<void> identifyAndRejoin() async {
+      final epoch = ++_connectionEpoch;
+      _identified = false;
+      try {
+        // getMe обновляет истёкший access-токен через существующий Dio interceptor.
+        final token = await getAccessToken();
+        if (_disposed || !socket.connected || epoch != _connectionEpoch) return;
+        if (token == null || token.isEmpty) {
+          onSessionExpired();
+          return;
+        }
+        final ack = await socket.timeout(5000).emitWithAckAsync(
+          'presence:identify',
+          {'token': token},
+        );
+        if (_disposed || !socket.connected || epoch != _connectionEpoch) return;
+        if (ack is! Map || ack['userId'] is! String) {
+          throw StateError('Не получено подтверждение сессии');
+        }
 
-    // На каждое (пере)подключение сокета комнаты сервера нужно вступать заново —
-    // членство в socket.io-комнате привязано к конкретному соединению и не
-    // переживает реконнект. Без этого server:join, отправленный до того как
-    // сокет реально подключился (или после обрыва связи), молча терялся, и
-    // владелец сервера переставал получать member:join/member:leave.
-    void rejoinCurrentServerRoom() {
-      final serverId = _currentServerId;
-
-      if (serverId != null) {
-        socket.emit('server:join', {'serverId': serverId});
+        _identified = true;
+        final serverId = _currentServerId;
+        final channelId = _currentChannelId;
+        if (serverId != null) socket.emit('server:join', {'serverId': serverId});
+        if (channelId != null) socket.emit('channel:join', {'channelId': channelId});
+        // Восстановление комнаты Socket.IO не возвращает сообщения, пропущенные
+        // во время обрыва связи — явно просим клиента дозагрузить текущий канал.
+        onReconnected(channelId);
+      } catch (_) {
+        if (_disposed || !socket.connected || epoch != _connectionEpoch) return;
+        Future.delayed(const Duration(seconds: 5), () {
+          if (!_disposed && socket.connected && epoch == _connectionEpoch) {
+            identifyAndRejoin();
+          }
+        });
       }
     }
 
-    socket.onConnect((_) {
-      identifyPresence();
-      rejoinCurrentServerRoom();
+    socket.onConnect((_) => identifyAndRejoin());
+    socket.onDisconnect((_) {
+      _identified = false;
+      _connectionEpoch++;
     });
-
-    if (socket.connected) {
-      identifyPresence();
-      rejoinCurrentServerRoom();
-    }
+    if (socket.connected) identifyAndRejoin();
 
     socket.on('message:new', (data) {
       if (data is Map) {
@@ -686,13 +714,11 @@ class RealtimeClient {
     _currentServerId = serverId;
 
     if (!socket.connected) {
-      // Комната будет занята через rejoinCurrentServerRoom(), как только
-      // сокет реально подключится (см. connect()).
       socket.connect();
       return;
     }
 
-    socket.emit('server:join', {'serverId': serverId});
+    if (_identified) socket.emit('server:join', {'serverId': serverId});
   }
 
   void leaveServer(String serverId) {
@@ -700,22 +726,27 @@ class RealtimeClient {
       _currentServerId = null;
     }
 
-    socket.emit('server:leave', {'serverId': serverId});
+    if (socket.connected) socket.emit('server:leave', {'serverId': serverId});
   }
 
   void joinChannel(String channelId) {
+    _currentChannelId = channelId;
     if (!socket.connected) {
       socket.connect();
+      return;
     }
 
-    socket.emit('channel:join', {'channelId': channelId});
+    if (_identified) socket.emit('channel:join', {'channelId': channelId});
   }
 
   void leaveChannel(String channelId) {
-    socket.emit('channel:leave', {'channelId': channelId});
+    if (_currentChannelId == channelId) _currentChannelId = null;
+    if (socket.connected) socket.emit('channel:leave', {'channelId': channelId});
   }
 
   void dispose() {
+    _disposed = true;
+    _connectionEpoch++;
     socket.dispose();
   }
 }
@@ -1084,7 +1115,7 @@ class _LoginScreenState extends State<LoginScreen> {
             border: Border.all(color: const Color(0xFF342D3F)),
             boxShadow: [
               BoxShadow(
-                color: Colors.black.withOpacity(0.35),
+                color: Colors.black.withValues(alpha: 0.35),
                 blurRadius: 30,
                 offset: const Offset(0, 18),
               ),
@@ -1330,7 +1361,18 @@ class _MainShellState extends State<MainShell> {
     currentUser = widget.initialUser;
     messagesScrollController.addListener(_handleMessagesScroll);
     realtimeClient.connect(
-      accessToken: apiClient.accessToken ?? '',
+      getAccessToken: () async {
+        try {
+          await apiClient.getMe();
+        } catch (_) {
+          if (apiClient.accessToken == null) return null;
+          rethrow;
+        }
+        return apiClient.accessToken;
+      },
+      onSessionExpired: () {
+        if (mounted) unawaited(widget.onLoggedOut());
+      },
       onMessageNew: handleRealtimeMessage,
       onMessageUpdate: handleRealtimeMessageUpdate,
       onMessageDelete: handleRealtimeMessageDelete,
@@ -1344,6 +1386,7 @@ class _MainShellState extends State<MainShell> {
       onRoleUpdate: handleRealtimeRoleUpdate,
       onRoleDelete: handleRealtimeRoleDelete,
       onMemberRolesUpdate: handleRealtimeMemberRolesUpdate,
+      onReconnected: handleRealtimeReconnected,
     );
     loadInitialData();
   }
@@ -1394,6 +1437,77 @@ class _MainShellState extends State<MainShell> {
 
     logout();
     return true;
+  }
+
+  // После обрыва и восстановления Socket.IO-соединения клиент заново
+  // присоединяется к комнате канала, но сообщения, отправленные другими
+  // участниками за время обрыва, по realtime не придут — их нужно
+  // дозагрузить явным запросом, иначе они будут молча потеряны в UI.
+  Future<void> handleRealtimeReconnected(String? channelId) async {
+    if (!mounted ||
+        channelId == null ||
+        channelId != selectedChannelId ||
+        isMessagesLoading) {
+      return;
+    }
+
+    try {
+      const pageSize = 50;
+      // Крайний случай: список сообщений канала ещё пуст (например, канал не
+      // успел догрузиться) — курсора для docачки нет, просто берём последнюю
+      // страницу, как раньше.
+      if (messages.isEmpty) {
+        final latest = await apiClient.getMessages(channelId, limit: pageSize);
+
+        if (!mounted || selectedChannelId != channelId) return;
+
+        if (latest.isNotEmpty) {
+          setState(() {
+            messages = latest;
+          });
+        }
+        return;
+      }
+
+      // Догружаем все пропущенные за время обрыва сообщения постранично по
+      // курсору `after`, начиная от последнего известного клиенту сообщения,
+      // а не только последнюю страницу — иначе длинный обрыв (>50 сообщений)
+      // молча потеряет часть истории.
+      var cursor = messages.last.id;
+      const maxPages = 40; // защита от зависания при аномально долгом обрыве
+      for (var page = 0; page < maxPages; page++) {
+        final next = await apiClient.getMessages(
+          channelId,
+          limit: pageSize,
+          after: cursor,
+        );
+
+        if (!mounted || selectedChannelId != channelId) return;
+
+        if (next.isNotEmpty) {
+          final existingIds = messages.map((item) => item.id).toSet();
+          final missing =
+              next.where((item) => !existingIds.contains(item.id)).toList();
+
+          if (missing.isNotEmpty) {
+            setState(() {
+              messages = [...messages, ...missing];
+            });
+          }
+
+          cursor = next.last.id;
+        }
+
+        if (next.length < pageSize) {
+          // Страница короче лимита — догнали realtime, дальше можно не идти.
+          break;
+        }
+      }
+    } catch (_) {
+      // Молча игнорируем: список сообщений уже отображён (не завис в
+      // загрузке), а пропущенные сообщения всё равно продолжат приходить
+      // по realtime-событиям или догрузятся при следующем переподключении.
+    }
   }
 
   void handleRealtimeMessage(AppMessage message) {
@@ -1529,6 +1643,11 @@ class _MainShellState extends State<MainShell> {
     setState(() {
       serverRoles = [...serverRoles, event.role];
     });
+
+    // Событие несёт краткую роль (без permissions). Подтягиваем полный
+    // список ролей и участников из API, чтобы effectivePermissions у всех
+    // клиентов пересчитался по актуальным правам.
+    unawaited(_refreshServerRolesAndMembers(event.serverId));
   }
 
   void handleRealtimeRoleUpdate(RealtimeRoleEvent event) {
@@ -1537,31 +1656,94 @@ class _MainShellState extends State<MainShell> {
     }
 
     setState(() {
-      final hasRole = serverRoles.any((role) => role.id == event.role.id);
-
-      serverRoles = hasRole
-          ? serverRoles
-                .map<AppRole>(
-                  (role) => role.id == event.role.id ? event.role : role,
-                )
-                .toList()
-          : [...serverRoles, event.role];
+      serverRoles = _mergeUpdatedRoleInto(serverRoles, event.role);
 
       members = members
           .map<AppServerMember>(
             (member) => member.roles.any((role) => role.id == event.role.id)
                 ? member.copyWith(
-                    roles: member.roles
-                        .map<AppRole>(
-                          (role) =>
-                              role.id == event.role.id ? event.role : role,
-                        )
-                        .toList(),
+                    roles: _mergeUpdatedRoleInto(member.roles, event.role),
                   )
                 : member,
           )
           .toList();
     });
+
+    // Событие несёт краткую роль (без permissions). Подтягиваем полный
+    // список ролей и участников из API, чтобы effectivePermissions у всех
+    // клиентов пересчитался по актуальным правам.
+    unawaited(_refreshServerRolesAndMembers(event.serverId));
+  }
+
+  // При обновлении роли по realtime-событию сохраняем permissions из
+  // существующей полной роли, если событие их не несёт (краткая роль).
+  // Это не даёт потерять права у клиентов, кроме инициатора, до того как
+  // refresh подтянет полные роли из backend.
+  List<AppRole> _mergeUpdatedRoleInto(List<AppRole> roles, AppRole updated) {
+    final hasRole = roles.any((role) => role.id == updated.id);
+    if (!hasRole) {
+      return [...roles, updated];
+    }
+
+    return roles
+        .map<AppRole>(
+          (role) => role.id == updated.id
+              ? _preservePermissions(updated, role)
+              : role,
+        )
+        .toList();
+  }
+
+  AppRole _preservePermissions(AppRole incoming, AppRole existing) {
+    if (incoming.permissions.isNotEmpty) {
+      return incoming;
+    }
+    if (existing.permissions.isEmpty) {
+      return incoming;
+    }
+    // Краткая роль из события не несёт permissions — оставляем существующие,
+    // чтобы effectivePermissions не проседал до успешного refresh.
+    return AppRole(
+      id: incoming.id,
+      name: incoming.name,
+      color: incoming.color,
+      position: incoming.position,
+      permissions: existing.permissions,
+    );
+  }
+
+  // Пересинхронизация после role:new / role:update: источник истины для
+  // прав — backend. Полные роли (с permissions) даёт getServerRoles,
+  // актуальные назначения — getServerMembers. Заменяем локальные списки
+  // целиком, без дубликатов. Ошибки API перехватываются здесь, чтобы
+  // unawaited не превратил их в unhandled future, а существующая полная
+  // роль не потеряла permissions при неудачном refresh.
+  Future<void> _refreshServerRolesAndMembers(String serverId) async {
+    try {
+      final latestRoles = await apiClient.getServerRoles(serverId);
+      final latestMembers = await apiClient.getServerMembers(serverId);
+
+      if (!mounted || serverId != selectedServerId) {
+        return;
+      }
+
+      setState(() {
+        serverRoles = latestRoles;
+        members = latestMembers;
+      });
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return;
+      if (!mounted || serverId != selectedServerId) return;
+
+      showErrorSnackBar(
+        context,
+        'Не удалось обновить роли: ${error.response?.data ?? error.message ?? error}',
+      );
+    } catch (error) {
+      if (!mounted || serverId != selectedServerId) return;
+
+      showErrorSnackBar(context, 'Не удалось обновить роли: $error');
+    }
   }
 
   void handleRealtimeRoleDelete(RealtimeRoleDelete event) {
@@ -3224,13 +3406,13 @@ class _MainShellState extends State<MainShell> {
             onManageRoles: selectedServer == null ? null : manageServerRoles,
             onRenameServer: selectedServer == null
                 ? null
-                : () => renameServer(selectedServer!),
+                : () => renameServer(selectedServer),
             onDeleteServer: selectedServer == null
                 ? null
-                : () => deleteServer(selectedServer!),
+                : () => deleteServer(selectedServer),
             onLeaveServer: selectedServer == null
                 ? null
-                : () => leaveServer(selectedServer!),
+                : () => leaveServer(selectedServer),
             onEditProfile: editProfile,
             onLogout: logout,
           ),
@@ -3315,7 +3497,7 @@ class ServersSidebar extends StatelessWidget {
             child: ListView.separated(
               padding: const EdgeInsets.symmetric(horizontal: 12),
               itemCount: servers.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              separatorBuilder: (_, _) => const SizedBox(height: 10),
               itemBuilder: (context, index) {
                 final server = servers[index];
                 final isSelected = server.id == selectedServerId;
@@ -3364,7 +3546,7 @@ class PlumsLogoButton extends StatelessWidget {
         ),
         boxShadow: [
           BoxShadow(
-            color: const Color(0xFF8D5CFF).withOpacity(0.35),
+            color: const Color(0xFF8D5CFF).withValues(alpha: 0.35),
             blurRadius: 18,
             offset: const Offset(0, 8),
           ),
@@ -4268,7 +4450,7 @@ class MembersSidebar extends StatelessWidget {
                 : ListView.separated(
                     padding: const EdgeInsets.all(12),
                     itemCount: members.length,
-                    separatorBuilder: (_, __) => const SizedBox(height: 8),
+                    separatorBuilder: (_, _) => const SizedBox(height: 8),
                     itemBuilder: (context, index) {
                       final member = members[index];
                       final user = member.user;
@@ -5399,7 +5581,7 @@ class PermissionSwitchTile extends StatelessWidget {
     return SwitchListTile(
       value: value,
       onChanged: enabled ? onChanged : null,
-      activeColor: const Color(0xFF8D5CFF),
+      activeThumbColor: const Color(0xFF8D5CFF),
       contentPadding: EdgeInsets.zero,
       title: Text(
         title,
@@ -5449,7 +5631,7 @@ Future<void> showServerMembersDialog({
                 )
               : ListView.separated(
                   itemCount: members.length,
-                  separatorBuilder: (_, __) => const SizedBox(height: 10),
+                  separatorBuilder: (_, _) => const SizedBox(height: 10),
                   itemBuilder: (context, index) {
                     final member = members[index];
                     final user = member.user;
@@ -5577,7 +5759,7 @@ Future<void> showServerBansDialog({
                     )
                   : ListView.separated(
                       itemCount: mutableBans.length,
-                      separatorBuilder: (_, __) => const SizedBox(height: 10),
+                      separatorBuilder: (_, _) => const SizedBox(height: 10),
                       itemBuilder: (context, index) {
                         final ban = mutableBans[index];
                         final user = ban.user;
@@ -5797,7 +5979,7 @@ Future<void> showManageRolesDialog({
                       )
                     : ListView.separated(
                         itemCount: sortedRoles.length,
-                        separatorBuilder: (_, __) => const SizedBox(height: 10),
+                        separatorBuilder: (_, _) => const SizedBox(height: 10),
                         itemBuilder: (context, index) {
                           final role = sortedRoles[index];
                           final color =
@@ -6046,7 +6228,7 @@ Future<void> showMemberRolesDialog({
                     )
                   : ListView.separated(
                       itemCount: sortedRoles.length,
-                      separatorBuilder: (_, __) => const SizedBox(height: 4),
+                      separatorBuilder: (_, _) => const SizedBox(height: 4),
                       itemBuilder: (context, index) {
                         final role = sortedRoles[index];
                         final assigned = assignedIds.contains(role.id);

@@ -125,7 +125,7 @@ export class MessagesService {
   async findByChannel(
     channelId: string,
     userId: string,
-    options?: { limit?: number; before?: string },
+    options?: { limit?: number; before?: string; after?: string },
   ) {
     const channel = await this.getChannelForUser(channelId, userId);
 
@@ -144,8 +144,15 @@ export class MessagesService {
 
     const limit = options?.limit ?? 50;
 
+    if (options?.before && options?.after) {
+      throw new BadRequestException(
+        'Нельзя одновременно использовать курсоры before и after',
+      );
+    }
+
     let cursorFilter:
       | { OR: [{ createdAt: { lt: Date } }, { createdAt: Date; id: { lt: string } }] }
+      | { OR: [{ createdAt: { gt: Date } }, { createdAt: Date; id: { gt: string } }] }
       | undefined;
 
     if (options?.before) {
@@ -166,6 +173,24 @@ export class MessagesService {
           { createdAt: cursorMessage.createdAt, id: { lt: options.before } },
         ],
       };
+    } else if (options?.after) {
+      const cursorMessage = await this.prisma.message.findUnique({
+        where: { id: options.after },
+        select: { createdAt: true, channelId: true },
+      });
+
+      if (!cursorMessage || cursorMessage.channelId !== channelId) {
+        throw new BadRequestException('Некорректный курсор пагинации');
+      }
+
+      // Составной курсор (createdAt, id) для догрузки сообщений, пропущенных
+      // во время обрыва realtime-соединения.
+      cursorFilter = {
+        OR: [
+          { createdAt: { gt: cursorMessage.createdAt } },
+          { createdAt: cursorMessage.createdAt, id: { gt: options.after } },
+        ],
+      };
     }
 
     const messages = await this.prisma.message.findMany({
@@ -174,7 +199,9 @@ export class MessagesService {
         deletedAt: null,
         ...cursorFilter,
       },
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      orderBy: options?.after
+        ? [{ createdAt: 'asc' }, { id: 'asc' }]
+        : [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit,
       include: {
         author: {
@@ -188,6 +215,12 @@ export class MessagesService {
         },
       },
     });
+
+    if (options?.after) {
+      // Для курсора "вперёд" Prisma уже отдаёт страницу в хронологическом
+      // порядке (от старых к новым), реверс не нужен.
+      return messages;
+    }
 
     // Отдаём страницу в хронологическом порядке (от старых к новым), как и раньше.
     return messages.reverse();

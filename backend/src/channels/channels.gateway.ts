@@ -1,11 +1,5 @@
-import {
-  ConnectedSocket,
-  MessageBody,
-  SubscribeMessage,
-  WebSocketGateway,
-  WebSocketServer,
-} from '@nestjs/websockets';
-import { Server, Socket } from 'socket.io';
+import { WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
+import { Server } from 'socket.io';
 
 @WebSocketGateway({
   cors: {
@@ -15,30 +9,6 @@ import { Server, Socket } from 'socket.io';
 export class ChannelsGateway {
   @WebSocketServer()
   server!: Server;
-
-  @SubscribeMessage('server:join')
-  joinServer(
-    @MessageBody() payload: { serverId?: string },
-    @ConnectedSocket() client: Socket,
-  ) {
-    if (!payload.serverId) {
-      return;
-    }
-
-    client.join(this.getServerRoom(payload.serverId));
-  }
-
-  @SubscribeMessage('server:leave')
-  leaveServer(
-    @MessageBody() payload: { serverId?: string },
-    @ConnectedSocket() client: Socket,
-  ) {
-    if (!payload.serverId) {
-      return;
-    }
-
-    client.leave(this.getServerRoom(payload.serverId));
-  }
 
   emitChannelNew(serverId: string, channel: unknown) {
     this.server.to(this.getServerRoom(serverId)).emit('channel:new', channel);
@@ -54,6 +24,19 @@ export class ChannelsGateway {
     this.server
       .to(this.getServerRoom(serverId))
       .emit('channel:delete', channel);
+  }
+
+  async evictChannelViewers(channelId: string, ownerId: string) {
+    const room = `channel:${channelId}`;
+    for (const socket of await this.server.in(room).fetchSockets()) {
+      if ((socket.data as { userId?: string }).userId !== ownerId)
+        socket.leave(room);
+    }
+  }
+
+  evictChannel(channelId: string) {
+    const room = `channel:${channelId}`;
+    this.server.in(room).socketsLeave(room);
   }
 
   private getServerRoom(serverId: string) {

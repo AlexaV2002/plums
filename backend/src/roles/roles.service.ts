@@ -282,7 +282,7 @@ export class RolesService {
         error instanceof Prisma.PrismaClientKnownRequestError &&
         (error.code === 'P2017' || error.code === 'P2025')
       ) {
-        throw new NotFoundException('Р РѕР»СЊ РЅРµ РЅР°Р·РЅР°С‡РµРЅР° СЌС‚РѕРјСѓ СѓС‡Р°СЃС‚РЅРёРєСѓ');
+        throw new NotFoundException('Роль не назначена этому участнику');
       }
 
       throw error;

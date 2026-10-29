@@ -6,6 +6,7 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
+import { PrismaService } from '../prisma/prisma.service';
 
 export type MemberLeavePayload = {
   serverId: string;
@@ -62,52 +63,105 @@ export class ServersGateway {
   @WebSocketServer()
   server!: Server;
 
+  constructor(private readonly prisma: PrismaService) {}
+
   @SubscribeMessage('server:join')
-  joinServer(
+  async joinServer(
     @MessageBody() payload: { serverId?: string },
     @ConnectedSocket() client: Socket,
   ) {
-    if (!payload.serverId) {
+    const userId = (client.data as { userId?: string }).userId;
+    if (typeof payload?.serverId !== 'string' || !userId) {
       return;
     }
 
-    client.join(this.getServerRoom(payload.serverId));
+    const member = await this.prisma.serverMember.findUnique({
+      where: {
+        serverId_userId: { serverId: payload.serverId, userId },
+      },
+    });
+    if (!member || (client.data as { userId?: string }).userId !== userId) {
+      client.emit('server:error', {
+        serverId: payload.serverId,
+        error: 'Нет доступа к серверу',
+      });
+      return;
+    }
+
+    await client.join(this.getServerRoom(payload.serverId));
   }
 
   @SubscribeMessage('server:leave')
-  leaveServer(
+  async leaveServer(
     @MessageBody() payload: { serverId?: string },
     @ConnectedSocket() client: Socket,
   ) {
-    if (!payload.serverId) {
+    if (typeof payload?.serverId !== 'string') {
       return;
     }
 
-    client.leave(this.getServerRoom(payload.serverId));
+    await client.leave(this.getServerRoom(payload.serverId));
   }
 
   emitMemberLeave(payload: MemberLeavePayload) {
-    this.server.to(this.getServerRoom(payload.serverId)).emit('member:leave', payload);
+    this.server
+      .to(this.getServerRoom(payload.serverId))
+      .emit('member:leave', payload);
   }
 
   emitMemberJoin(payload: MemberJoinPayload) {
-    this.server.to(this.getServerRoom(payload.serverId)).emit('member:join', payload);
+    this.server
+      .to(this.getServerRoom(payload.serverId))
+      .emit('member:join', payload);
   }
 
   emitRoleNew(payload: RoleEventPayload) {
-    this.server.to(this.getServerRoom(payload.serverId)).emit('role:new', payload);
+    this.server
+      .to(this.getServerRoom(payload.serverId))
+      .emit('role:new', payload);
   }
 
   emitRoleUpdate(payload: RoleEventPayload) {
-    this.server.to(this.getServerRoom(payload.serverId)).emit('role:update', payload);
+    this.server
+      .to(this.getServerRoom(payload.serverId))
+      .emit('role:update', payload);
   }
 
   emitRoleDelete(payload: RoleDeletePayload) {
-    this.server.to(this.getServerRoom(payload.serverId)).emit('role:delete', payload);
+    this.server
+      .to(this.getServerRoom(payload.serverId))
+      .emit('role:delete', payload);
   }
 
   emitMemberRolesUpdate(payload: MemberRolesUpdatePayload) {
-    this.server.to(this.getServerRoom(payload.serverId)).emit('member:roles:update', payload);
+    this.server
+      .to(this.getServerRoom(payload.serverId))
+      .emit('member:roles:update', payload);
+  }
+
+  async evictUserFromServer(serverId: string, userId: string) {
+    const channels = await this.prisma.channel.findMany({
+      where: { serverId },
+      select: { id: true },
+    });
+    const rooms = new Set([
+      this.getServerRoom(serverId),
+      ...channels.map((channel) => `channel:${channel.id}`),
+    ]);
+    for (const socket of await this.server.fetchSockets()) {
+      if ((socket.data as { userId?: string }).userId !== userId) continue;
+      for (const room of rooms) {
+        if (socket.rooms.has(room)) socket.leave(room);
+      }
+    }
+  }
+
+  evictServerRooms(serverId: string, channelIds: string[]) {
+    const rooms = [
+      this.getServerRoom(serverId),
+      ...channelIds.map((id) => `channel:${id}`),
+    ];
+    for (const room of rooms) this.server.in(room).socketsLeave(room);
   }
 
   private getServerRoom(serverId: string) {

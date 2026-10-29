@@ -211,11 +211,21 @@ export class ServersService {
   async deleteServer(userId: string, serverId: string) {
     await this.getServerOwnerOrThrow(userId, serverId);
 
+    const channels = await this.prisma.channel.findMany({
+      where: { serverId },
+      select: { id: true },
+    });
+
     await this.prisma.server.delete({
       where: {
         id: serverId,
       },
     });
+
+    this.serversGateway.evictServerRooms(
+      serverId,
+      channels.map((channel) => channel.id),
+    );
 
     return {
       message: 'Сервер удалён',
@@ -246,6 +256,7 @@ export class ServersService {
       memberId: member.id,
       reason: 'leave',
     });
+    await this.serversGateway.evictUserFromServer(serverId, userId);
 
     return {
       message: 'Вы вышли с сервера',
@@ -285,6 +296,7 @@ export class ServersService {
       memberId: member.id,
       reason: 'kick',
     });
+    await this.serversGateway.evictUserFromServer(serverId, member.userId);
 
     return {
       message: 'Участник удалён с сервера',
@@ -355,6 +367,7 @@ export class ServersService {
         reason: 'ban',
       });
     }
+    await this.serversGateway.evictUserFromServer(serverId, targetUserId);
 
     return {
       message: 'Пользователь забанен на сервере',
