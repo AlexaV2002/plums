@@ -709,6 +709,7 @@ class RealtimeClient {
     required ValueChanged<RealtimeRoleDelete> onRoleDelete,
     required ValueChanged<RealtimeMemberRolesUpdate> onMemberRolesUpdate,
     required ValueChanged<String?> onReconnected,
+    VoidCallback? onDisconnected,
   }) {
     if (_disposed || _handlersInstalled) return;
     _handlersInstalled = true;
@@ -788,6 +789,11 @@ class RealtimeClient {
       identifyAndRejoin();
     });
     socket.onDisconnect((reason) {
+      // Фиксируем точку синхронизации ДО любой другой обработки разрыва:
+      // после этого момента по этому соединению не может прийти новое
+      // realtime-событие, поэтому вызывающая сторона может безопасно
+      // использовать текущее состояние как надёжный якорь для докачки.
+      onDisconnected?.call();
       _identified = false;
       _connectionEpoch++;
       _manuallyDisconnected = reason == 'io client disconnect';
@@ -1640,6 +1646,21 @@ class _MainShellState extends State<MainShell> {
   // пока предыдущий ещё не завершился.
   bool _reconnectCatchUpInProgress = false;
 
+  // Якорь синхронизации: курсор последнего сообщения, которое клиент
+  // гарантированно видел ДО разрыва соединения (захватывается в момент
+  // onDisconnect, когда новые realtime-события по старому соединению уже
+  // физически невозможны). Без него handleRealtimeReconnected рисковал бы
+  // использовать messages.last.id уже ПОСЛЕ того, как по восстановленному
+  // соединению успело прилететь новое live-сообщение, и пропустить реальный
+  // пробел истории.
+  String? _syncAnchorChannelId;
+  String? _syncAnchorMessageId;
+
+  // Канал, для которого реконнект пришёл во время занятости (первоначальная
+  // загрузка или уже идущая докачка) — чтобы запрос на синхронизацию не
+  // терялся молча, а выполнился сразу после освобождения.
+  String? _pendingReconnectSyncChannelId;
+
   final ScrollController messagesScrollController = ScrollController();
 
   @override
@@ -1676,6 +1697,7 @@ class _MainShellState extends State<MainShell> {
       onRoleDelete: handleRealtimeRoleDelete,
       onMemberRolesUpdate: handleRealtimeMemberRolesUpdate,
       onReconnected: handleRealtimeReconnected,
+      onDisconnected: handleRealtimeDisconnected,
     );
     loadInitialData();
   }
@@ -1787,33 +1809,63 @@ class _MainShellState extends State<MainShell> {
   // присоединяется к комнате канала, но сообщения, отправленные другими
   // участниками за время обрыва, по realtime не придут — их нужно
   // дозагрузить явным запросом, иначе они будут молча потеряны в UI.
+  // Захватывает якорь синхронизации в момент разрыва соединения — до того,
+  // как по восстановленному соединению сможет прийти любое новое
+  // realtime-сообщение. Синхронный метод, не влияет на отображение.
+  void handleRealtimeDisconnected() {
+    _syncAnchorChannelId = selectedChannelId;
+    _syncAnchorMessageId =
+        (selectedChannelId != null && messages.isNotEmpty)
+            ? messages.last.id
+            : null;
+  }
+
   Future<void> handleRealtimeReconnected(String? channelId) async {
-    if (!mounted ||
-        channelId == null ||
-        channelId != selectedChannelId ||
-        isMessagesLoading ||
-        _reconnectCatchUpInProgress) {
+    if (!mounted || channelId == null || channelId != selectedChannelId) {
       return;
     }
 
+    if (isMessagesLoading || _reconnectCatchUpInProgress) {
+      // Текущая занятая операция может не покрыть тот же пробел (например,
+      // она была запущена по устаревшему якорю) — не теряем этот запрос на
+      // синхронизацию молча, а выполним его сразу после освобождения.
+      _pendingReconnectSyncChannelId = channelId;
+      return;
+    }
+
+    await _runReconnectSync(channelId);
+  }
+
+  Future<void> _runReconnectSync(String channelId) async {
+    _pendingReconnectSyncChannelId = null;
     _reconnectCatchUpInProgress = true;
     try {
-      // Крайний случай: список сообщений канала ещё пуст (например, канал не
-      // успел догрузиться или реконнект случился до первой загрузки) —
-      // курсора для докачки `after` нет. Забираем последнюю страницу и, если
-      // она полная (вероятно, пропущено больше, чем pageSize), достаём
-      // остальную историю докачкой НАЗАД по курсору `before`, а не считаем
-      // синхронизацию завершённой по первым 50 сообщениям.
-      if (messages.isEmpty) {
-        await _catchUpEmptyChannel(channelId);
-        return;
-      }
+      // Якорь, захваченный в момент разрыва соединения, надёжнее
+      // messages.last.id: на момент выполнения этого метода по
+      // восстановленному соединению уже может быть дописано новое
+      // live-сообщение (handleRealtimeMessage синхронный и не ждёт этот
+      // метод), из-за чего messages.last.id указывал бы на него, а не на
+      // последнее сообщение, увиденное ДО обрыва, — и докачка пропустила бы
+      // реальный пробел истории.
+      final anchorId =
+          _syncAnchorChannelId == channelId ? _syncAnchorMessageId : null;
 
-      // Догружаем все пропущенные за время обрыва сообщения постранично по
-      // курсору `after`, начиная от последнего известного клиенту сообщения,
-      // а не только последнюю страницу — иначе длинный обрыв (>50 сообщений)
-      // молча потеряет часть истории.
-      await _catchUpMessagesAfter(channelId, messages.last.id);
+      if (anchorId != null) {
+        await _catchUpMessagesAfter(channelId, anchorId);
+      } else if (messages.isEmpty) {
+        // Крайний случай: список сообщений канала ещё пуст (например, канал
+        // не успел догрузиться или реконнект случился до первой загрузки) —
+        // курсора для докачки `after` нет. Забираем последнюю страницу и,
+        // если она полная (вероятно, пропущено больше, чем pageSize),
+        // достаём остальную историю докачкой НАЗАД по курсору `before`, а не
+        // считаем синхронизацию завершённой по первым 50 сообщениям.
+        await _catchUpEmptyChannel(channelId);
+      } else {
+        // Якоря для этого канала нет (например, реконнект пришёл без
+        // предшествующего onDisconnect для этого канала) — используем
+        // прежнее поведение как запасной вариант.
+        await _catchUpMessagesAfter(channelId, messages.last.id);
+      }
     } catch (_) {
       // Молча игнорируем: список сообщений уже отображён (не завис в
       // загрузке), а пропущенные сообщения всё равно продолжат приходить
@@ -1821,6 +1873,23 @@ class _MainShellState extends State<MainShell> {
     } finally {
       _reconnectCatchUpInProgress = false;
     }
+
+    await _flushPendingReconnectSync();
+  }
+
+  // Выполняет отложенный из-за занятости запрос на синхронизацию, если он
+  // всё ещё актуален (канал не сменился, и сейчас ничего не занято).
+  Future<void> _flushPendingReconnectSync() async {
+    final pending = _pendingReconnectSyncChannelId;
+    if (pending == null ||
+        !mounted ||
+        pending != selectedChannelId ||
+        isMessagesLoading ||
+        _reconnectCatchUpInProgress) {
+      return;
+    }
+
+    await _runReconnectSync(pending);
   }
 
   // Постранично догружает сообщения после курсора [startCursor]. Каждая
@@ -1901,6 +1970,9 @@ class _MainShellState extends State<MainShell> {
     } finally {
       _reconnectCatchUpInProgress = false;
     }
+    // Если новый реконнект пришёл во время ожидания "Повторить" и был
+    // отложен из-за занятости — выполняем его сразу, не теряя пробел.
+    await _flushPendingReconnectSync();
   }
 
   // Реконнект застал канал без ни одной загруженной локально страницы:
@@ -2015,6 +2087,9 @@ class _MainShellState extends State<MainShell> {
     } finally {
       _reconnectCatchUpInProgress = false;
     }
+    // Если новый реконнект пришёл во время ожидания "Повторить" и был
+    // отложен из-за занятости — выполняем его сразу, не теряя пробел.
+    await _flushPendingReconnectSync();
   }
 
   void handleRealtimeMessage(AppMessage message) {
@@ -2628,6 +2703,10 @@ class _MainShellState extends State<MainShell> {
       });
       _scrollMessagesToBottom();
       syncRealtimeChannel(channel);
+      // Реконнект мог прийти во время этой первоначальной загрузки и быть
+      // отложен из-за isMessagesLoading — выполняем его сразу теперь, а не
+      // ждём случайного следующего реконнекта.
+      await _flushPendingReconnectSync();
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
 
