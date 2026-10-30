@@ -186,7 +186,9 @@ export class UsersGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Статус виден только самому пользователю и участникам общих серверов.
     // Проверяем членство непосредственно перед отправкой каждому сокету;
     // повторная проверка identity исключает доставку после смены аккаунта.
-    for (const socket of this.server.sockets.sockets.values()) {
+    const sockets = this.server?.sockets?.sockets;
+    if (!sockets) return;
+    for (const socket of sockets.values()) {
       const identity = getActiveSocketIdentity(socket);
       if (!identity) continue;
 
