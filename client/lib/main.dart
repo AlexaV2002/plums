@@ -155,7 +155,29 @@ class ApiClient {
 
           try {
             await _refreshTokens();
-          } catch (_) {
+          } catch (refreshError) {
+            if (isTemporaryRequestError(refreshError)) {
+              // Сам запрос /auth/refresh временно недоступен (таймаут,
+              // connectionError, 5xx) — backend ничего не подтвердил и не
+              // отверг, сессия потенциально ещё валидна. Не стираем токены и
+              // пробрасываем вызывающему коду РЕАЛЬНУЮ ошибку refresh (а не
+              // исходную 401 от первого запроса), чтобы
+              // isTemporaryRequestError() выше по стеку (например, в
+              // restoreSession()) увидел настоящую временную ошибку, а не
+              // подтверждённый отказ.
+              final rejection = refreshError is DioException
+                  ? refreshError
+                  : DioException(
+                      requestOptions: error.requestOptions,
+                      error: refreshError,
+                      type: DioExceptionType.unknown,
+                    );
+              handler.reject(rejection);
+              return;
+            }
+
+            // Backend ответил и явно отверг refresh (например, 401/400) —
+            // refresh-токен действительно недействителен.
             accessToken = null;
             refreshToken = null;
             await authStorage.clearTokens();
