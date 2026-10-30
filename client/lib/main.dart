@@ -103,6 +103,28 @@ String describeRequestError(Object error) {
   return 'Непредвиденная ошибка, попробуйте ещё раз';
 }
 
+// Отличает ВРЕМЕННУЮ недоступность сети/backend (таймаут, отсутствие
+// соединения, 5xx, либо вообще не распознанная не-DioException ошибка) от
+// ПОДТВЕРЖДЁННОГО отказа — когда backend успел ответить и явно отверг запрос
+// (например, 401/403 с реальным response). Используется restoreSession(),
+// чтобы не стирать валидный refresh-токен только потому, что Wi-Fi/backend
+// на секунду пропали. DioException без response (таймауты, connectionError и
+// т.п.) всегда попадает во "временная" — именно так backend ничего не успел
+// подтвердить или отвергнуть.
+bool isTemporaryRequestError(Object error) {
+  if (error is! DioException) {
+    return true;
+  }
+
+  final statusCode = error.response?.statusCode;
+
+  if (error.response == null) {
+    return true;
+  }
+
+  return statusCode == null || statusCode >= 500;
+}
+
 class ApiClient {
   ApiClient()
     : dio = Dio(
@@ -1010,15 +1032,30 @@ class RealtimeMemberRolesUpdate {
 ========================= */
 
 class AuthGate extends StatefulWidget {
-  const AuthGate({super.key});
+  // apiClient/authStorage по умолчанию берутся из глобальных singleton — это
+  // сохраняет прежнее поведение. Необязательные параметры добавлены только
+  // для тестируемости restoreSession() (подмена в widget-тестах), поведение
+  // приложения по умолчанию не меняется.
+  const AuthGate({super.key, this.apiClient, this.authStorage});
+
+  final ApiClient? apiClient;
+  final AuthStorage? authStorage;
 
   @override
   State<AuthGate> createState() => _AuthGateState();
 }
 
 class _AuthGateState extends State<AuthGate> {
+  late final ApiClient _apiClient = widget.apiClient ?? apiClient;
+  late final AuthStorage _authStorage = widget.authStorage ?? authStorage;
+
   AppUser? currentUser;
   bool isCheckingAuth = true;
+  // true, когда restoreSession() столкнулась с ВРЕМЕННОЙ недоступностью
+  // сети/backend (см. isTemporaryRequestError) — токены в этом случае не
+  // стираются, пользователь остаётся на экране "нет соединения" с кнопкой
+  // "Повторить", а не выкидывается на логин.
+  bool isOffline = false;
 
   @override
   void initState() {
@@ -1027,55 +1064,84 @@ class _AuthGateState extends State<AuthGate> {
   }
 
   Future<void> restoreSession() async {
-    final token = await authStorage.readAccessToken();
-    final storedRefreshToken = await authStorage.readRefreshToken();
+    final token = await _authStorage.readAccessToken();
+    final storedRefreshToken = await _authStorage.readRefreshToken();
 
     if (token == null || token.isEmpty) {
       if (!mounted) return;
 
       setState(() {
         isCheckingAuth = false;
+        isOffline = false;
       });
 
       return;
     }
 
     try {
-      apiClient.accessToken = token;
-      apiClient.refreshToken = storedRefreshToken;
+      _apiClient.accessToken = token;
+      _apiClient.refreshToken = storedRefreshToken;
       // Если accessToken уже истёк, ApiClient сам попробует тихо обновить его
       // через refreshToken прямо во время этого запроса.
-      final user = await apiClient.getMe();
+      final user = await _apiClient.getMe();
 
       if (!mounted) return;
 
       setState(() {
         currentUser = user;
         isCheckingAuth = false;
+        isOffline = false;
       });
-    } catch (_) {
-      await authStorage.clearTokens();
-      apiClient.accessToken = null;
-      apiClient.refreshToken = null;
+    } catch (error) {
+      if (isTemporaryRequestError(error)) {
+        // Сеть/backend временно недоступны — это не подтверждённый отказ
+        // сессии, поэтому валидные токены трогать нельзя.
+        if (!mounted) return;
+
+        setState(() {
+          isCheckingAuth = false;
+          isOffline = true;
+        });
+
+        return;
+      }
+
+      await _authStorage.clearTokens();
+      _apiClient.accessToken = null;
+      _apiClient.refreshToken = null;
 
       if (!mounted) return;
 
       setState(() {
         currentUser = null;
         isCheckingAuth = false;
+        isOffline = false;
       });
     }
   }
 
+  // Кнопка "Повторить" на экране "нет соединения": возвращаемся в состояние
+  // проверки и заново пытаемся восстановить сессию.
+  Future<void> retryRestoreSession() async {
+    if (!mounted) return;
+
+    setState(() {
+      isCheckingAuth = true;
+      isOffline = false;
+    });
+
+    await restoreSession();
+  }
+
   Future<void> handleLogin(AppUser user) async {
-    final token = apiClient.accessToken;
-    final refreshToken = apiClient.refreshToken;
+    final token = _apiClient.accessToken;
+    final refreshToken = _apiClient.refreshToken;
 
     if (token != null &&
         token.isNotEmpty &&
         refreshToken != null &&
         refreshToken.isNotEmpty) {
-      await authStorage.saveTokens(
+      await _authStorage.saveTokens(
         accessToken: token,
         refreshToken: refreshToken,
       );
@@ -1089,10 +1155,10 @@ class _AuthGateState extends State<AuthGate> {
   }
 
   Future<void> handleLogout() async {
-    await apiClient.logout();
-    await authStorage.clearTokens();
-    apiClient.accessToken = null;
-    apiClient.refreshToken = null;
+    await _apiClient.logout();
+    await _authStorage.clearTokens();
+    _apiClient.accessToken = null;
+    _apiClient.refreshToken = null;
 
     if (!mounted) return;
 
@@ -1108,6 +1174,31 @@ class _AuthGateState extends State<AuthGate> {
         backgroundColor: Color(0xFF15131A),
         body: Center(
           child: CircularProgressIndicator(color: Color(0xFF8D5CFF)),
+        ),
+      );
+    }
+
+    if (isOffline) {
+      return Scaffold(
+        backgroundColor: const Color(0xFF15131A),
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Нет соединения с сервером',
+                style: TextStyle(color: Colors.white),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF8D5CFF),
+                ),
+                onPressed: () => unawaited(retryRestoreSession()),
+                child: const Text('Повторить'),
+              ),
+            ],
+          ),
         ),
       );
     }
@@ -1592,20 +1683,14 @@ class _MainShellState extends State<MainShell> {
 
     _reconnectCatchUpInProgress = true;
     try {
-      const pageSize = 50;
       // Крайний случай: список сообщений канала ещё пуст (например, канал не
-      // успел догрузиться) — курсора для docачки нет, просто берём последнюю
-      // страницу, как раньше.
+      // успел догрузиться или реконнект случился до первой загрузки) —
+      // курсора для докачки `after` нет. Забираем последнюю страницу и, если
+      // она полная (вероятно, пропущено больше, чем pageSize), достаём
+      // остальную историю докачкой НАЗАД по курсору `before`, а не считаем
+      // синхронизацию завершённой по первым 50 сообщениям.
       if (messages.isEmpty) {
-        final latest = await apiClient.getMessages(channelId, limit: pageSize);
-
-        if (!mounted || selectedChannelId != channelId) return;
-
-        if (latest.isNotEmpty) {
-          setState(() {
-            messages = latest;
-          });
-        }
+        await _catchUpEmptyChannel(channelId);
         return;
       }
 
@@ -1698,6 +1783,120 @@ class _MainShellState extends State<MainShell> {
     _reconnectCatchUpInProgress = true;
     try {
       await _catchUpMessagesAfter(channelId, cursor);
+    } finally {
+      _reconnectCatchUpInProgress = false;
+    }
+  }
+
+  // Реконнект застал канал без ни одной загруженной локально страницы:
+  // курсора `after` нет совсем. Берём последнюю страницу без курсора — но, в
+  // отличие от прежнего кода, не считаем это завершением синхронизации. Если
+  // страница оказалась полной (== pageSize), в канале, скорее всего, пропущено
+  // больше, и остальное докачиваем НАЗАД по курсору `before`, пока страница не
+  // окажется короче pageSize (дошли до настоящего начала истории).
+  Future<void> _catchUpEmptyChannel(String channelId) async {
+    const pageSize = 50;
+    final latest = await apiClient.getMessages(channelId, limit: pageSize);
+
+    if (!mounted || selectedChannelId != channelId) return;
+
+    final step = applyCatchUpPage(
+      current: messages,
+      page: latest,
+      pageSize: pageSize,
+    );
+
+    setState(() {
+      messages = step.messages;
+      hasMoreMessages = step.isFull;
+    });
+
+    final nextCursor = step.nextCursor;
+    if (!step.isFull || nextCursor == null) {
+      // В канале было не больше pageSize сообщений — восстановление полное.
+      return;
+    }
+
+    await _catchUpMessagesBefore(channelId, nextCursor);
+  }
+
+  // Постранично догружает сообщения НАЗАД по курсору [startCursor] —
+  // симметрично _catchUpMessagesAfter, но для случая, когда реконнект застал
+  // канал пустым и нет курсора "вперёд". Каждая страница читает актуальный
+  // messages прямо перед merge (через applyCatchUpPage), чтобы не потерять
+  // live-сообщение, пришедшее по realtime во время этого цикла. Останавливаем
+  // цикл, когда страница короче pageSize (дошли до начала истории), либо по
+  // защитному лимиту maxPages — в этом случае, как и для докачки вперёд, не
+  // завершаемся молча: показываем snackbar с кнопкой "Повторить".
+  Future<void> _catchUpMessagesBefore(
+    String channelId,
+    String startCursor,
+  ) async {
+    const pageSize = 50;
+    const maxPages = 40;
+    var cursor = startCursor;
+    var lastPageWasFull = false;
+
+    try {
+      for (var page = 0; page < maxPages; page++) {
+        final previous = await apiClient.getMessages(
+          channelId,
+          limit: pageSize,
+          before: cursor,
+        );
+
+        if (!mounted || selectedChannelId != channelId) return;
+
+        final step = applyCatchUpPage(
+          current: messages,
+          page: previous,
+          pageSize: pageSize,
+        );
+
+        setState(() {
+          messages = step.messages;
+          hasMoreMessages = step.isFull;
+        });
+
+        final nextCursor = step.nextCursor;
+        if (nextCursor != null) {
+          cursor = nextCursor;
+        }
+
+        lastPageWasFull = step.isFull;
+        if (!lastPageWasFull) {
+          return;
+        }
+      }
+    } catch (_) {
+      // Молча игнорируем ошибку отдельной страницы докачки: уже загруженная
+      // часть истории уже отображена, а попытка повторится по кнопке
+      // "Повторить" ниже или при следующем переподключении.
+      return;
+    }
+
+    if (!mounted || selectedChannelId != channelId) return;
+
+    showErrorSnackBar(
+      context,
+      'Не удалось полностью восстановить историю сообщений после '
+      'переподключения',
+      action: SnackBarAction(
+        label: 'Повторить',
+        onPressed: () => unawaited(_retryCatchUpBefore(channelId, cursor)),
+      ),
+    );
+  }
+
+  // Отдельная обёртка для кнопки "Повторить" докачки НАЗАД — тот же guard,
+  // что и у handleRealtimeReconnected/_retryCatchUp, чтобы повторный реконнект
+  // не запустил параллельный цикл докачки для того же канала.
+  Future<void> _retryCatchUpBefore(String channelId, String cursor) async {
+    if (_reconnectCatchUpInProgress) return;
+
+    _reconnectCatchUpInProgress = true;
+    try {
+      await _catchUpMessagesBefore(channelId, cursor);
     } finally {
       _reconnectCatchUpInProgress = false;
     }
@@ -6137,6 +6336,55 @@ List<AppMessage> mergeMessagesChronologically(
     });
 
   return merged;
+}
+
+// Результат применения одной докачанной страницы истории (вперёд или назад)
+// к текущему списку сообщений канала: обновлённый (слитый и
+// отсортированный через mergeMessagesChronologically) список, курсор для
+// следующей страницы (null, если страница была пустой — курсор не
+// продвигаем) и признак того, что страница была полной (== pageSize, значит,
+// вероятно, есть ещё не загруженные сообщения и докачку нужно продолжать).
+// Чистая функция без побочных эффектов и сети, поэтому тестируется без
+// виджетов: вызывающий код сам отвечает за setState и обязан передавать
+// актуальный [current] перед каждым вызовом, чтобы не потерять сообщение,
+// пришедшее по realtime во время докачки (см. _catchUpMessagesBefore).
+class CatchUpPageStep {
+  CatchUpPageStep({
+    required this.messages,
+    required this.nextCursor,
+    required this.isFull,
+  });
+
+  final List<AppMessage> messages;
+  final String? nextCursor;
+  final bool isFull;
+}
+
+CatchUpPageStep applyCatchUpPage({
+  required List<AppMessage> current,
+  required List<AppMessage> page,
+  required int pageSize,
+}) {
+  final isFull = page.length >= pageSize;
+
+  if (page.isEmpty) {
+    return CatchUpPageStep(
+      messages: current,
+      nextCursor: null,
+      isFull: isFull,
+    );
+  }
+
+  return CatchUpPageStep(
+    messages: mergeMessagesChronologically(current, page),
+    // Для курсора `before` следующая страница должна начинаться раньше
+    // самого старого сообщения из уже полученных — это первый элемент
+    // страницы, т.к. getMessages возвращает сообщения в хронологическом
+    // порядке (см. backend-пагинацию и использование `before` в
+    // loadMoreMessages).
+    nextCursor: page.first.id,
+    isFull: isFull,
+  );
 }
 
 Color? parseHexColor(String? hex) {
