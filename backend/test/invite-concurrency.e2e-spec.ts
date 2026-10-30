@@ -85,7 +85,9 @@ describe('invite join concurrency (e2e)', () => {
 
   it('maxUses=1: exactly 1 of 5 concurrent different users succeeds', async () => {
     const owner = await user(`owner1-${Date.now()}`);
-    const { serverId, code } = await createServerAndInvite(owner, { maxUses: 1 });
+    const { serverId, code } = await createServerAndInvite(owner, {
+      maxUses: 1,
+    });
 
     const joiners = await Promise.all(
       Array.from({ length: 5 }, (_, i) => user(`joiner1-${i}-${Date.now()}`)),
@@ -115,7 +117,9 @@ describe('invite join concurrency (e2e)', () => {
 
   it('maxUses=3: exactly 3 of 7 concurrent different users succeed', async () => {
     const owner = await user(`owner3-${Date.now()}`);
-    const { serverId, code } = await createServerAndInvite(owner, { maxUses: 3 });
+    const { serverId, code } = await createServerAndInvite(owner, {
+      maxUses: 3,
+    });
 
     const joiners = await Promise.all(
       Array.from({ length: 7 }, (_, i) => user(`joiner3-${i}-${Date.now()}`)),
@@ -143,7 +147,9 @@ describe('invite join concurrency (e2e)', () => {
   it('existing member re-joining succeeds without a second ServerMember or extra currentUses', async () => {
     const owner = await user(`ownerR-${Date.now()}`);
     const member = await user(`memberR-${Date.now()}`);
-    const { serverId, code } = await createServerAndInvite(owner, { maxUses: 5 });
+    const { serverId, code } = await createServerAndInvite(owner, {
+      maxUses: 5,
+    });
 
     await joinAttempt(member.token, code).expect(201);
     await joinAttempt(member.token, code).expect(201);
@@ -157,9 +163,31 @@ describe('invite join concurrency (e2e)', () => {
     expect(memberCount).toBe(1);
   }, 20000);
 
+  it('already joined member can repeat an exhausted invite without another use', async () => {
+    const owner = await user(`ownerFull-${Date.now()}`);
+    const member = await user(`memberFull-${Date.now()}`);
+    const { serverId, code } = await createServerAndInvite(owner, {
+      maxUses: 1,
+    });
+
+    await joinAttempt(member.token, code).expect(201);
+    await joinAttempt(member.token, code).expect(201);
+
+    expect(
+      (await prisma.invite.findUnique({ where: { code } }))?.currentUses,
+    ).toBe(1);
+    expect(
+      await prisma.serverMember.count({
+        where: { serverId, userId: member.id },
+      }),
+    ).toBe(1);
+  }, 20000);
+
   it('same new user firing 2 parallel joins: both resolve 2xx, 1 ServerMember, currentUses +1', async () => {
     const owner = await user(`ownerP-${Date.now()}`);
-    const { serverId, code } = await createServerAndInvite(owner, { maxUses: 5 });
+    const { serverId, code } = await createServerAndInvite(owner, {
+      maxUses: 5,
+    });
     const joiner = await user(`joinerP-${Date.now()}`);
 
     const [res1, res2] = await Promise.all([
@@ -205,9 +233,65 @@ describe('invite join concurrency (e2e)', () => {
     expect(memberCount).toBe(0);
   }, 15000);
 
+  it('expires while a join waits for the invite row lock', async () => {
+    const owner = await user(`ownerWait-${Date.now()}`);
+    const joiner = await user(`joinerWait-${Date.now()}`);
+    const expiresAt = new Date(Date.now() + 2_000);
+    const { serverId, code } = await createServerAndInvite(owner, {
+      expiresAt: expiresAt.toISOString(),
+    });
+    let release!: () => void;
+    let locked!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const lockReady = new Promise<void>((resolve) => (locked = resolve));
+    const holder = prisma.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT "id" FROM "invites" WHERE "code" = ${code} FOR UPDATE`;
+        locked();
+        await gate;
+      },
+      { timeout: 15_000 },
+    );
+    await lockReady;
+
+    try {
+      let settled = false;
+      const pending = joinAttempt(joiner.token, code).then((response) => {
+        settled = true;
+        return response;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(settled).toBe(false);
+      await new Promise((resolve) =>
+        setTimeout(
+          resolve,
+          Math.max(0, expiresAt.getTime() - Date.now() + 100),
+        ),
+      );
+      release();
+      await holder;
+      const response = await pending;
+      expect(response.status).toBe(400);
+      expect((response.body as { message: string }).message).toMatch(/истёк/i);
+      expect(
+        (await prisma.invite.findUnique({ where: { code } }))?.currentUses,
+      ).toBe(0);
+      expect(
+        await prisma.serverMember.count({
+          where: { serverId, userId: joiner.id },
+        }),
+      ).toBe(0);
+    } finally {
+      release();
+      await holder;
+    }
+  }, 20_000);
+
   it('banned user: 403 even when limit is not exhausted', async () => {
     const owner = await user(`ownerB-${Date.now()}`);
-    const { serverId, code } = await createServerAndInvite(owner, { maxUses: 5 });
+    const { serverId, code } = await createServerAndInvite(owner, {
+      maxUses: 5,
+    });
     const banned = await user(`joinerB-${Date.now()}`);
 
     await prisma.serverBan.create({
@@ -227,7 +311,9 @@ describe('invite join concurrency (e2e)', () => {
   // "serverBan exists => serverMember doesn't" must hold afterwards.
   it('concurrent ban + join for the same user never leaves them banned and still a member', async () => {
     const owner = await user(`ownerX-${Date.now()}`);
-    const { serverId, code } = await createServerAndInvite(owner, { maxUses: 5 });
+    const { serverId, code } = await createServerAndInvite(owner, {
+      maxUses: 5,
+    });
     const target = await user(`joinerX-${Date.now()}`);
 
     const [joinRes, banRes] = await Promise.all([
@@ -250,5 +336,8 @@ describe('invite join concurrency (e2e)', () => {
       where: { serverId_userId: { serverId, userId: target.id } },
     });
     expect(member).toBeNull();
+    expect(
+      (await prisma.invite.findUnique({ where: { code } }))?.currentUses,
+    ).toBe(joinRes.status === 201 ? 1 : 0);
   }, 20000);
 });

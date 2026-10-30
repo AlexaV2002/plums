@@ -1,10 +1,11 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { ChannelType } from '@prisma/client';
+import { ChannelType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateMessageDto } from './dto/create-message.dto';
 import { MessagesGateway } from './messages.gateway';
@@ -98,28 +99,79 @@ export class MessagesService {
       throw new ForbiddenException('В этом канале нельзя отправлять сообщения');
     }
 
-    const message = await this.prisma.message.create({
-      data: {
-        channelId,
-        authorId: userId,
-        content: dto.content,
-      },
-      include: {
-        author: {
-          select: {
-            id: true,
-            username: true,
-            email: true,
-            avatarUrl: true,
-            status: true,
+    const clientMessageId = dto.clientMessageId;
+    const findExisting = (id: string) =>
+      this.prisma.message.findUnique({
+        where: {
+          authorId_channelId_clientMessageId: {
+            authorId: userId,
+            channelId,
+            clientMessageId: id,
           },
         },
-      },
-    });
+        include: {
+          author: {
+            select: {
+              id: true,
+              username: true,
+              avatarUrl: true,
+              status: true,
+            },
+          },
+        },
+      });
+    const returnExisting = async (id: string) => {
+      const existing = await findExisting(id);
+      if (!existing) return null;
+      if (existing.content !== dto.content || existing.deletedAt) {
+        throw new ConflictException(
+          'Идентификатор уже использован для другого или удалённого сообщения',
+        );
+      }
+      return existing;
+    };
 
-    this.messagesGateway.emitMessageNew(channelId, message);
+    if (clientMessageId) {
+      const existing = await returnExisting(clientMessageId);
+      if (existing) return existing;
+    }
 
-    return message;
+    try {
+      const message = await this.prisma.message.create({
+        data: {
+          channelId,
+          authorId: userId,
+          clientMessageId,
+          content: dto.content,
+        },
+        include: {
+          author: {
+            select: {
+              id: true,
+              username: true,
+              avatarUrl: true,
+              status: true,
+            },
+          },
+        },
+      });
+
+      this.messagesGateway.emitMessageNew(channelId, message);
+      return message;
+    } catch (error) {
+      if (
+        !clientMessageId ||
+        !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+        error.code !== 'P2002'
+      ) {
+        throw error;
+      }
+      // При двух одновременных POST уникальный индекс пропускает только один.
+      // Проигравший запрос возвращает ту же запись без повторного события.
+      const existing = await returnExisting(clientMessageId);
+      if (existing) return existing;
+      throw error;
+    }
   }
 
   async findByChannel(
@@ -151,8 +203,18 @@ export class MessagesService {
     }
 
     let cursorFilter:
-      | { OR: [{ createdAt: { lt: Date } }, { createdAt: Date; id: { lt: string } }] }
-      | { OR: [{ createdAt: { gt: Date } }, { createdAt: Date; id: { gt: string } }] }
+      | {
+          OR: [
+            { createdAt: { lt: Date } },
+            { createdAt: Date; id: { lt: string } },
+          ];
+        }
+      | {
+          OR: [
+            { createdAt: { gt: Date } },
+            { createdAt: Date; id: { gt: string } },
+          ];
+        }
       | undefined;
 
     if (options?.before) {
@@ -208,7 +270,6 @@ export class MessagesService {
           select: {
             id: true,
             username: true,
-            email: true,
             avatarUrl: true,
             status: true,
           },
@@ -286,7 +347,6 @@ export class MessagesService {
           select: {
             id: true,
             username: true,
-            email: true,
             avatarUrl: true,
             status: true,
           },

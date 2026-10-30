@@ -14,7 +14,6 @@ const publicUserSelect = {
   id: true,
   username: true,
   avatarUrl: true,
-  status: true,
 };
 
 const conversationInclude = {
@@ -22,10 +21,7 @@ const conversationInclude = {
   userBPeer: { select: publicUserSelect },
   messages: {
     where: { deletedAt: null },
-    orderBy: [
-      { createdAt: 'desc' as const },
-      { id: 'desc' as const },
-    ],
+    orderBy: [{ createdAt: 'desc' as const }, { id: 'desc' as const }],
     take: 1,
     select: {
       id: true,
@@ -111,7 +107,12 @@ export class DmService {
     const limit = options?.limit ?? 50;
 
     let cursorFilter:
-      | { OR: [{ createdAt: { lt: Date } }, { createdAt: Date; id: { lt: string } }] }
+      | {
+          OR: [
+            { createdAt: { lt: Date } },
+            { createdAt: Date; id: { lt: string } },
+          ];
+        }
       | undefined;
 
     if (options?.before) {

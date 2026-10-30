@@ -111,6 +111,7 @@ export class UsersGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private readonly connectionsByUser = new Map<string, number>();
   private readonly expiryTimers = new WeakMap<Socket, NodeJS.Timeout>();
   private readonly operations = new WeakMap<Socket, Promise<void>>();
+  private readonly statusOperationsByUser = new Map<string, Promise<void>>();
   private readonly logger = new Logger(UsersGateway.name);
 
   constructor(
@@ -162,7 +163,7 @@ export class UsersGateway implements OnGatewayConnection, OnGatewayDisconnect {
       this.connectionsByUser.set(result.userId, connections + 1);
       this.setIdentity(client, result.userId, result.expiresAt);
       if (connections === 0) {
-        await this.updateAndEmitStatus(result.userId, 'ONLINE');
+        await this.queuePresenceUpdate(result.userId);
       }
       if (
         !isDisconnected(client) &&
@@ -181,8 +182,37 @@ export class UsersGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
   }
 
-  emitUserStatus(userId: string, status: UserStatus) {
-    this.server.emit('user:status', { userId, status });
+  async emitUserStatus(userId: string, status: UserStatus) {
+    // Статус виден только самому пользователю и участникам общих серверов.
+    // Проверяем членство непосредственно перед отправкой каждому сокету;
+    // повторная проверка identity исключает доставку после смены аккаунта.
+    for (const socket of this.server.sockets.sockets.values()) {
+      const identity = getActiveSocketIdentity(socket);
+      if (!identity) continue;
+
+      let visible = identity.userId === userId;
+      if (!visible) {
+        try {
+          visible = Boolean(
+            await this.prisma.serverMember.findFirst({
+              where: {
+                userId: identity.userId,
+                server: { members: { some: { userId } } },
+              },
+              select: { id: true },
+            }),
+          );
+        } catch {
+          // Ошибка проверки одного получателя не должна превращать уже
+          // сохранённое изменение статуса в ошибочный ответ REST/identify.
+          this.logger.warn('Не удалось проверить доступ к событию user:status');
+          continue;
+        }
+      }
+      if (visible && isSocketIdentityCurrent(socket, identity)) {
+        socket.emit('user:status', { userId, status });
+      }
+    }
   }
 
   private async updateAndEmitStatus(userId: string, status: UserStatus) {
@@ -195,7 +225,7 @@ export class UsersGateway implements OnGatewayConnection, OnGatewayDisconnect {
       },
     });
 
-    this.emitUserStatus(userId, status);
+    await this.emitUserStatus(userId, status);
   }
 
   private async verifyToken(
@@ -286,7 +316,27 @@ export class UsersGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
     this.connectionsByUser.delete(userId);
-    await this.updateAndEmitStatus(userId, 'OFFLINE');
+    await this.queuePresenceUpdate(userId);
+  }
+
+  private queuePresenceUpdate(userId: string) {
+    const previous =
+      this.statusOperationsByUser.get(userId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        const status =
+          (this.connectionsByUser.get(userId) ?? 0) > 0 ? 'ONLINE' : 'OFFLINE';
+        await this.updateAndEmitStatus(userId, status);
+      });
+    this.statusOperationsByUser.set(userId, next);
+    const cleanup = () => {
+      if (this.statusOperationsByUser.get(userId) === next) {
+        this.statusOperationsByUser.delete(userId);
+      }
+    };
+    void next.then(cleanup, cleanup);
+    return next;
   }
 
   private enqueue(client: Socket, task: () => Promise<void>) {

@@ -9,8 +9,14 @@ describe('server room revocation', () => {
   const prisma = {
     serverMember: { findUnique: jest.fn(), delete: jest.fn() },
     serverBan: { findUnique: jest.fn(), create: jest.fn() },
+    $queryRaw: jest.fn(),
     $transaction: jest.fn(),
   };
+  // Отдельная строка (а не ссылка на `prisma` в его же инициализаторе) —
+  // иначе TS не может вывести тип `prisma` и он становится `any`.
+  prisma.$transaction.mockImplementation((callback: (tx: unknown) => unknown) =>
+    callback(prisma),
+  );
   const permissions = {
     getServerOrThrow: jest
       .fn()

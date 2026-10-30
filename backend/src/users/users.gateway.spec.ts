@@ -16,7 +16,11 @@ type MockSocket = {
 describe('UsersGateway', () => {
   let gateway: UsersGateway;
   let jwtService: { verifyAsync: jest.Mock };
-  let prisma: { user: { update: jest.Mock } };
+  let prisma: {
+    user: { update: jest.Mock };
+    serverMember: { findFirst: jest.Mock };
+  };
+  let sockets: Map<string, MockSocket>;
 
   function createSocket(): MockSocket {
     const socket: MockSocket = {
@@ -38,7 +42,11 @@ describe('UsersGateway', () => {
 
   beforeEach(async () => {
     jwtService = { verifyAsync: jest.fn() };
-    prisma = { user: { update: jest.fn().mockResolvedValue({}) } };
+    prisma = {
+      user: { update: jest.fn().mockResolvedValue({}) },
+      serverMember: { findFirst: jest.fn().mockResolvedValue(null) },
+    };
+    sockets = new Map();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -49,7 +57,73 @@ describe('UsersGateway', () => {
     }).compile();
 
     gateway = module.get<UsersGateway>(UsersGateway);
-    gateway.server = { emit: jest.fn() } as never;
+    gateway.server = { sockets: { sockets }, emit: jest.fn() } as never;
+  });
+
+  describe('user:status privacy', () => {
+    function identifiedSocket(userId: string) {
+      const socket = createSocket();
+      socket.data = {
+        userId,
+        authExpiresAt: Date.now() + 60_000,
+        identityVersion: 1,
+      };
+      return socket;
+    }
+
+    it('sends only to the user and members of a common server', async () => {
+      const owner = identifiedSocket('subject');
+      const sharedFirst = identifiedSocket('shared');
+      const sharedSecond = identifiedSocket('shared');
+      const stranger = identifiedSocket('stranger');
+      const anonymous = createSocket();
+      [owner, sharedFirst, sharedSecond, stranger, anonymous].forEach(
+        (socket, index) => sockets.set(String(index), socket),
+      );
+      prisma.serverMember.findFirst.mockImplementation(
+        ({ where }: { where: { userId: string } }) =>
+          where.userId === 'shared' ? { id: 'membership' } : null,
+      );
+
+      await gateway.emitUserStatus('subject', 'ONLINE');
+
+      for (const socket of [owner, sharedFirst, sharedSecond]) {
+        expect(socket.emit).toHaveBeenCalledWith('user:status', {
+          userId: 'subject',
+          status: 'ONLINE',
+        });
+      }
+      expect(stranger.emit).not.toHaveBeenCalled();
+      expect(anonymous.emit).not.toHaveBeenCalled();
+    });
+
+    it('stops delivery after membership loss or account switch during lookup', async () => {
+      const socket = identifiedSocket('shared');
+      sockets.set('one', socket);
+      prisma.serverMember.findFirst
+        .mockResolvedValueOnce({ id: 'membership' })
+        .mockResolvedValueOnce(null);
+
+      await gateway.emitUserStatus('subject', 'ONLINE');
+      socket.emit.mockClear();
+      await gateway.emitUserStatus('subject', 'OFFLINE');
+      expect(socket.emit).not.toHaveBeenCalled();
+
+      let releaseLookup!: (value: { id: string }) => void;
+      prisma.serverMember.findFirst.mockImplementationOnce(
+        () =>
+          new Promise<{ id: string }>((resolve) => {
+            releaseLookup = resolve;
+          }),
+      );
+      const pending = gateway.emitUserStatus('subject', 'ONLINE');
+      await new Promise((resolve) => setImmediate(resolve));
+      socket.data.userId = 'stranger';
+      socket.data.identityVersion = 2;
+      releaseLookup({ id: 'membership' });
+      await pending;
+      expect(socket.emit).not.toHaveBeenCalled();
+    });
   });
 
   describe('presence:identify', () => {
@@ -99,6 +173,60 @@ describe('UsersGateway', () => {
 
       // Счётчик подключений не дублируется, статус не переписывается.
       expect(prisma.user.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps a user online while another device is still connected', async () => {
+      jwtService.verifyAsync.mockResolvedValue({
+        sub: 'user-1',
+        email: 'user-1@plums.test',
+        exp: Date.now() / 1000 + 60,
+      });
+      const first = createSocket();
+      const second = createSocket();
+      await gateway.identify({ token: 'valid' }, first as never, jest.fn());
+      await gateway.identify({ token: 'valid' }, second as never, jest.fn());
+      await gateway.handleDisconnect(first as never);
+      expect(prisma.user.update).toHaveBeenCalledTimes(1);
+      await gateway.handleDisconnect(second as never);
+      expect(prisma.user.update).toHaveBeenLastCalledWith(
+        expect.objectContaining({ data: { status: 'OFFLINE' } }),
+      );
+    });
+
+    it('serializes OFFLINE then ONLINE when reconnect races with disconnect', async () => {
+      jwtService.verifyAsync.mockResolvedValue({
+        sub: 'user-1',
+        email: 'user-1@plums.test',
+        exp: Date.now() / 1000 + 60,
+      });
+      const first = createSocket();
+      await gateway.identify({ token: 'valid' }, first as never, jest.fn());
+
+      let releaseOffline!: () => void;
+      const offlineGate = new Promise<void>((resolve) => {
+        releaseOffline = resolve;
+      });
+      prisma.user.update.mockImplementation(
+        ({ data }: { data: { status: string } }) =>
+          data.status === 'OFFLINE' ? offlineGate : Promise.resolve({}),
+      );
+      const disconnect = gateway.handleDisconnect(first as never);
+      await new Promise((resolve) => setImmediate(resolve));
+      const second = createSocket();
+      const secondAck = jest.fn();
+      const reconnect = gateway.identify(
+        { token: 'valid' },
+        second as never,
+        secondAck,
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      releaseOffline();
+      await Promise.all([disconnect, reconnect]);
+
+      expect(secondAck).toHaveBeenCalledWith({ userId: 'user-1' });
+      expect(
+        prisma.user.update.mock.calls.map(([args]) => args.data.status),
+      ).toEqual(['ONLINE', 'OFFLINE', 'ONLINE']);
     });
 
     it('should signal an invalid token and not acknowledge', async () => {

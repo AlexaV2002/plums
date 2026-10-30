@@ -322,7 +322,9 @@ describe('realtime access (e2e)', () => {
     reconnected.emit('server:join', { serverId });
     expect(await reconnected.event('server:error')).toMatchObject({ serverId });
     reconnected.emit('channel:join', { channelId });
-    expect(await reconnected.event('channel:error')).toMatchObject({ channelId });
+    expect(await reconnected.event('channel:error')).toMatchObject({
+      channelId,
+    });
 
     await request(app.getHttpServer())
       .post(`/channels/${channelId}/messages`)
@@ -330,5 +332,73 @@ describe('realtime access (e2e)', () => {
       .send({ content: 'after ban' })
       .expect(201);
     await reconnected.expectNoEvent('message:new');
+  }, 30000);
+
+  it('keeps email private in member, message, ban and realtime payloads', async () => {
+    const owner = await user('privacy-owner');
+    const member = await user('privacy-member');
+    const auth = (token: string) => ({ Authorization: `Bearer ${token}` });
+    const server = await request(app.getHttpServer())
+      .post('/servers')
+      .set(auth(owner.token))
+      .send({ name: 'Privacy smoke' })
+      .expect(201);
+    const serverId = (server.body as { id: string }).id;
+    const channel = await request(app.getHttpServer())
+      .post(`/servers/${serverId}/channels`)
+      .set(auth(owner.token))
+      .send({ name: 'general' })
+      .expect(201);
+    const channelId = (channel.body as { id: string }).id;
+    await prisma.serverMember.create({ data: { serverId, userId: member.id } });
+
+    const detail = await request(app.getHttpServer())
+      .get(`/servers/${serverId}`)
+      .set(auth(owner.token))
+      .expect(200);
+    const members = await request(app.getHttpServer())
+      .get(`/servers/${serverId}/members`)
+      .set(auth(owner.token))
+      .expect(200);
+    expect(
+      (detail.body as { members: Array<{ user: object }> }).members[0].user,
+    ).not.toHaveProperty('email');
+    expect(
+      (members.body as Array<{ user: object }>)[0].user,
+    ).not.toHaveProperty('email');
+
+    const socket = await SocketProbe.connect(port);
+    probes.push(socket);
+    await socket.identify(member.token);
+    socket.emit('channel:join', { channelId });
+    await waitForRoom(`channel:${channelId}`, member.id, true);
+    const sent = await request(app.getHttpServer())
+      .post(`/channels/${channelId}/messages`)
+      .set(auth(owner.token))
+      .send({ content: 'private author data' })
+      .expect(201);
+    expect((sent.body as { author: object }).author).not.toHaveProperty(
+      'email',
+    );
+    const realtime = (await socket.event('message:new')) as { author: object };
+    expect(realtime.author).not.toHaveProperty('email');
+
+    const me = await request(app.getHttpServer())
+      .get('/users/me')
+      .set(auth(owner.token))
+      .expect(200);
+    expect(me.body).toHaveProperty('email');
+    await request(app.getHttpServer())
+      .post(`/servers/${serverId}/bans/${member.id}`)
+      .set(auth(owner.token))
+      .send({ reason: 'privacy test' })
+      .expect(201);
+    const bans = await request(app.getHttpServer())
+      .get(`/servers/${serverId}/bans`)
+      .set(auth(owner.token))
+      .expect(200);
+    expect((bans.body as Array<{ user: object }>)[0].user).not.toHaveProperty(
+      'email',
+    );
   }, 30000);
 });

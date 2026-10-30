@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
@@ -591,11 +592,15 @@ class ApiClient {
   Future<AppMessage> sendMessage({
     required String channelId,
     required String content,
+    String? clientMessageId,
   }) async {
     final response = await dio.post(
       '/channels/$channelId/messages',
       options: authOptions,
-      data: {'content': content},
+      data: {
+        'content': content,
+        'clientMessageId': ?clientMessageId,
+      },
     );
 
     return AppMessage.fromJson(response.data as Map<String, dynamic>);
@@ -1639,6 +1644,7 @@ class _MainShellState extends State<MainShell> {
   bool hasMoreMessages = false;
   bool isLoadingMoreMessages = false;
   String? errorMessage;
+  String? messagesError;
 
   // Защита от параллельного запуска докачки пропущенных сообщений: если
   // соединение мигает (упало-поднялось несколько раз подряд), не даём
@@ -2024,6 +2030,7 @@ class _MainShellState extends State<MainShell> {
     setState(() {
       messages = step.messages;
       hasMoreMessages = step.isFull;
+      messagesError = null;
     });
 
     final nextCursor = step.nextCursor;
@@ -2621,7 +2628,7 @@ class _MainShellState extends State<MainShell> {
         members = loadedMembers;
         serverRoles = loadedRoles;
         selectedChannelId = firstChannel?.id;
-        messages = loadedMessages;
+        messages = mergeMessagesChronologically(messages, loadedMessages);
         hasMoreMessages = loadedMessages.length >= 50;
         isLoading = false;
       });
@@ -2721,6 +2728,7 @@ class _MainShellState extends State<MainShell> {
       isMessagesLoading = channel.type == ChannelType.text;
       hasMoreMessages = false;
       errorMessage = null;
+      messagesError = null;
     });
 
     if (channel.type == ChannelType.voice) {
@@ -2746,6 +2754,7 @@ class _MainShellState extends State<MainShell> {
         messages = loadedMessages;
         hasMoreMessages = loadedMessages.length >= pageSize;
         isMessagesLoading = false;
+        messagesError = null;
       });
       _scrollMessagesToBottom();
       syncRealtimeChannel(channel);
@@ -2759,9 +2768,10 @@ class _MainShellState extends State<MainShell> {
       if (!mounted || selectedChannelId != channelId) return;
 
       setState(() {
-        errorMessage = 'Ошибка загрузки сообщений: ${describeRequestError(error)}';
+        messagesError = 'Ошибка загрузки сообщений: ${describeRequestError(error)}';
         isMessagesLoading = false;
       });
+      syncRealtimeChannel(channel);
       // Реконнект мог прийти во время этой первоначальной загрузки и быть
       // отложен из-за isMessagesLoading — если загрузка упала с ошибкой,
       // отложенный запрос нельзя оставлять висеть до случайного следующего
@@ -2771,9 +2781,10 @@ class _MainShellState extends State<MainShell> {
       if (!mounted || selectedChannelId != channelId) return;
 
       setState(() {
-        errorMessage = 'Не удалось загрузить сообщения: ${describeRequestError(error)}';
+        messagesError = 'Не удалось загрузить сообщения: ${describeRequestError(error)}';
         isMessagesLoading = false;
       });
+      syncRealtimeChannel(channel);
       await _flushPendingReconnectSync();
     }
   }
@@ -3275,12 +3286,8 @@ class _MainShellState extends State<MainShell> {
   // Возвращает true, если сообщение подтверждено backend и добавлено в
   // messages, и false при любой ошибке (уже показанной пользователю здесь же
   // через describeRequestError) — вызывающий код (MessageInput) решает, можно
-  // ли очищать поле ввода. Известное ограничение: без server-side
-  // idempotency-ключа повторная отправка после разрыва связи, при котором
-  // сообщение реально дошло до backend, но ответ не вернулся клиенту, создаст
-  // дубликат на сервере — это требует минимального изменения backend и не
-  // входит в эту задачу.
-  Future<bool> sendMessage(String content) async {
+  // ли очищать поле ввода. Повторная попытка использует тот же clientMessageId.
+  Future<bool> sendMessage(String content, String clientMessageId) async {
     final channelId = selectedChannelId;
 
     if (channelId == null) {
@@ -3291,9 +3298,10 @@ class _MainShellState extends State<MainShell> {
       final sentMessage = await apiClient.sendMessage(
         channelId: channelId,
         content: content,
+        clientMessageId: clientMessageId,
       );
 
-      if (!mounted) return true;
+      if (!mounted || selectedChannelId != channelId) return true;
 
       setState(() {
         if (messages.any((item) => item.id == sentMessage.id)) {
@@ -4089,6 +4097,7 @@ class _MainShellState extends State<MainShell> {
                     channel: selectedChannel,
                     messages: messages,
                     isMessagesLoading: isMessagesLoading,
+                    messagesError: messagesError,
                     hasMoreMessages: hasMoreMessages,
                     isLoadingMoreMessages: isLoadingMoreMessages,
                     canSendMessages: canSendMessages,
@@ -4098,6 +4107,7 @@ class _MainShellState extends State<MainShell> {
                     onDeleteMessage: deleteMessage,
                     onShowMembers: showMembers,
                     onLoadMoreMessages: loadMoreMessages,
+                    onRetryMessages: () => selectChannel(selectedChannel.id),
                   ),
           ),
           if (selectedServer != null)
@@ -4889,6 +4899,7 @@ class ChatArea extends StatelessWidget {
     required this.channel,
     required this.messages,
     required this.isMessagesLoading,
+    required this.messagesError,
     required this.hasMoreMessages,
     required this.isLoadingMoreMessages,
     required this.canSendMessages,
@@ -4898,20 +4909,24 @@ class ChatArea extends StatelessWidget {
     required this.onDeleteMessage,
     required this.onShowMembers,
     required this.onLoadMoreMessages,
+    required this.onRetryMessages,
   });
 
   final AppChannel channel;
   final List<AppMessage> messages;
   final bool isMessagesLoading;
+  final String? messagesError;
   final bool hasMoreMessages;
   final bool isLoadingMoreMessages;
   final bool canSendMessages;
   final ScrollController messagesScrollController;
-  final Future<bool> Function(String content) onSendMessage;
+  final Future<bool> Function(String content, String clientMessageId)
+  onSendMessage;
   final ValueChanged<AppMessage> onEditMessage;
   final ValueChanged<AppMessage> onDeleteMessage;
   final VoidCallback onShowMembers;
   final VoidCallback onLoadMoreMessages;
+  final VoidCallback onRetryMessages;
 
   @override
   Widget build(BuildContext context) {
@@ -4928,6 +4943,25 @@ class ChatArea extends StatelessWidget {
                             color: Color(0xFF8D5CFF),
                           ),
                         )
+                      : messagesError != null
+                      ? Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                messagesError!,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: Color(0xFFFF7A7A),
+                                ),
+                              ),
+                              TextButton(
+                                onPressed: onRetryMessages,
+                                child: const Text('Повторить загрузку'),
+                              ),
+                            ],
+                          ),
+                        )
                       : MessagesList(
                           messages: messages,
                           hasMoreMessages: hasMoreMessages,
@@ -4941,8 +4975,9 @@ class ChatArea extends StatelessWidget {
           ),
           if (channel.type == ChannelType.text)
             MessageInput(
+              channelId: channel.id,
               channelName: channel.name,
-              canSendMessages: canSendMessages,
+              canSendMessages: canSendMessages && messagesError == null,
               onSendMessage: onSendMessage,
             ),
         ],
@@ -5441,17 +5476,43 @@ class MessageBubble extends StatelessWidget {
   }
 }
 
+String _newClientMessageId() {
+  final random = Random.secure();
+  final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  final hex = bytes.map((byte) => byte.toRadixString(16).padLeft(2, '0')).join();
+  return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-'
+      '${hex.substring(12, 16)}-${hex.substring(16, 20)}-'
+      '${hex.substring(20)}';
+}
+
+class _MessageDraft {
+  const _MessageDraft(
+    this.text,
+    this.pendingContent,
+    this.pendingClientMessageId,
+  );
+
+  final String text;
+  final String? pendingContent;
+  final String? pendingClientMessageId;
+}
+
 class MessageInput extends StatefulWidget {
   const MessageInput({
     super.key,
+    required this.channelId,
     required this.channelName,
     required this.canSendMessages,
     required this.onSendMessage,
   });
 
+  final String channelId;
   final String channelName;
   final bool canSendMessages;
-  final Future<bool> Function(String content) onSendMessage;
+  final Future<bool> Function(String content, String clientMessageId)
+  onSendMessage;
 
   @override
   State<MessageInput> createState() => _MessageInputState();
@@ -5460,6 +5521,25 @@ class MessageInput extends StatefulWidget {
 class _MessageInputState extends State<MessageInput> {
   final TextEditingController controller = TextEditingController();
   bool isSending = false;
+  String? pendingContent;
+  String? pendingClientMessageId;
+  final Map<String, _MessageDraft> draftsByChannel = {};
+
+  @override
+  void didUpdateWidget(covariant MessageInput oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.channelId != widget.channelId) {
+      draftsByChannel[oldWidget.channelId] = _MessageDraft(
+        controller.text,
+        pendingContent,
+        pendingClientMessageId,
+      );
+      final draft = draftsByChannel[widget.channelId];
+      controller.text = draft?.text ?? '';
+      pendingContent = draft?.pendingContent;
+      pendingClientMessageId = draft?.pendingClientMessageId;
+    }
+  }
 
   @override
   void dispose() {
@@ -5474,6 +5554,13 @@ class _MessageInputState extends State<MessageInput> {
       return;
     }
 
+    final channelId = widget.channelId;
+    if (pendingContent != text || pendingClientMessageId == null) {
+      pendingContent = text;
+      pendingClientMessageId = _newClientMessageId();
+    }
+    final clientMessageId = pendingClientMessageId!;
+
     setState(() {
       isSending = true;
     });
@@ -5481,10 +5568,18 @@ class _MessageInputState extends State<MessageInput> {
     try {
       // sendMessage сам показывает snackbar при ошибке и не бросает
       // исключения — здесь только решаем, очищать ли поле ввода.
-      final sent = await widget.onSendMessage(text);
+      final sent = await widget.onSendMessage(text, clientMessageId);
 
-      if (sent) {
+      if (sent &&
+          mounted &&
+          widget.channelId == channelId &&
+          controller.text.trim() == text) {
         controller.clear();
+        pendingContent = null;
+        pendingClientMessageId = null;
+        draftsByChannel.remove(channelId);
+      } else if (sent && widget.channelId != channelId) {
+        draftsByChannel.remove(channelId);
       }
     } finally {
       if (mounted) {
@@ -6344,15 +6439,6 @@ Future<void> showServerMembersDialog({
                                     fontWeight: FontWeight.w800,
                                   ),
                                 ),
-                                const SizedBox(height: 3),
-                                Text(
-                                  user.email,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    color: Color(0xFF8F849F),
-                                    fontSize: 12,
-                                  ),
-                                ),
                               ],
                             ),
                           ),
@@ -6471,7 +6557,7 @@ Future<void> showServerBansDialog({
                                     Text(
                                       ban.reason?.isNotEmpty == true
                                           ? ban.reason!
-                                          : user.email,
+                                          : 'Причина не указана',
                                       overflow: TextOverflow.ellipsis,
                                       style: const TextStyle(
                                         color: Color(0xFF8F849F),
@@ -7088,7 +7174,7 @@ class AppUser {
   const AppUser({
     required this.id,
     required this.username,
-    required this.email,
+    this.email,
     this.avatarUrl,
     this.bio,
     required this.status,
@@ -7096,7 +7182,7 @@ class AppUser {
 
   final String id;
   final String username;
-  final String email;
+  final String? email;
   final String? avatarUrl;
   final String? bio;
   final String status;
@@ -7105,10 +7191,10 @@ class AppUser {
     return AppUser(
       id: json['id'] as String,
       username: json['username'] as String,
-      email: json['email'] as String,
+      email: json['email'] as String?,
       avatarUrl: json['avatarUrl'] as String?,
       bio: json['bio'] as String?,
-      status: json['status'] as String,
+      status: json['status'] as String? ?? 'OFFLINE',
     );
   }
 

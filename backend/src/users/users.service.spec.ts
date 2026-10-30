@@ -58,7 +58,6 @@ describe('UsersService', () => {
           id: true,
           username: true,
           avatarUrl: true,
-          status: true,
         },
         orderBy: { username: 'asc' },
         take: 5,

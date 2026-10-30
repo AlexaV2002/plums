@@ -28,7 +28,6 @@ export type MemberJoinPayload = {
   user: {
     id: string;
     username: string;
-    email: string;
     avatarUrl: string | null;
     status: string;
     bio: string | null;

@@ -26,7 +26,6 @@ export class UsersService {
         id: true,
         username: true,
         avatarUrl: true,
-        status: true,
       },
       orderBy: { username: 'asc' },
       take: limit ?? 10,
@@ -55,11 +54,7 @@ export class UsersService {
     return user;
   }
 
-  createUser(data: {
-    username: string;
-    email: string;
-    passwordHash: string;
-  }) {
+  createUser(data: { username: string; email: string; passwordHash: string }) {
     return this.prisma.user.create({
       data,
       select: {
@@ -96,7 +91,7 @@ export class UsersService {
     });
 
     if (dto.status) {
-      this.usersGateway.emitUserStatus(user.id, user.status);
+      await this.usersGateway.emitUserStatus(user.id, user.status);
     }
 
     return user;

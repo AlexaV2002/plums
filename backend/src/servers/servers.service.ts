@@ -115,7 +115,6 @@ export class ServersService {
               select: {
                 id: true,
                 username: true,
-                email: true,
                 avatarUrl: true,
                 status: true,
                 bio: true,
@@ -167,7 +166,6 @@ export class ServersService {
           select: {
             id: true,
             username: true,
-            email: true,
             avatarUrl: true,
             status: true,
             bio: true,
@@ -332,32 +330,45 @@ export class ServersService {
       throw new ConflictException('Пользователь уже забанен на этом сервере');
     }
 
-    const member = await this.prisma.serverMember.findUnique({
-      where: {
-        serverId_userId: {
-          serverId,
-          userId: targetUserId,
-        },
-      },
-    });
+    const member = await this.prisma.$transaction(async (tx) => {
+      // Сериализуем ban и join для одной пары (serverId, userId) тем же
+      // lock-key, что и joinInvite, чтобы одна из операций всегда дожидалась
+      // другой и запись ServerMember не "переживала" успешный бан.
+      await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtextextended(${`${serverId}:${targetUserId}`}, 0))`;
 
-    await this.prisma.$transaction([
-      this.prisma.serverBan.create({
+      const freshBan = await tx.serverBan.findUnique({
+        where: { serverId_userId: { serverId, userId: targetUserId } },
+      });
+      if (freshBan) {
+        throw new ConflictException('Пользователь уже забанен на этом сервере');
+      }
+
+      const freshMember = await tx.serverMember.findUnique({
+        where: {
+          serverId_userId: {
+            serverId,
+            userId: targetUserId,
+          },
+        },
+      });
+
+      await tx.serverBan.create({
         data: {
           serverId,
           userId: targetUserId,
           bannedBy: userId,
           reason: dto.reason,
         },
-      }),
-      ...(member
-        ? [
-            this.prisma.serverMember.delete({
-              where: { id: member.id },
-            }),
-          ]
-        : []),
-    ]);
+      });
+
+      if (freshMember) {
+        await tx.serverMember.delete({
+          where: { id: freshMember.id },
+        });
+      }
+
+      return freshMember;
+    });
 
     if (member) {
       this.serversGateway.emitMemberLeave({
@@ -420,9 +431,7 @@ export class ServersService {
           select: {
             id: true,
             username: true,
-            email: true,
             avatarUrl: true,
-            status: true,
             bio: true,
           },
         },
