@@ -29,7 +29,12 @@ export class MessagesGateway {
   async joinChannel(
     @MessageBody() payload: { channelId?: string },
     @ConnectedSocket() client: Socket,
-    @Ack() ack?: (result: { joined: boolean; channelId?: string; reason?: string }) => void,
+    @Ack()
+    ack?: (result: {
+      joined: boolean;
+      channelId?: string;
+      reason?: string;
+    }) => void,
   ) {
     const identity = getActiveSocketIdentity(client);
     if (typeof payload?.channelId !== 'string' || !identity) {
@@ -46,7 +51,11 @@ export class MessagesGateway {
         channelId: payload.channelId,
         error: 'Канал не найден',
       });
-      ack?.({ joined: false, channelId: payload.channelId, reason: 'not_found' });
+      ack?.({
+        joined: false,
+        channelId: payload.channelId,
+        reason: 'not_found',
+      });
       return;
     }
     const member = await this.prisma.serverMember.findUnique({
@@ -72,7 +81,11 @@ export class MessagesGateway {
         channelId: payload.channelId,
         error: 'Нет доступа к каналу',
       });
-      ack?.({ joined: false, channelId: payload.channelId, reason: 'forbidden' });
+      ack?.({
+        joined: false,
+        channelId: payload.channelId,
+        reason: 'forbidden',
+      });
       return;
     }
 

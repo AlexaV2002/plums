@@ -3,8 +3,16 @@ import { ChannelsService } from './channels.service';
 
 describe('channel room revocation', () => {
   it('removes non-owners when canView is revoked', async () => {
-    const owner = { data: { userId: 'owner' }, leave: jest.fn(), emit: jest.fn() };
-    const member = { data: { userId: 'member' }, leave: jest.fn(), emit: jest.fn() };
+    const owner = {
+      data: { userId: 'owner' },
+      leave: jest.fn(),
+      emit: jest.fn(),
+    };
+    const member = {
+      data: { userId: 'member' },
+      leave: jest.fn(),
+      emit: jest.fn(),
+    };
     const fetchSockets = jest.fn().mockResolvedValue([owner, member]);
     const gatewayPrisma = {
       server: { findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner' }) },

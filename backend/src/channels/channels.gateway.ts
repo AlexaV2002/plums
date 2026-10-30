@@ -19,19 +19,11 @@ export class ChannelsGateway {
     await this.emitChannelEvent(serverId, 'channel:new', channel, hidden);
   }
 
-  async emitChannelUpdate(
-    serverId: string,
-    channel: unknown,
-    hidden = false,
-  ) {
+  async emitChannelUpdate(serverId: string, channel: unknown, hidden = false) {
     await this.emitChannelEvent(serverId, 'channel:update', channel, hidden);
   }
 
-  async emitChannelDelete(
-    serverId: string,
-    channel: unknown,
-    hidden = false,
-  ) {
+  async emitChannelDelete(serverId: string, channel: unknown, hidden = false) {
     await this.emitChannelEvent(serverId, 'channel:delete', channel, hidden);
   }
 
@@ -45,9 +37,15 @@ export class ChannelsGateway {
 
   // Участник мог уже загрузить видимый канал. При скрытии отправляем только
   // ранее известный id, чтобы клиент убрал его и сообщения из локального UI.
-  async notifyChannelHidden(serverId: string, channelId: string, ownerId: string) {
+  async notifyChannelHidden(
+    serverId: string,
+    channelId: string,
+    ownerId: string,
+  ) {
     const payload = { id: channelId, serverId };
-    for (const socket of await this.server.in(this.getServerRoom(serverId)).fetchSockets()) {
+    for (const socket of await this.server
+      .in(this.getServerRoom(serverId))
+      .fetchSockets()) {
       if ((socket.data as { userId?: string }).userId !== ownerId) {
         socket.emit('channel:delete', payload);
       }

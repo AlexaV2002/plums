@@ -32,7 +32,10 @@ describe('MessagesGateway rooms', () => {
     delete (socket.data as { userId?: string }).userId;
     await gateway.joinChannel({ channelId: 'channel-1' }, socket as never, ack);
     expect(prisma.channel.findUnique).not.toHaveBeenCalled();
-    expect(ack).toHaveBeenLastCalledWith({ joined: false, reason: 'session_required' });
+    expect(ack).toHaveBeenLastCalledWith({
+      joined: false,
+      reason: 'session_required',
+    });
 
     socket.data.userId = 'user-1';
     prisma.channel.findUnique.mockResolvedValue(channel(true));
@@ -69,7 +72,11 @@ describe('MessagesGateway rooms', () => {
     prisma.channel.findUnique.mockResolvedValue(channel(true));
     prisma.serverMember.findUnique.mockResolvedValue({ id: 'member-1' });
 
-    const joining = gateway.joinChannel({ channelId: 'channel-1' }, socket as never, ack);
+    const joining = gateway.joinChannel(
+      { channelId: 'channel-1' },
+      socket as never,
+      ack,
+    );
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(socket.join).toHaveBeenCalledWith('channel:channel-1');
     expect(ack).not.toHaveBeenCalled();
