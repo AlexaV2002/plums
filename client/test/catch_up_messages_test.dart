@@ -186,6 +186,59 @@ _runForwardCatchUpWithFailures(
   );
 }
 
+// Мирроит _catchUpEmptyChannel после фикса "ошибка первой страницы без
+// курсора не должна молча проглатываться": если [firstPage] равен null,
+// первый fetch (без `after`/`before`) бросает исключение — ровно как теперь
+// обрабатывает try/catch в _catchUpEmptyChannel, результат которого ведёт к
+// snackbar с "Повторить", вызывающей _retryCatchUpEmptyChannel(channelId) без
+// сохранённого курсора (т.к. ни одной страницы ещё не было успешно
+// обработано). Если первая страница успешна и полная, цепочка продолжается
+// докачкой НАЗАД (как applyCatchUpPage.nextCursor -> _catchUpMessagesBefore
+// в реальном коде), которая может тоже упасть — это покрывает существующий
+// `_runBackwardCatchUpWithFailures`.
+({List<AppMessage> messages, bool failed, bool interrupted, String? cursor})
+_runEmptyChannelCatchUpWithFailures(
+  List<AppMessage> initial,
+  List<AppMessage>? firstPage, {
+  List<List<AppMessage>?> backwardPages = const [],
+  int pageSize = 50,
+  int maxPages = 40,
+}) {
+  if (firstPage == null) {
+    return (messages: initial, failed: true, interrupted: true, cursor: null);
+  }
+
+  final step = applyCatchUpPage(
+    current: initial,
+    page: firstPage,
+    pageSize: pageSize,
+  );
+
+  if (!step.isFull || step.nextCursor == null) {
+    return (
+      messages: step.messages,
+      failed: false,
+      interrupted: false,
+      cursor: step.nextCursor,
+    );
+  }
+
+  final backward = _runBackwardCatchUpWithFailures(
+    step.messages,
+    backwardPages,
+    startCursor: step.nextCursor!,
+    pageSize: pageSize,
+    maxPages: maxPages,
+  );
+
+  return (
+    messages: backward.messages,
+    failed: backward.failed,
+    interrupted: backward.interrupted,
+    cursor: backward.cursor,
+  );
+}
+
 void main() {
   group('applyCatchUpPage', () {
     test('empty page stops catch-up without advancing the cursor', () {
@@ -471,6 +524,49 @@ void main() {
 
         expect(retry.messages.where((m) => m.id == 'z-live'), hasLength(1));
         expect(retry.messages, hasLength(121)); // 120 истории + live
+      },
+    );
+
+    test(
+      'empty-channel forward fetch (no cursor): the very first page throws '
+      '-> failed, no cursor to resume from, messages unchanged',
+      () {
+        final result = _runEmptyChannelCatchUpWithFailures(const [], null);
+
+        expect(result.failed, isTrue);
+        expect(result.interrupted, isTrue);
+        expect(result.cursor, isNull);
+        expect(result.messages, isEmpty);
+      },
+    );
+
+    test(
+      'empty-channel forward fetch: retry after a first-page failure '
+      'restores the channel fully, including a live message that arrived '
+      'before the retry',
+      () {
+        final live = _message(id: 'z-live', createdAt: DateTime.utc(2027));
+
+        final firstAttempt = _runEmptyChannelCatchUpWithFailures(
+          [live],
+          null,
+        );
+        expect(firstAttempt.failed, isTrue);
+        expect(firstAttempt.messages, [live]);
+
+        // "Повторить" вызывает _catchUpEmptyChannel заново без курсора (как
+        // и первый раз) — сохранённого прогресса нет, т.к. ни одна страница
+        // ещё не была успешно обработана.
+        final retry = _runEmptyChannelCatchUpWithFailures(
+          firstAttempt.messages,
+          _page(40, 50), // latest 50 (id40..89), полная страница
+          backwardPages: [_page(0, 40)], // id0..39 — короче pageSize, конец истории
+        );
+
+        expect(retry.failed, isFalse);
+        expect(retry.interrupted, isFalse);
+        expect(retry.messages.where((m) => m.id == 'z-live'), hasLength(1));
+        expect(retry.messages, hasLength(91)); // 90 истории + live
       },
     );
   });

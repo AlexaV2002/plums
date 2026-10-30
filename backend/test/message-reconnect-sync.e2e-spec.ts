@@ -1,3 +1,4 @@
+import './ensure-test-database';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';

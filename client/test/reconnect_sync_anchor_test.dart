@@ -70,9 +70,14 @@ _GetMessagesFn _backedBy(List<AppMessage> all) {
     }
     final take = limit ?? pool.length;
     if (pool.length <= take) return pool;
-    return before != null
-        ? pool.sublist(pool.length - take)
-        : pool.sublist(0, take);
+    // `after` (докачка вперёд): следующая страница — самые СТАРЫЕ из
+    // оставшихся после курсора. Без курсора вовсе (как и `before`, докачка
+    // назад/начальная загрузка) — backend отдаёт самые НОВЫЕ: сначала
+    // последнюю страницу, которую затем можно докачивать `before` вглубь
+    // истории (см. _catchUpEmptyChannel/selectChannel).
+    return after != null
+        ? pool.sublist(0, take)
+        : pool.sublist(pool.length - take);
   };
 }
 
@@ -124,14 +129,23 @@ class _ReconnectSyncHarness {
     pendingReconnectSyncChannelId = null;
     reconnectCatchUpInProgress = true;
     try {
-      final anchorId =
-          syncAnchorChannelId == channelId ? syncAnchorMessageId : null;
-      if (anchorId != null) {
-        await _catchUpMessagesAfter(channelId, anchorId);
-      } else if (messages.isEmpty) {
-        await _catchUpEmptyChannel(channelId);
-      } else {
-        await _catchUpMessagesAfter(channelId, messages.last.id);
+      final hasAnchorForChannel = syncAnchorChannelId == channelId;
+      final anchorId = hasAnchorForChannel ? syncAnchorMessageId : null;
+
+      // Вызывает настоящую production-функцию выбора стратегии
+      // (main.dart ~6600), а не копию логики — только сами ветки докачки
+      // (сетевые вызовы) всё ещё мирроятся harness-ом ниже.
+      switch (chooseReconnectSyncStrategy(
+        hasAnchorForChannel: hasAnchorForChannel,
+        anchorMessageId: anchorId,
+        messagesEmpty: messages.isEmpty,
+      )) {
+        case ReconnectSyncStrategy.afterAnchor:
+          await _catchUpMessagesAfter(channelId, anchorId!);
+        case ReconnectSyncStrategy.emptyChannelRestore:
+          await _catchUpEmptyChannel(channelId);
+        case ReconnectSyncStrategy.afterLastMessage:
+          await _catchUpMessagesAfter(channelId, messages.last.id);
       }
     } catch (_) {
       // как и в реальном коде — молча игнорируем.
@@ -188,6 +202,38 @@ class _ReconnectSyncHarness {
       pageSize: pageSize,
     );
     messages = step.messages;
+
+    final nextCursor = step.nextCursor;
+    if (!step.isFull || nextCursor == null) return;
+
+    await _catchUpMessagesBefore(channelId, nextCursor);
+  }
+
+  Future<void> _catchUpMessagesBefore(
+    String channelId,
+    String startCursor,
+  ) async {
+    const pageSize = 50;
+    const maxPages = 40;
+    var cursor = startCursor;
+
+    for (var page = 0; page < maxPages; page++) {
+      final previous = await _getMessages(channelId, limit: pageSize, before: cursor);
+
+      if (!mounted || selectedChannelId != channelId) return;
+
+      final step = applyCatchUpPage(
+        current: messages,
+        page: previous,
+        pageSize: pageSize,
+      );
+      messages = step.messages;
+
+      final nextCursor = step.nextCursor;
+      if (nextCursor != null) cursor = nextCursor;
+
+      if (!step.isFull) return;
+    }
   }
 }
 
@@ -328,6 +374,133 @@ void main() {
           harness.messages.map((m) => m.id).toList(),
           ['100', '101', '102'],
           reason: 'докачка канала A не должна писать в messages канала B',
+        );
+      },
+    );
+
+    test(
+      'channel empty at disconnect time + a live message arriving before '
+      'reconnect runs must still trigger full empty-channel restore, not '
+      'be mistaken for "no anchor at all"',
+      () async {
+        // Backend содержит полную историю 1-70 (канал был пуст у B только
+        // локально — например, B присоединился во время обрыва и ещё не
+        // успел ничего загрузить).
+        final harness = _ReconnectSyncHarness(_backedBy(_range(1, 70)));
+        harness.selectedChannelId = 'channel-1';
+        harness.messages = [];
+
+        // Разрыв застаёт канал пустым: якорь зафиксирован (канал == этот),
+        // но anchorMessageId == null — это НЕ "якоря нет вовсе".
+        harness.handleRealtimeDisconnected();
+        expect(harness.syncAnchorChannelId, 'channel-1');
+        expect(harness.syncAnchorMessageId, isNull);
+
+        // До того, как реально выполнится докачка, по восстановленному
+        // соединению уже пришло #71 по realtime.
+        harness.handleRealtimeMessage(
+          _msg('71', DateTime.utc(2026, 1, 1, 0, 1, 11)),
+        );
+        expect(harness.messages.map((m) => m.id).toList(), ['71']);
+
+        await harness.handleRealtimeReconnected('channel-1');
+
+        // Без фикса messages было бы непустым («71») и код бы попал в ветку
+        // "докачка after messages.last.id('71')" — backend ничего не вернёт
+        // после 71, и история 1-70 потерялась бы молча. Форвард-курсор не
+        // использовался вовсе — восстановление прошло через
+        // _catchUpEmptyChannel (без курсора) + докачку назад.
+        expect(harness.afterCursorsUsed, isEmpty);
+        expect(
+          harness.messages.map((m) => m.id).toList(),
+          [for (var i = 1; i <= 71; i++) '$i'],
+        );
+        expect(
+          harness.messages.map((m) => m.id).toSet().length,
+          71,
+          reason: 'без дублей',
+        );
+      },
+    );
+  });
+
+  group('chooseReconnectSyncStrategy (pure decision function, main.dart '
+      '~6600, used directly by _runReconnectSync)', () {
+    test('anchor present for the channel -> afterAnchor', () {
+      expect(
+        chooseReconnectSyncStrategy(
+          hasAnchorForChannel: true,
+          anchorMessageId: 'm10',
+          messagesEmpty: false,
+        ),
+        ReconnectSyncStrategy.afterAnchor,
+      );
+
+      // Якорь главнее текущего messagesEmpty (которое может быть устаревшим
+      // из-за гонки с live-сообщением) — проверяем, что сам messagesEmpty не
+      // влияет на эту ветку.
+      expect(
+        chooseReconnectSyncStrategy(
+          hasAnchorForChannel: true,
+          anchorMessageId: 'm10',
+          messagesEmpty: true,
+        ),
+        ReconnectSyncStrategy.afterAnchor,
+      );
+    });
+
+    test(
+      'anchor for the channel exists but is explicitly null (channel was '
+      'empty at disconnect) -> emptyChannelRestore, regardless of current '
+      'messagesEmpty',
+      () {
+        expect(
+          chooseReconnectSyncStrategy(
+            hasAnchorForChannel: true,
+            anchorMessageId: null,
+            messagesEmpty: false,
+          ),
+          ReconnectSyncStrategy.emptyChannelRestore,
+          reason: 'даже если messages уже непустой из-за live-гонки',
+        );
+
+        expect(
+          chooseReconnectSyncStrategy(
+            hasAnchorForChannel: true,
+            anchorMessageId: null,
+            messagesEmpty: true,
+          ),
+          ReconnectSyncStrategy.emptyChannelRestore,
+        );
+      },
+    );
+
+    test(
+      'no anchor for the channel at all (e.g. first connect, no prior '
+      'onDisconnect) and messages not empty -> afterLastMessage fallback',
+      () {
+        expect(
+          chooseReconnectSyncStrategy(
+            hasAnchorForChannel: false,
+            anchorMessageId: null,
+            messagesEmpty: false,
+          ),
+          ReconnectSyncStrategy.afterLastMessage,
+        );
+      },
+    );
+
+    test(
+      'no anchor for the channel at all and messages empty -> '
+      'emptyChannelRestore (boundary case)',
+      () {
+        expect(
+          chooseReconnectSyncStrategy(
+            hasAnchorForChannel: false,
+            anchorMessageId: null,
+            messagesEmpty: true,
+          ),
+          ReconnectSyncStrategy.emptyChannelRestore,
         );
       },
     );

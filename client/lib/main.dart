@@ -1846,25 +1846,35 @@ class _MainShellState extends State<MainShell> {
       // live-сообщение (handleRealtimeMessage синхронный и не ждёт этот
       // метод), из-за чего messages.last.id указывал бы на него, а не на
       // последнее сообщение, увиденное ДО обрыва, — и докачка пропустила бы
-      // реальный пробел истории.
-      final anchorId =
-          _syncAnchorChannelId == channelId ? _syncAnchorMessageId : null;
+      // реальный пробел истории. По той же причине важно различать "якоря
+      // для канала нет вовсе" и "якорь есть и явно говорит, что канал был
+      // пуст" — см. chooseReconnectSyncStrategy.
+      final hasAnchorForChannel = _syncAnchorChannelId == channelId;
+      final anchorId = hasAnchorForChannel ? _syncAnchorMessageId : null;
 
-      if (anchorId != null) {
-        await _catchUpMessagesAfter(channelId, anchorId);
-      } else if (messages.isEmpty) {
-        // Крайний случай: список сообщений канала ещё пуст (например, канал
-        // не успел догрузиться или реконнект случился до первой загрузки) —
-        // курсора для докачки `after` нет. Забираем последнюю страницу и,
-        // если она полная (вероятно, пропущено больше, чем pageSize),
-        // достаём остальную историю докачкой НАЗАД по курсору `before`, а не
-        // считаем синхронизацию завершённой по первым 50 сообщениям.
-        await _catchUpEmptyChannel(channelId);
-      } else {
-        // Якоря для этого канала нет (например, реконнект пришёл без
-        // предшествующего onDisconnect для этого канала) — используем
-        // прежнее поведение как запасной вариант.
-        await _catchUpMessagesAfter(channelId, messages.last.id);
+      switch (chooseReconnectSyncStrategy(
+        hasAnchorForChannel: hasAnchorForChannel,
+        anchorMessageId: anchorId,
+        messagesEmpty: messages.isEmpty,
+      )) {
+        case ReconnectSyncStrategy.afterAnchor:
+          await _catchUpMessagesAfter(channelId, anchorId!);
+        case ReconnectSyncStrategy.emptyChannelRestore:
+          // Курсора для докачки `after` нет (канал был пуст на момент
+          // обрыва, либо ещё не успел догрузиться). Забираем последнюю
+          // страницу и, если она полная (вероятно, пропущено больше, чем
+          // pageSize), достаём остальную историю докачкой НАЗАД по курсору
+          // `before`, а не считаем синхронизацию завершённой по первым 50
+          // сообщениям. applyCatchUpPage/_catchUpEmptyChannel сливают
+          // результат с текущим messages через mergeMessagesChronologically,
+          // так что уже пришедшее по realtime live-сообщение не потеряется
+          // и не продублируется.
+          await _catchUpEmptyChannel(channelId);
+        case ReconnectSyncStrategy.afterLastMessage:
+          // Якоря для этого канала нет (например, реконнект пришёл без
+          // предшествующего onDisconnect для этого канала) — используем
+          // прежнее поведение как запасной вариант.
+          await _catchUpMessagesAfter(channelId, messages.last.id);
       }
     } catch (_) {
       // Молча игнорируем: список сообщений уже отображён (не завис в
@@ -1983,7 +1993,25 @@ class _MainShellState extends State<MainShell> {
   // окажется короче pageSize (дошли до настоящего начала истории).
   Future<void> _catchUpEmptyChannel(String channelId) async {
     const pageSize = 50;
-    final latest = await apiClient.getMessages(channelId, limit: pageSize);
+    List<AppMessage> latest;
+    try {
+      latest = await apiClient.getMessages(channelId, limit: pageSize);
+    } catch (_) {
+      // Ошибка первой (без курсора) страницы: не даём ей молча раствориться
+      // во внешнем catch _runReconnectSync — как и в _catchUpMessagesAfter/
+      // _catchUpMessagesBefore, показываем snackbar с кнопкой "Повторить".
+      if (!mounted || selectedChannelId != channelId) return;
+
+      showErrorSnackBar(
+        context,
+        'Не удалось восстановить историю сообщений после переподключения',
+        action: SnackBarAction(
+          label: 'Повторить',
+          onPressed: () => unawaited(_retryCatchUpEmptyChannel(channelId)),
+        ),
+      );
+      return;
+    }
 
     if (!mounted || selectedChannelId != channelId) return;
 
@@ -2005,6 +2033,24 @@ class _MainShellState extends State<MainShell> {
     }
 
     await _catchUpMessagesBefore(channelId, nextCursor);
+  }
+
+  // Отдельная обёртка для кнопки "Повторить" первой страницы пустого канала —
+  // тот же guard, что и у handleRealtimeReconnected/_retryCatchUp/
+  // _retryCatchUpBefore, чтобы повторный реконнект во время ожидания не
+  // запустил параллельный цикл докачки для того же канала.
+  Future<void> _retryCatchUpEmptyChannel(String channelId) async {
+    if (_reconnectCatchUpInProgress) return;
+
+    _reconnectCatchUpInProgress = true;
+    try {
+      await _catchUpEmptyChannel(channelId);
+    } finally {
+      _reconnectCatchUpInProgress = false;
+    }
+    // Если новый реконнект пришёл во время ожидания "Повторить" и был
+    // отложен из-за занятости — выполняем его сразу, не теряя пробел.
+    await _flushPendingReconnectSync();
   }
 
   // Постранично догружает сообщения НАЗАД по курсору [startCursor] —
@@ -2716,6 +2762,11 @@ class _MainShellState extends State<MainShell> {
         errorMessage = 'Ошибка загрузки сообщений: ${describeRequestError(error)}';
         isMessagesLoading = false;
       });
+      // Реконнект мог прийти во время этой первоначальной загрузки и быть
+      // отложен из-за isMessagesLoading — если загрузка упала с ошибкой,
+      // отложенный запрос нельзя оставлять висеть до случайного следующего
+      // реконнекта.
+      await _flushPendingReconnectSync();
     } catch (error) {
       if (!mounted || selectedChannelId != channelId) return;
 
@@ -2723,6 +2774,7 @@ class _MainShellState extends State<MainShell> {
         errorMessage = 'Не удалось загрузить сообщения: ${describeRequestError(error)}';
         isMessagesLoading = false;
       });
+      await _flushPendingReconnectSync();
     }
   }
 
@@ -6585,6 +6637,46 @@ CatchUpPageStep applyCatchUpPage({
     nextCursor: page.first.id,
     isFull: isFull,
   );
+}
+
+// Какую стратегию докачки после реконнекта выбрать для канала [channelId]
+// (см. _runReconnectSync, main.dart ~1839). Чистая функция без побочных
+// эффектов — вынесена отдельно, чтобы тест мог вызывать именно эту
+// production-логику выбора, а не копию в test harness.
+enum ReconnectSyncStrategy {
+  // Есть якорь (последнее сообщение, увиденное ДО обрыва) — докачиваем
+  // `after` этого якоря.
+  afterAnchor,
+  // Якорь явно говорит, что канал был пуст на момент обрыва (или для этого
+  // канала вообще не было onDisconnect, и messages сейчас пуст) — курсора
+  // `after` нет, восстанавливаем с нуля через _catchUpEmptyChannel.
+  emptyChannelRestore,
+  // Якоря для этого канала нет вовсе (реконнект не был предварён
+  // onDisconnect для него), а messages не пуст — запасной вариант, как и
+  // раньше: докачка от текущего последнего сообщения.
+  afterLastMessage,
+}
+
+ReconnectSyncStrategy chooseReconnectSyncStrategy({
+  required bool hasAnchorForChannel,
+  required String? anchorMessageId,
+  required bool messagesEmpty,
+}) {
+  if (hasAnchorForChannel) {
+    // Якорь для канала есть: либо он указывает конкретное сообщение (есть
+    // курсор), либо явно null, что означает "канал был пуст на момент
+    // обрыва" — и тогда НЕЛЬЗЯ ориентироваться на текущий messagesEmpty,
+    // потому что по восстановленному соединению уже могло прилететь
+    // live-сообщение, из-за чего список стал непустым, но реальная история
+    // ДО обрыва всё равно не докачана.
+    return anchorMessageId != null
+        ? ReconnectSyncStrategy.afterAnchor
+        : ReconnectSyncStrategy.emptyChannelRestore;
+  }
+
+  return messagesEmpty
+      ? ReconnectSyncStrategy.emptyChannelRestore
+      : ReconnectSyncStrategy.afterLastMessage;
 }
 
 Color? parseHexColor(String? hex) {

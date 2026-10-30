@@ -1,3 +1,4 @@
+import './ensure-test-database';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
@@ -178,19 +179,30 @@ describe('invite join concurrency (e2e)', () => {
     expect(memberCount).toBe(1);
   }, 20000);
 
-  it('expired invite: 400', async () => {
+  it('expired invite: 400, and currentUses is not bumped by the rolled-back attempt', async () => {
     const owner = await user(`ownerE-${Date.now()}`);
     // createInvite rejects a past expiresAt at creation time, so a normal
     // invite is created first and then backdated directly via Prisma to
-    // simulate one that has since expired.
-    const { code } = await createServerAndInvite(owner, {});
+    // simulate one that was "usable" on an earlier read but expires before
+    // it's actually redeemed (the race the atomic updateMany in joinInvite's
+    // transaction guards against, not just the pre-transaction fast check).
+    const { serverId, code } = await createServerAndInvite(owner, {});
     await prisma.invite.update({
       where: { code },
       data: { expiresAt: new Date(Date.now() - 60_000) },
     });
     const joiner = await user(`joinerE-${Date.now()}`);
 
-    await joinAttempt(joiner.token, code).expect(400);
+    const res = await joinAttempt(joiner.token, code).expect(400);
+    expect((res.body as { message: string }).message).toMatch(/истёк/i);
+
+    const invite = await prisma.invite.findUnique({ where: { code } });
+    expect(invite?.currentUses).toBe(0);
+
+    const memberCount = await prisma.serverMember.count({
+      where: { serverId, userId: joiner.id },
+    });
+    expect(memberCount).toBe(0);
   }, 15000);
 
   it('banned user: 403 even when limit is not exhausted', async () => {
@@ -209,4 +221,34 @@ describe('invite join concurrency (e2e)', () => {
     const owner = await user(`ownerN-${Date.now()}`);
     await joinAttempt(owner.token, 'does-not-exist-code').expect(404);
   }, 15000);
+
+  // Guards the pg_advisory_xact_lock serialization in joinInvite/banServerMember:
+  // whichever of the two transactions commits first, the invariant
+  // "serverBan exists => serverMember doesn't" must hold afterwards.
+  it('concurrent ban + join for the same user never leaves them banned and still a member', async () => {
+    const owner = await user(`ownerX-${Date.now()}`);
+    const { serverId, code } = await createServerAndInvite(owner, { maxUses: 5 });
+    const target = await user(`joinerX-${Date.now()}`);
+
+    const [joinRes, banRes] = await Promise.all([
+      joinAttempt(target.token, code),
+      request(app.getHttpServer())
+        .post(`/servers/${serverId}/bans/${target.id}`)
+        .set(auth(owner.token))
+        .send({ reason: 'race test' }),
+    ]);
+
+    expect([201, 403]).toContain(joinRes.status);
+    expect(banRes.status).toBe(201);
+
+    const ban = await prisma.serverBan.findUnique({
+      where: { serverId_userId: { serverId, userId: target.id } },
+    });
+    expect(ban).not.toBeNull();
+
+    const member = await prisma.serverMember.findUnique({
+      where: { serverId_userId: { serverId, userId: target.id } },
+    });
+    expect(member).toBeNull();
+  }, 20000);
 });
