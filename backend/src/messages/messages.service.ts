@@ -248,6 +248,19 @@ export class MessagesService {
       throw new ForbiddenException('Можно редактировать только свои сообщения');
     }
 
+    const member = await this.prisma.serverMember.findUnique({
+      where: {
+        serverId_userId: {
+          serverId: message.channel.serverId,
+          userId,
+        },
+      },
+    });
+
+    if (!member) {
+      throw new ForbiddenException('Вы не состоите на этом сервере');
+    }
+
     const permissions = this.getPermissions(message.channel.permissions);
     const isOwner = message.channel.server.ownerId === userId;
 
@@ -309,6 +322,19 @@ export class MessagesService {
 
     if (message.authorId !== userId) {
       throw new ForbiddenException('Можно удалять только свои сообщения');
+    }
+
+    const member = await this.prisma.serverMember.findUnique({
+      where: {
+        serverId_userId: {
+          serverId: message.channel.serverId,
+          userId,
+        },
+      },
+    });
+
+    if (!member) {
+      throw new ForbiddenException('Вы не состоите на этом сервере');
     }
 
     const permissions = this.getPermissions(message.channel.permissions);

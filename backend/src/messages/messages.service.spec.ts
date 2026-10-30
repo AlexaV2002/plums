@@ -1,4 +1,4 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ChannelType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -10,7 +10,7 @@ describe('MessagesService', () => {
   let prisma: {
     channel: { findUnique: jest.Mock };
     serverMember: { findUnique: jest.Mock };
-    message: { findUnique: jest.Mock; findMany: jest.Mock };
+    message: { findUnique: jest.Mock; findMany: jest.Mock; update: jest.Mock };
   };
 
   const channelId = 'channel-1';
@@ -20,14 +20,17 @@ describe('MessagesService', () => {
     prisma = {
       channel: { findUnique: jest.fn() },
       serverMember: { findUnique: jest.fn() },
-      message: { findUnique: jest.fn(), findMany: jest.fn() },
+      message: { findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn() },
     };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         MessagesService,
         { provide: PrismaService, useValue: prisma },
-        { provide: MessagesGateway, useValue: {} },
+        {
+          provide: MessagesGateway,
+          useValue: { emitMessageUpdate: jest.fn(), emitMessageDelete: jest.fn() },
+        },
       ],
     }).compile();
 
@@ -126,6 +129,192 @@ describe('MessagesService', () => {
       ).rejects.toThrow(BadRequestException);
 
       expect(prisma.message.findUnique).not.toHaveBeenCalled();
+    });
+  });
+
+  const messageId = 'message-1';
+  const authorId = userId;
+  const ownerId = 'owner-1';
+
+  const buildMessage = (overrides: Record<string, unknown> = {}) => ({
+    id: messageId,
+    authorId,
+    deletedAt: null,
+    channelId,
+    channel: {
+      id: channelId,
+      serverId: 'server-1',
+      permissions: null,
+      server: { ownerId },
+    },
+    ...overrides,
+  });
+
+  describe('update', () => {
+    it('действующий участник редактирует своё сообщение — успешно', async () => {
+      prisma.message.findUnique.mockResolvedValue(buildMessage());
+      prisma.serverMember.findUnique.mockResolvedValue({ id: 'member-1' });
+      prisma.message.update.mockResolvedValue({ id: messageId, channelId });
+
+      await expect(
+        service.update(messageId, authorId, { content: 'новый текст' }),
+      ).resolves.toBeDefined();
+
+      expect(prisma.message.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: messageId },
+          data: { content: 'новый текст' },
+        }),
+      );
+    });
+
+    it('пользователь без ServerMember (kick/ban/leave) не может редактировать своё старое сообщение', async () => {
+      prisma.message.findUnique.mockResolvedValue(buildMessage());
+      prisma.serverMember.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.update(messageId, authorId, { content: 'x' }),
+      ).rejects.toThrow(new ForbiddenException('Вы не состоите на этом сервере'));
+
+      expect(prisma.message.update).not.toHaveBeenCalled();
+    });
+
+    it('чужое сообщение — ForbiddenException до проверки членства', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        buildMessage({ authorId: 'other-user' }),
+      );
+
+      await expect(
+        service.update(messageId, userId, { content: 'x' }),
+      ).rejects.toThrow(
+        new ForbiddenException('Можно редактировать только свои сообщения'),
+      );
+
+      expect(prisma.serverMember.findUnique).not.toHaveBeenCalled();
+      expect(prisma.message.update).not.toHaveBeenCalled();
+    });
+
+    it('скрытый канал (canView:false) блокирует действующего участника без прав', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        buildMessage({
+          channel: {
+            id: channelId,
+            serverId: 'server-1',
+            permissions: { canView: false, canSendMessages: false },
+            server: { ownerId },
+          },
+        }),
+      );
+      prisma.serverMember.findUnique.mockResolvedValue({ id: 'member-1' });
+
+      await expect(
+        service.update(messageId, authorId, { content: 'x' }),
+      ).rejects.toThrow(ForbiddenException);
+
+      expect(prisma.message.update).not.toHaveBeenCalled();
+    });
+
+    it('владелец сервера редактирует своё сообщение в канале с canView:false/canSendMessages:false — успешно', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        buildMessage({
+          authorId: ownerId,
+          channel: {
+            id: channelId,
+            serverId: 'server-1',
+            permissions: { canView: false, canSendMessages: false },
+            server: { ownerId },
+          },
+        }),
+      );
+      prisma.serverMember.findUnique.mockResolvedValue({ id: 'member-owner' });
+      prisma.message.update.mockResolvedValue({ id: messageId, channelId });
+
+      await expect(
+        service.update(messageId, ownerId, { content: 'x' }),
+      ).resolves.toBeDefined();
+
+      expect(prisma.message.update).toHaveBeenCalled();
+    });
+  });
+
+  describe('remove', () => {
+    it('действующий участник удаляет своё сообщение — успешно', async () => {
+      prisma.message.findUnique.mockResolvedValue(buildMessage());
+      prisma.serverMember.findUnique.mockResolvedValue({ id: 'member-1' });
+      prisma.message.update.mockResolvedValue({ id: messageId, channelId });
+
+      await expect(service.remove(messageId, authorId)).resolves.toBeDefined();
+
+      expect(prisma.message.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: messageId },
+          data: { deletedAt: expect.any(Date) },
+        }),
+      );
+    });
+
+    it('пользователь без ServerMember (kick/ban/leave) не может удалить своё старое сообщение', async () => {
+      prisma.message.findUnique.mockResolvedValue(buildMessage());
+      prisma.serverMember.findUnique.mockResolvedValue(null);
+
+      await expect(service.remove(messageId, authorId)).rejects.toThrow(
+        new ForbiddenException('Вы не состоите на этом сервере'),
+      );
+
+      expect(prisma.message.update).not.toHaveBeenCalled();
+    });
+
+    it('чужое сообщение — ForbiddenException до проверки членства', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        buildMessage({ authorId: 'other-user' }),
+      );
+
+      await expect(service.remove(messageId, userId)).rejects.toThrow(
+        new ForbiddenException('Можно удалять только свои сообщения'),
+      );
+
+      expect(prisma.serverMember.findUnique).not.toHaveBeenCalled();
+      expect(prisma.message.update).not.toHaveBeenCalled();
+    });
+
+    it('скрытый канал (canView:false) блокирует действующего участника без прав', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        buildMessage({
+          channel: {
+            id: channelId,
+            serverId: 'server-1',
+            permissions: { canView: false, canSendMessages: false },
+            server: { ownerId },
+          },
+        }),
+      );
+      prisma.serverMember.findUnique.mockResolvedValue({ id: 'member-1' });
+
+      await expect(service.remove(messageId, authorId)).rejects.toThrow(
+        ForbiddenException,
+      );
+
+      expect(prisma.message.update).not.toHaveBeenCalled();
+    });
+
+    it('владелец сервера удаляет своё сообщение в канале с canView:false/canSendMessages:false — успешно', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        buildMessage({
+          authorId: ownerId,
+          channel: {
+            id: channelId,
+            serverId: 'server-1',
+            permissions: { canView: false, canSendMessages: false },
+            server: { ownerId },
+          },
+        }),
+      );
+      prisma.serverMember.findUnique.mockResolvedValue({ id: 'member-owner' });
+      prisma.message.update.mockResolvedValue({ id: messageId, channelId });
+
+      await expect(service.remove(messageId, ownerId)).resolves.toBeDefined();
+
+      expect(prisma.message.update).toHaveBeenCalled();
     });
   });
 });
