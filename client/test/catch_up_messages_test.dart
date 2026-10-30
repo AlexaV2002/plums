@@ -2,6 +2,8 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:client/main.dart';
 
+import 'support/fake_message_backend.dart';
+
 AppMessage _message({required String id, required DateTime createdAt}) {
   return AppMessage(
     id: id,
@@ -27,215 +29,6 @@ List<AppMessage> _page(int startSeq, int count) {
         Duration(seconds: startSeq + i),
       ),
     ),
-  );
-}
-
-// Воспроизводит цикл докачки НАЗАД, который реализует
-// _MainShellState._catchUpMessagesBefore: постранично читает фиктивные
-// страницы из [pages] (как если бы их возвращал apiClient.getMessages с
-// курсором `before`) и прогоняет каждую через applyCatchUpPage, пока
-// страница не окажется короче pageSize или не будет исчерпан maxPages.
-({List<AppMessage> messages, bool hasMoreMessages, bool interrupted})
-_runBackwardCatchUp(
-  List<AppMessage> initial,
-  List<List<AppMessage>> pages, {
-  int pageSize = 50,
-  int maxPages = 40,
-}) {
-  var messages = initial;
-  var hasMoreMessages = false;
-
-  for (var i = 0; i < pages.length && i < maxPages; i++) {
-    final step = applyCatchUpPage(
-      current: messages,
-      page: pages[i],
-      pageSize: pageSize,
-    );
-    messages = step.messages;
-    hasMoreMessages = step.isFull;
-
-    if (!step.isFull) {
-      return (
-        messages: messages,
-        hasMoreMessages: false,
-        interrupted: false,
-      );
-    }
-  }
-
-  // Цикл дошёл до maxPages (или до конца списка фикстур в тесте) с ещё
-  // полной последней страницей — докачка не завершена, в реальном коде это
-  // ветка "показать snackbar с Повторить".
-  return (messages: messages, hasMoreMessages: hasMoreMessages, interrupted: hasMoreMessages);
-}
-
-// Воспроизводит цикл докачки НАЗАД после фикса "дефекта 2": ошибка на
-// отдельной странице (элемент [pages] равен null) больше не делает `return`
-// до snackbar — цикл прерывается, но функция возвращает `failed: true` и
-// курсор, достигнутый последней УСПЕШНО обработанной страницей (ровно то,
-// что передаст кнопка "Повторить" в реальном _catchUpMessagesBefore).
-({
-  List<AppMessage> messages,
-  bool hasMoreMessages,
-  bool interrupted,
-  bool failed,
-  String cursor,
-})
-_runBackwardCatchUpWithFailures(
-  List<AppMessage> initial,
-  List<List<AppMessage>?> pages, {
-  required String startCursor,
-  int pageSize = 50,
-  int maxPages = 40,
-}) {
-  var messages = initial;
-  var hasMoreMessages = false;
-  var cursor = startCursor;
-  var failed = false;
-
-  try {
-    for (var i = 0; i < pages.length && i < maxPages; i++) {
-      final page = pages[i];
-      if (page == null) {
-        throw Exception('network error on page $i');
-      }
-
-      final step = applyCatchUpPage(
-        current: messages,
-        page: page,
-        pageSize: pageSize,
-      );
-      messages = step.messages;
-      hasMoreMessages = step.isFull;
-
-      final nextCursor = step.nextCursor;
-      if (nextCursor != null) {
-        cursor = nextCursor;
-      }
-
-      if (!step.isFull) {
-        return (
-          messages: messages,
-          hasMoreMessages: false,
-          interrupted: false,
-          failed: false,
-          cursor: cursor,
-        );
-      }
-    }
-  } catch (_) {
-    failed = true;
-  }
-
-  return (
-    messages: messages,
-    hasMoreMessages: hasMoreMessages,
-    interrupted: hasMoreMessages || failed,
-    failed: failed,
-    cursor: cursor,
-  );
-}
-
-// Симметричный хелпер для направления ВПЕРЁД (мирроит _catchUpMessagesAfter
-// после фикса): страницы сливаются через mergeMessagesChronologically,
-// курсор продвигается на id последнего сообщения страницы.
-({List<AppMessage> messages, bool failed, bool interrupted, String cursor})
-_runForwardCatchUpWithFailures(
-  List<AppMessage> initial,
-  List<List<AppMessage>?> pages, {
-  required String startCursor,
-  int pageSize = 50,
-  int maxPages = 40,
-}) {
-  var messages = initial;
-  var cursor = startCursor;
-  var lastPageWasFull = false;
-  var failed = false;
-
-  try {
-    for (var i = 0; i < pages.length && i < maxPages; i++) {
-      final next = pages[i];
-      if (next == null) {
-        throw Exception('network error on page $i');
-      }
-
-      if (next.isNotEmpty) {
-        messages = mergeMessagesChronologically(messages, next);
-        cursor = next.last.id;
-      }
-
-      lastPageWasFull = next.length >= pageSize;
-      if (!lastPageWasFull) {
-        return (
-          messages: messages,
-          failed: false,
-          interrupted: false,
-          cursor: cursor,
-        );
-      }
-    }
-  } catch (_) {
-    failed = true;
-  }
-
-  return (
-    messages: messages,
-    failed: failed,
-    interrupted: lastPageWasFull || failed,
-    cursor: cursor,
-  );
-}
-
-// Мирроит _catchUpEmptyChannel после фикса "ошибка первой страницы без
-// курсора не должна молча проглатываться": если [firstPage] равен null,
-// первый fetch (без `after`/`before`) бросает исключение — ровно как теперь
-// обрабатывает try/catch в _catchUpEmptyChannel, результат которого ведёт к
-// snackbar с "Повторить", вызывающей _retryCatchUpEmptyChannel(channelId) без
-// сохранённого курсора (т.к. ни одной страницы ещё не было успешно
-// обработано). Если первая страница успешна и полная, цепочка продолжается
-// докачкой НАЗАД (как applyCatchUpPage.nextCursor -> _catchUpMessagesBefore
-// в реальном коде), которая может тоже упасть — это покрывает существующий
-// `_runBackwardCatchUpWithFailures`.
-({List<AppMessage> messages, bool failed, bool interrupted, String? cursor})
-_runEmptyChannelCatchUpWithFailures(
-  List<AppMessage> initial,
-  List<AppMessage>? firstPage, {
-  List<List<AppMessage>?> backwardPages = const [],
-  int pageSize = 50,
-  int maxPages = 40,
-}) {
-  if (firstPage == null) {
-    return (messages: initial, failed: true, interrupted: true, cursor: null);
-  }
-
-  final step = applyCatchUpPage(
-    current: initial,
-    page: firstPage,
-    pageSize: pageSize,
-  );
-
-  if (!step.isFull || step.nextCursor == null) {
-    return (
-      messages: step.messages,
-      failed: false,
-      interrupted: false,
-      cursor: step.nextCursor,
-    );
-  }
-
-  final backward = _runBackwardCatchUpWithFailures(
-    step.messages,
-    backwardPages,
-    startCursor: step.nextCursor!,
-    pageSize: pageSize,
-    maxPages: maxPages,
-  );
-
-  return (
-    messages: backward.messages,
-    failed: backward.failed,
-    interrupted: backward.interrupted,
-    cursor: backward.cursor,
   );
 }
 
@@ -282,291 +75,157 @@ void main() {
     });
   });
 
-  group('backward catch-up loop (mirrors _catchUpMessagesBefore)', () {
-    test('channel with exactly 60 messages is fully restored in 2 pages', () {
-      // Страница без курсора уже выдала последние 50 (id 10..59); докачка
-      // назад должна забрать оставшиеся 10 (id 0..9) одной короткой страницей.
-      final result = _runBackwardCatchUp(_page(10, 50), [_page(0, 10)]);
+  // Восстановление пустого/неизвестного baseline: последняя страница без
+  // курсора + докачка назад (MessageSyncController, restoreLatest).
+  group('MessageSyncController: backward restore', () {
+    test('channel with exactly 60 messages is fully restored in 2 pages', () async {
+      final backend = FakeMessageBackend()..add(range(1, 60));
+      final f = SyncFixture(backend);
+      f.loadBaseline('channel-1', const []);
 
-      expect(result.hasMoreMessages, isFalse);
-      expect(result.interrupted, isFalse);
-      expect(result.messages, hasLength(60));
+      await f.sync.onRoomJoined('channel-1');
+
+      expect(backend.calls.map((c) => c.before).toList(), [null, '11']);
+      expect(ids(f.messages), idRange(1, 60));
+      expect(f.hasMore, isFalse);
+      expect(f.incomplete, isEmpty);
     });
 
-    test('channel with exactly 120 messages needs 3 pages total', () {
-      // Первая страница (без курсора) уже вернула id 70..119 (последние 50).
-      final initial = _page(70, 50);
+    test('channel with exactly 120 messages needs 3 pages total', () async {
+      final backend = FakeMessageBackend()..add(range(1, 120));
+      final f = SyncFixture(backend);
+      f.loadBaseline('channel-1', const []);
 
-      final result = _runBackwardCatchUp(initial, [
-        _page(20, 50), // id 20..69
-        _page(0, 20), // id 0..19 — короче pageSize, докачка завершена
-      ]);
+      await f.sync.onRoomJoined('channel-1');
 
-      expect(result.hasMoreMessages, isFalse);
-      expect(result.interrupted, isFalse);
-      expect(result.messages, hasLength(120));
+      expect(backend.calls.map((c) => c.before).toList(), [null, '71', '21']);
+      expect(ids(f.messages), idRange(1, 120));
+      expect(f.hasMore, isFalse);
     });
 
-    test(
-      'a live message that arrives mid catch-up is kept, not overwritten',
-      () {
-        final initial = _page(50, 50); // id 50..99
-        final live = _message(
-          id: 'z-live',
-          createdAt: DateTime.utc(2027),
-        ); // новее всех, прилетело по realtime во время докачки
+    test('a live message that arrives mid catch-up is kept once', () async {
+      final backend = FakeMessageBackend()..add(range(1, 100));
+      final f = SyncFixture(backend);
+      f.loadBaseline('channel-1', const []);
+      backend.beforeRespond = (call) {
+        if (call == 2) f.live(msg(101));
+      };
 
-        // Симулируем: перед обработкой первой страницы докачки назад
-        // в messages уже добавлено live-сообщение.
-        final afterLive = [...initial, live];
-        final result = _runBackwardCatchUp(afterLive, [_page(0, 50)]);
+      await f.sync.onRoomJoined('channel-1');
 
-        expect(result.messages.map((m) => m.id), contains('z-live'));
-        expect(result.messages, hasLength(101));
-      },
-    );
+      expect(ids(f.messages), idRange(1, 101));
+    });
 
-    test(
-      'catch-up interrupted by maxPages is NOT reported as complete',
-      () {
-        // 3 страницы по 50 — все полные, но maxPages=2 обрывает цикл раньше,
-        // чем страница окажется короче pageSize.
-        final result = _runBackwardCatchUp(
-          _page(100, 50),
-          [_page(50, 50), _page(0, 50)],
-          maxPages: 2,
-        );
+    test('catch-up interrupted by maxPages is NOT reported as complete', () async {
+      final backend = FakeMessageBackend()..add(range(1, 300));
+      final f = SyncFixture(backend, maxPages: 2);
+      f.loadBaseline('channel-1', const []);
 
-        expect(result.interrupted, isTrue);
-        expect(result.hasMoreMessages, isTrue);
-      },
-    );
+      await f.sync.onRoomJoined('channel-1');
+
+      expect(f.incomplete, ['channel-1']);
+      expect(f.hasMore, isTrue);
+      expect(f.sync.inSync, isFalse);
+      expect(ids(f.messages), idRange(151, 300));
+    });
   });
 
-  // Регрессия на "дефект 2": ошибка на отдельной странице (не исчерпание
-  // maxPages, а настоящее исключение сети) больше не должна "сдаваться"
-  // молча — цикл обязан остановиться на границе последней УСПЕШНО
-  // обработанной страницы и сохранить курсор для кнопки "Повторить", а не
-  // прервать выполнение до того, как об этом можно узнать.
-  group('catch-up loop reports a page-level network failure (defect 2)', () {
+  // Ошибка отдельной страницы: цикл останавливается на последней успешной
+  // странице, onIncomplete даёт «Повторить», retry продолжает с неё.
+  group('MessageSyncController: page-level network failure', () {
     test(
-      'backward: channel with 120 messages, page 2 throws -> cursor stays '
-      'at the boundary of the first successful page',
-      () {
-        final initial = _page(70, 50); // id70..119, nextCursor уже 'm70'
-        final result = _runBackwardCatchUpWithFailures(
-          initial,
-          [_page(20, 50), null], // страница 2 (id20..69) ok, страница 3 throws
-          startCursor: 'm70',
-        );
-
-        expect(result.failed, isTrue);
-        expect(result.interrupted, isTrue);
-        // Курсор продвинулся только до границы УСПЕШНО обработанной
-        // страницы (id20..69), не потерян и не "ушёл" дальше.
-        expect(result.cursor, 'm20');
-        expect(result.messages, hasLength(100)); // id20..119
-      },
-    );
-
-    test(
-      'backward: retry from the saved cursor completes the remaining '
+      'backward: page 3 throws -> progress kept, retry completes the '
       'history without duplicates',
-      () {
-        final initial = _page(70, 50);
-        final firstAttempt = _runBackwardCatchUpWithFailures(
-          initial,
-          [_page(20, 50), null],
-          startCursor: 'm70',
-        );
-        expect(firstAttempt.failed, isTrue);
+      () async {
+        final backend = FakeMessageBackend()..add(range(1, 120));
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', const []);
+        backend.failOnCalls.add(3);
 
-        // "Повторить" продолжает с сохранённого курсора (не с начала).
-        final retry = _runBackwardCatchUpWithFailures(
-          firstAttempt.messages,
-          [_page(0, 20)], // id0..19 — короче pageSize, завершает докачку
-          startCursor: firstAttempt.cursor,
-        );
+        await f.sync.onRoomJoined('channel-1');
 
-        expect(retry.failed, isFalse);
-        expect(retry.interrupted, isFalse);
-        expect(retry.messages, hasLength(120));
-        expect(
-          retry.messages.map((m) => m.id).toSet(),
-          _page(0, 120).map((m) => m.id).toSet(),
-        );
+        expect(f.incomplete, ['channel-1']);
+        expect(ids(f.messages), idRange(21, 120));
+        expect(f.sync.confirmedMessageId, '120');
+
+        await f.lastRetry!();
+
+        expect(backend.calls[3].after, '120');
+        expect(backend.calls[4].before, '21');
+        expect(ids(f.messages), idRange(1, 120));
+        expect(f.incomplete, hasLength(1));
+        expect(f.sync.inSync, isTrue);
       },
     );
 
     test(
-      'backward: a live message present before the failing page survives '
+      'backward: a live message delivered before the failing page survives '
       'the error and the retry without being duplicated',
-      () {
-        final live = _message(id: 'z-live', createdAt: DateTime.utc(2027));
-        final initial = [..._page(70, 50), live];
+      () async {
+        final backend = FakeMessageBackend()..add(range(1, 120));
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', const []);
+        backend.failOnCalls.add(3);
+        backend.beforeRespond = (call) {
+          if (call == 3) f.live(msg(121));
+        };
 
-        final firstAttempt = _runBackwardCatchUpWithFailures(
-          initial,
-          [_page(20, 50), null],
-          startCursor: 'm70',
-        );
-        expect(firstAttempt.failed, isTrue);
-        expect(
-          firstAttempt.messages.where((m) => m.id == 'z-live'),
-          hasLength(1),
-        );
+        await f.sync.onRoomJoined('channel-1');
+        expect(ids(f.messages), idRange(21, 121));
 
-        final retry = _runBackwardCatchUpWithFailures(
-          firstAttempt.messages,
-          [_page(0, 20)],
-          startCursor: firstAttempt.cursor,
-        );
+        await f.lastRetry!();
 
-        expect(retry.messages.where((m) => m.id == 'z-live'), hasLength(1));
-        expect(retry.messages, hasLength(121)); // 120 истории + live
+        expect(ids(f.messages), idRange(1, 121));
       },
     );
 
     test(
-      'backward: a live message that arrived before the very first catch-up '
-      'page (channel:join race) is not lost even if that first page fails',
-      () {
-        final live = _message(id: 'z-live', createdAt: DateTime.utc(2027));
-        // current уже содержит live-сообщение к моменту первого вызова —
-        // симулирует "сообщение прилетело сразу после channel:join, до того
-        // как докачка успела сделать первый запрос".
-        final initial = [..._page(70, 50), live];
+      'forward: page 2 throws -> confirmed point stays at the first page '
+      'boundary; live message survives; retry completes',
+      () async {
+        final backend = FakeMessageBackend()..add(range(1, 120));
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', range(1, 10));
+        backend.failOnCalls.add(2);
+        backend.beforeRespond = (call) {
+          if (call == 2) f.live(msg(121));
+        };
 
-        final firstAttempt = _runBackwardCatchUpWithFailures(
-          initial,
-          [null], // первая же страница падает
-          startCursor: 'm70',
-        );
+        await f.sync.onRoomJoined('channel-1');
 
-        expect(firstAttempt.failed, isTrue);
-        expect(
-          firstAttempt.messages.where((m) => m.id == 'z-live'),
-          hasLength(1),
-        );
-        expect(firstAttempt.messages, hasLength(51)); // 50 исходных + live
+        expect(f.incomplete, ['channel-1']);
+        expect(f.sync.confirmedMessageId, '60');
+        expect(ids(f.messages), [...idRange(1, 60), '121']);
+
+        await f.lastRetry!();
+
+        expect(backend.afterCursors.skip(2).toList(),['60', '110']);
+        expect(ids(f.messages), idRange(1, 121));
       },
     );
 
     test(
-      'forward: channel with 120 messages, page 2 throws -> cursor stays '
-      'at the boundary of the first successful page',
-      () {
-        final initial = _page(1, 10); // id1..10, последнее известное m10
-        final result = _runForwardCatchUpWithFailures(
-          initial,
-          [_page(11, 50), null], // страница id11..60 ok, страница 2 throws
-          startCursor: 'm10',
-        );
+      'unknown baseline: the very first page (no cursor) throws -> '
+      'incomplete, nothing confirmed, retry restores everything',
+      () async {
+        final backend = FakeMessageBackend()..add(range(1, 90));
+        final f = SyncFixture(backend);
+        f.sync.resetForChannel('channel-1');
+        backend.failOnCalls.add(1);
 
-        expect(result.failed, isTrue);
-        expect(result.interrupted, isTrue);
-        expect(result.cursor, 'm60');
-        expect(result.messages, hasLength(60)); // id1..60
-      },
-    );
+        await f.sync.onRoomJoined('channel-1');
 
-    test(
-      'forward: retry from the saved cursor completes the remaining '
-      'history without duplicates',
-      () {
-        final initial = _page(1, 10);
-        final firstAttempt = _runForwardCatchUpWithFailures(
-          initial,
-          [_page(11, 50), null],
-          startCursor: 'm10',
-        );
-        expect(firstAttempt.failed, isTrue);
+        expect(f.incomplete, ['channel-1']);
+        expect(f.sync.baselineKnown, isFalse);
+        expect(f.sync.confirmedMessageId, isNull);
+        expect(f.messages, isEmpty);
 
-        final retry = _runForwardCatchUpWithFailures(
-          firstAttempt.messages,
-          [_page(61, 50), _page(111, 10)], // id61..110, затем id111..120 (short)
-          startCursor: firstAttempt.cursor,
-        );
+        f.live(msg(91));
+        await f.lastRetry!();
 
-        expect(retry.failed, isFalse);
-        expect(retry.interrupted, isFalse);
-        expect(retry.messages, hasLength(120));
-        expect(
-          retry.messages.map((m) => m.id).toSet(),
-          _page(1, 120).map((m) => m.id).toSet(),
-        );
-      },
-    );
-
-    test(
-      'forward: a live message present before the failing page survives '
-      'the error and the retry without being duplicated',
-      () {
-        final live = _message(id: 'z-live', createdAt: DateTime.utc(2027));
-        final initial = [..._page(1, 10), live];
-
-        final firstAttempt = _runForwardCatchUpWithFailures(
-          initial,
-          [_page(11, 50), null],
-          startCursor: 'm10',
-        );
-        expect(firstAttempt.failed, isTrue);
-        expect(
-          firstAttempt.messages.where((m) => m.id == 'z-live'),
-          hasLength(1),
-        );
-
-        final retry = _runForwardCatchUpWithFailures(
-          firstAttempt.messages,
-          [_page(61, 50), _page(111, 10)],
-          startCursor: firstAttempt.cursor,
-        );
-
-        expect(retry.messages.where((m) => m.id == 'z-live'), hasLength(1));
-        expect(retry.messages, hasLength(121)); // 120 истории + live
-      },
-    );
-
-    test(
-      'empty-channel forward fetch (no cursor): the very first page throws '
-      '-> failed, no cursor to resume from, messages unchanged',
-      () {
-        final result = _runEmptyChannelCatchUpWithFailures(const [], null);
-
-        expect(result.failed, isTrue);
-        expect(result.interrupted, isTrue);
-        expect(result.cursor, isNull);
-        expect(result.messages, isEmpty);
-      },
-    );
-
-    test(
-      'empty-channel forward fetch: retry after a first-page failure '
-      'restores the channel fully, including a live message that arrived '
-      'before the retry',
-      () {
-        final live = _message(id: 'z-live', createdAt: DateTime.utc(2027));
-
-        final firstAttempt = _runEmptyChannelCatchUpWithFailures(
-          [live],
-          null,
-        );
-        expect(firstAttempt.failed, isTrue);
-        expect(firstAttempt.messages, [live]);
-
-        // "Повторить" вызывает _catchUpEmptyChannel заново без курсора (как
-        // и первый раз) — сохранённого прогресса нет, т.к. ни одна страница
-        // ещё не была успешно обработана.
-        final retry = _runEmptyChannelCatchUpWithFailures(
-          firstAttempt.messages,
-          _page(40, 50), // latest 50 (id40..89), полная страница
-          backwardPages: [_page(0, 40)], // id0..39 — короче pageSize, конец истории
-        );
-
-        expect(retry.failed, isFalse);
-        expect(retry.interrupted, isFalse);
-        expect(retry.messages.where((m) => m.id == 'z-live'), hasLength(1));
-        expect(retry.messages, hasLength(91)); // 90 истории + live
+        expect(backend.calls[1].after, isNull);
+        expect(ids(f.messages), idRange(1, 91));
+        expect(f.sync.confirmedMessageId, '91');
       },
     );
   });

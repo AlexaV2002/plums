@@ -694,6 +694,12 @@ class RealtimeClient {
   bool _manuallyDisconnected = false;
   Timer? _reconnectWatchdog;
   int _connectionEpoch = 0;
+  ValueChanged<String?>? _onRoomJoined;
+  ValueChanged<RealtimeChannelDelete>? _onChannelJoinDenied;
+
+  // Сокет подключён и сессия подтверждена presence:identify — только тогда
+  // ранее выбранная комната канала действительно активна на backend.
+  bool get isIdentified => _identified && socket.connected;
 
   void connect({
     required Future<String?> Function() getAccessToken,
@@ -718,6 +724,8 @@ class RealtimeClient {
   }) {
     if (_disposed || _handlersInstalled) return;
     _handlersInstalled = true;
+    _onRoomJoined = onReconnected;
+    _onChannelJoinDenied = onChannelDelete;
 
     Future<void> identifyAndRejoin() async {
       final epoch = ++_connectionEpoch;
@@ -958,7 +966,47 @@ class RealtimeClient {
       return;
     }
 
-    if (_identified) socket.emit('channel:join', {'channelId': channelId});
+    if (_identified) unawaited(_joinChannelWithAck(channelId));
+  }
+
+  // Вход в комнату уже identified-сокетом: докачка истории должна стартовать
+  // только после подтверждения входа (ack), иначе сообщения между REST-ответом
+  // и фактическим join теряются. До identify канал войдёт identifyAndRejoin.
+  Future<void> _joinChannelWithAck(String channelId) async {
+    final epoch = _connectionEpoch;
+    bool stale() =>
+        _disposed ||
+        !socket.connected ||
+        epoch != _connectionEpoch ||
+        !_identified ||
+        _currentChannelId != channelId;
+    try {
+      final ack = await socket.timeout(5000).emitWithAckAsync(
+        'channel:join',
+        {'channelId': channelId},
+      );
+      // При смене канала leaveChannel уже отправил channel:leave.
+      if (stale()) return;
+      if (ack is Map &&
+          ack['joined'] == true &&
+          ack['channelId'] == channelId) {
+        _onRoomJoined?.call(channelId);
+        return;
+      }
+      if (ack is Map &&
+          (ack['reason'] == 'forbidden' || ack['reason'] == 'not_found') &&
+          _currentServerId != null) {
+        _onChannelJoinDenied?.call(
+          RealtimeChannelDelete(id: channelId, serverId: _currentServerId!),
+        );
+        return;
+      }
+    } catch (_) {
+      if (stale()) return;
+    }
+    Future.delayed(const Duration(seconds: 5), () {
+      if (!stale()) unawaited(_joinChannelWithAck(channelId));
+    });
   }
 
   void leaveChannel(String channelId) {
@@ -1646,26 +1694,38 @@ class _MainShellState extends State<MainShell> {
   String? errorMessage;
   String? messagesError;
 
-  // Защита от параллельного запуска докачки пропущенных сообщений: если
-  // соединение мигает (упало-поднялось несколько раз подряд), не даём
-  // второму вызову handleRealtimeReconnected стартовать новый цикл докачки,
-  // пока предыдущий ещё не завершился.
-  bool _reconnectCatchUpInProgress = false;
-
-  // Якорь синхронизации: курсор последнего сообщения, которое клиент
-  // гарантированно видел ДО разрыва соединения (захватывается в момент
-  // onDisconnect, когда новые realtime-события по старому соединению уже
-  // физически невозможны). Без него handleRealtimeReconnected рисковал бы
-  // использовать messages.last.id уже ПОСЛЕ того, как по восстановленному
-  // соединению успело прилететь новое live-сообщение, и пропустить реальный
-  // пробел истории.
-  String? _syncAnchorChannelId;
-  String? _syncAnchorMessageId;
-
-  // Канал, для которого реконнект пришёл во время занятости (первоначальная
-  // загрузка или уже идущая докачка) — чтобы запрос на синхронизацию не
-  // терялся молча, а выполнился сразу после освобождения.
-  String? _pendingReconnectSyncChannelId;
+  // Докачка истории выбранного канала после (пере)входа в комнату: хранит
+  // подтверждённую точку непрерывной синхронизации, pending-запрос и guard
+  // против параллельных циклов (см. MessageSyncController).
+  late final MessageSyncController _messageSync = MessageSyncController(
+    fetch: (channelId, {required limit, after, before}) => apiClient
+        .getMessages(channelId, limit: limit, after: after, before: before),
+    readMessages: () => messages,
+    writeMessages: (next, {hasMore}) {
+      if (!mounted) return;
+      setState(() {
+        messages = next;
+        if (hasMore != null) {
+          hasMoreMessages = hasMore;
+          messagesError = null;
+        }
+      });
+    },
+    isChannelActive: (channelId) =>
+        mounted && selectedChannelId == channelId,
+    onIncomplete: (channelId, retry) {
+      if (!mounted || selectedChannelId != channelId) return;
+      showErrorSnackBar(
+        context,
+        'Не удалось полностью восстановить историю сообщений после '
+        'переподключения',
+        action: SnackBarAction(
+          label: 'Повторить',
+          onPressed: () => unawaited(retry()),
+        ),
+      );
+    },
+  );
 
   final ScrollController messagesScrollController = ScrollController();
 
@@ -1813,336 +1873,19 @@ class _MainShellState extends State<MainShell> {
 
   // После обрыва и восстановления Socket.IO-соединения клиент заново
   // присоединяется к комнате канала, но сообщения, отправленные другими
-  // участниками за время обрыва, по realtime не придут — их нужно
-  // дозагрузить явным запросом, иначе они будут молча потеряны в UI.
-  // Захватывает якорь синхронизации в момент разрыва соединения — до того,
-  // как по восстановленному соединению сможет прийти любое новое
-  // realtime-сообщение. Синхронный метод, не влияет на отображение.
+  // участниками за время обрыва, по realtime не придут — их докачивает
+  // MessageSyncController от подтверждённой точки синхронизации. Сам разрыв
+  // только снимает признак inSync: последнее отображённое (возможно, live)
+  // сообщение курсором не становится.
   void handleRealtimeDisconnected() {
-    _syncAnchorChannelId = selectedChannelId;
-    _syncAnchorMessageId =
-        (selectedChannelId != null && messages.isNotEmpty)
-            ? messages.last.id
-            : null;
+    _messageSync.onDisconnected();
   }
 
+  // Вызывается RealtimeClient после подтверждённого (ack) входа в комнату —
+  // и при переподключении, и при первом входе/переключении канала.
   Future<void> handleRealtimeReconnected(String? channelId) async {
-    if (!mounted || channelId == null || channelId != selectedChannelId) {
-      return;
-    }
-
-    if (isMessagesLoading || _reconnectCatchUpInProgress) {
-      // Текущая занятая операция может не покрыть тот же пробел (например,
-      // она была запущена по устаревшему якорю) — не теряем этот запрос на
-      // синхронизацию молча, а выполним его сразу после освобождения.
-      _pendingReconnectSyncChannelId = channelId;
-      return;
-    }
-
-    await _runReconnectSync(channelId);
-  }
-
-  Future<void> _runReconnectSync(String channelId) async {
-    _pendingReconnectSyncChannelId = null;
-    _reconnectCatchUpInProgress = true;
-    try {
-      // Якорь, захваченный в момент разрыва соединения, надёжнее
-      // messages.last.id: на момент выполнения этого метода по
-      // восстановленному соединению уже может быть дописано новое
-      // live-сообщение (handleRealtimeMessage синхронный и не ждёт этот
-      // метод), из-за чего messages.last.id указывал бы на него, а не на
-      // последнее сообщение, увиденное ДО обрыва, — и докачка пропустила бы
-      // реальный пробел истории. По той же причине важно различать "якоря
-      // для канала нет вовсе" и "якорь есть и явно говорит, что канал был
-      // пуст" — см. chooseReconnectSyncStrategy.
-      final hasAnchorForChannel = _syncAnchorChannelId == channelId;
-      final anchorId = hasAnchorForChannel ? _syncAnchorMessageId : null;
-
-      switch (chooseReconnectSyncStrategy(
-        hasAnchorForChannel: hasAnchorForChannel,
-        anchorMessageId: anchorId,
-        messagesEmpty: messages.isEmpty,
-      )) {
-        case ReconnectSyncStrategy.afterAnchor:
-          await _catchUpMessagesAfter(channelId, anchorId!);
-        case ReconnectSyncStrategy.emptyChannelRestore:
-          // Курсора для докачки `after` нет (канал был пуст на момент
-          // обрыва, либо ещё не успел догрузиться). Забираем последнюю
-          // страницу и, если она полная (вероятно, пропущено больше, чем
-          // pageSize), достаём остальную историю докачкой НАЗАД по курсору
-          // `before`, а не считаем синхронизацию завершённой по первым 50
-          // сообщениям. applyCatchUpPage/_catchUpEmptyChannel сливают
-          // результат с текущим messages через mergeMessagesChronologically,
-          // так что уже пришедшее по realtime live-сообщение не потеряется
-          // и не продублируется.
-          await _catchUpEmptyChannel(channelId);
-        case ReconnectSyncStrategy.afterLastMessage:
-          // Якоря для этого канала нет (например, реконнект пришёл без
-          // предшествующего onDisconnect для этого канала) — используем
-          // прежнее поведение как запасной вариант.
-          await _catchUpMessagesAfter(channelId, messages.last.id);
-      }
-    } catch (_) {
-      // Молча игнорируем: список сообщений уже отображён (не завис в
-      // загрузке), а пропущенные сообщения всё равно продолжат приходить
-      // по realtime-событиям или догрузятся при следующем переподключении.
-    } finally {
-      _reconnectCatchUpInProgress = false;
-    }
-
-    await _flushPendingReconnectSync();
-  }
-
-  // Выполняет отложенный из-за занятости запрос на синхронизацию, если он
-  // всё ещё актуален (канал не сменился, и сейчас ничего не занято).
-  Future<void> _flushPendingReconnectSync() async {
-    final pending = _pendingReconnectSyncChannelId;
-    if (pending == null ||
-        !mounted ||
-        pending != selectedChannelId ||
-        isMessagesLoading ||
-        _reconnectCatchUpInProgress) {
-      return;
-    }
-
-    await _runReconnectSync(pending);
-  }
-
-  // Постранично догружает сообщения после курсора [startCursor]. Каждая
-  // полученная страница сливается с текущим списком через
-  // mergeMessagesChronologically — это защищает от гонки, когда во время
-  // докачки по этому же восстановленному соединению приходит новое live
-  // сообщение (handleRealtimeMessage успевает выполниться между двумя
-  // await этого цикла): простое добавление в конец списка поставило бы его
-  // раньше более старых, но ещё не докачанных страниц.
-  //
-  // Если за maxPages страниц не догнали реальное состояние канала
-  // (последняя полученная страница всё ещё полная — значит, вероятно, есть
-  // ещё данные), не завершаемся молча: показываем snackbar с кнопкой
-  // "Повторить", которая продолжит докачку с последнего достигнутого
-  // курсора, а не с начала.
-  Future<void> _catchUpMessagesAfter(
-    String channelId,
-    String startCursor,
-  ) async {
-    const pageSize = 50;
-    const maxPages = 40; // защита от зависания при аномально долгом обрыве
-    var cursor = startCursor;
-    var lastPageWasFull = false;
-
-    try {
-      for (var page = 0; page < maxPages; page++) {
-        final next = await apiClient.getMessages(
-          channelId,
-          limit: pageSize,
-          after: cursor,
-        );
-
-        if (!mounted || selectedChannelId != channelId) return;
-
-        if (next.isNotEmpty) {
-          setState(() {
-            messages = mergeMessagesChronologically(messages, next);
-          });
-          cursor = next.last.id;
-        }
-
-        lastPageWasFull = next.length >= pageSize;
-        if (!lastPageWasFull) {
-          // Страница короче лимита — догнали realtime, дальше можно не идти.
-          return;
-        }
-      }
-    } catch (_) {
-      // Ошибка отдельной страницы докачки: не завершаемся молча — ниже по
-      // методу уже стоит snackbar с кнопкой "Повторить", передающей
-      // последний УСПЕШНО достигнутый курсор (cursor обновляется сразу после
-      // удачного фетча страницы, до следующей попытки).
-    }
-
-    if (!mounted || selectedChannelId != channelId) return;
-
-    showErrorSnackBar(
-      context,
-      'Не удалось полностью восстановить историю сообщений после '
-      'переподключения',
-      action: SnackBarAction(
-        label: 'Повторить',
-        onPressed: () => unawaited(_retryCatchUp(channelId, cursor)),
-      ),
-    );
-  }
-
-  // Отдельная обёртка для кнопки "Повторить": использует тот же guard, что
-  // и handleRealtimeReconnected, чтобы повторный реконнект во время ожидания
-  // нажатия (или сразу после него) не запустил второй параллельный цикл
-  // докачки для того же канала.
-  Future<void> _retryCatchUp(String channelId, String cursor) async {
-    if (_reconnectCatchUpInProgress) return;
-
-    _reconnectCatchUpInProgress = true;
-    try {
-      await _catchUpMessagesAfter(channelId, cursor);
-    } finally {
-      _reconnectCatchUpInProgress = false;
-    }
-    // Если новый реконнект пришёл во время ожидания "Повторить" и был
-    // отложен из-за занятости — выполняем его сразу, не теряя пробел.
-    await _flushPendingReconnectSync();
-  }
-
-  // Реконнект застал канал без ни одной загруженной локально страницы:
-  // курсора `after` нет совсем. Берём последнюю страницу без курсора — но, в
-  // отличие от прежнего кода, не считаем это завершением синхронизации. Если
-  // страница оказалась полной (== pageSize), в канале, скорее всего, пропущено
-  // больше, и остальное докачиваем НАЗАД по курсору `before`, пока страница не
-  // окажется короче pageSize (дошли до настоящего начала истории).
-  Future<void> _catchUpEmptyChannel(String channelId) async {
-    const pageSize = 50;
-    List<AppMessage> latest;
-    try {
-      latest = await apiClient.getMessages(channelId, limit: pageSize);
-    } catch (_) {
-      // Ошибка первой (без курсора) страницы: не даём ей молча раствориться
-      // во внешнем catch _runReconnectSync — как и в _catchUpMessagesAfter/
-      // _catchUpMessagesBefore, показываем snackbar с кнопкой "Повторить".
-      if (!mounted || selectedChannelId != channelId) return;
-
-      showErrorSnackBar(
-        context,
-        'Не удалось восстановить историю сообщений после переподключения',
-        action: SnackBarAction(
-          label: 'Повторить',
-          onPressed: () => unawaited(_retryCatchUpEmptyChannel(channelId)),
-        ),
-      );
-      return;
-    }
-
-    if (!mounted || selectedChannelId != channelId) return;
-
-    final step = applyCatchUpPage(
-      current: messages,
-      page: latest,
-      pageSize: pageSize,
-    );
-
-    setState(() {
-      messages = step.messages;
-      hasMoreMessages = step.isFull;
-      messagesError = null;
-    });
-
-    final nextCursor = step.nextCursor;
-    if (!step.isFull || nextCursor == null) {
-      // В канале было не больше pageSize сообщений — восстановление полное.
-      return;
-    }
-
-    await _catchUpMessagesBefore(channelId, nextCursor);
-  }
-
-  // Отдельная обёртка для кнопки "Повторить" первой страницы пустого канала —
-  // тот же guard, что и у handleRealtimeReconnected/_retryCatchUp/
-  // _retryCatchUpBefore, чтобы повторный реконнект во время ожидания не
-  // запустил параллельный цикл докачки для того же канала.
-  Future<void> _retryCatchUpEmptyChannel(String channelId) async {
-    if (_reconnectCatchUpInProgress) return;
-
-    _reconnectCatchUpInProgress = true;
-    try {
-      await _catchUpEmptyChannel(channelId);
-    } finally {
-      _reconnectCatchUpInProgress = false;
-    }
-    // Если новый реконнект пришёл во время ожидания "Повторить" и был
-    // отложен из-за занятости — выполняем его сразу, не теряя пробел.
-    await _flushPendingReconnectSync();
-  }
-
-  // Постранично догружает сообщения НАЗАД по курсору [startCursor] —
-  // симметрично _catchUpMessagesAfter, но для случая, когда реконнект застал
-  // канал пустым и нет курсора "вперёд". Каждая страница читает актуальный
-  // messages прямо перед merge (через applyCatchUpPage), чтобы не потерять
-  // live-сообщение, пришедшее по realtime во время этого цикла. Останавливаем
-  // цикл, когда страница короче pageSize (дошли до начала истории), либо по
-  // защитному лимиту maxPages — в этом случае, как и для докачки вперёд, не
-  // завершаемся молча: показываем snackbar с кнопкой "Повторить".
-  Future<void> _catchUpMessagesBefore(
-    String channelId,
-    String startCursor,
-  ) async {
-    const pageSize = 50;
-    const maxPages = 40;
-    var cursor = startCursor;
-    var lastPageWasFull = false;
-
-    try {
-      for (var page = 0; page < maxPages; page++) {
-        final previous = await apiClient.getMessages(
-          channelId,
-          limit: pageSize,
-          before: cursor,
-        );
-
-        if (!mounted || selectedChannelId != channelId) return;
-
-        final step = applyCatchUpPage(
-          current: messages,
-          page: previous,
-          pageSize: pageSize,
-        );
-
-        setState(() {
-          messages = step.messages;
-          hasMoreMessages = step.isFull;
-        });
-
-        final nextCursor = step.nextCursor;
-        if (nextCursor != null) {
-          cursor = nextCursor;
-        }
-
-        lastPageWasFull = step.isFull;
-        if (!lastPageWasFull) {
-          return;
-        }
-      }
-    } catch (_) {
-      // Ошибка отдельной страницы докачки: не завершаемся молча — ниже по
-      // методу уже стоит snackbar с кнопкой "Повторить", передающей
-      // последний УСПЕШНО достигнутый курсор (cursor обновляется сразу после
-      // удачного фетча страницы, до следующей попытки).
-    }
-
-    if (!mounted || selectedChannelId != channelId) return;
-
-    showErrorSnackBar(
-      context,
-      'Не удалось полностью восстановить историю сообщений после '
-      'переподключения',
-      action: SnackBarAction(
-        label: 'Повторить',
-        onPressed: () => unawaited(_retryCatchUpBefore(channelId, cursor)),
-      ),
-    );
-  }
-
-  // Отдельная обёртка для кнопки "Повторить" докачки НАЗАД — тот же guard,
-  // что и у handleRealtimeReconnected/_retryCatchUp, чтобы повторный реконнект
-  // не запустил параллельный цикл докачки для того же канала.
-  Future<void> _retryCatchUpBefore(String channelId, String cursor) async {
-    if (_reconnectCatchUpInProgress) return;
-
-    _reconnectCatchUpInProgress = true;
-    try {
-      await _catchUpMessagesBefore(channelId, cursor);
-    } finally {
-      _reconnectCatchUpInProgress = false;
-    }
-    // Если новый реконнект пришёл во время ожидания "Повторить" и был
-    // отложен из-за занятости — выполняем его сразу, не теряя пробел.
-    await _flushPendingReconnectSync();
+    if (!mounted || channelId == null) return;
+    await _messageSync.onRoomJoined(channelId);
   }
 
   void handleRealtimeMessage(AppMessage message) {
@@ -2150,13 +1893,13 @@ class _MainShellState extends State<MainShell> {
       return;
     }
 
-    if (messages.any((item) => item.id == message.id)) {
-      return;
+    if (!messages.any((item) => item.id == message.id)) {
+      setState(() {
+        messages = [...messages, message];
+      });
     }
-
-    setState(() {
-      messages = [...messages, message];
-    });
+    // Продвигает подтверждённую точку только в состоянии inSync.
+    _messageSync.onLiveMessage(message);
   }
 
   void handleRealtimeMessageUpdate(AppMessage message) {
@@ -2583,6 +2326,34 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
+  // Фиксирует успешно загруженную через REST страницу как baseline канала.
+  void _confirmLoadedBaseline(AppChannel? channel, List<AppMessage> loaded) {
+    _messageSync.resetForChannel(channel?.id);
+    if (channel != null && channel.type == ChannelType.text) {
+      _messageSync.confirmBaseline(channel.id, loaded);
+    }
+  }
+
+  // Вход в комнату после REST-загрузки. Докачка от baseline запустится по
+  // ack входа (onReconnected). Если комната уже была выбрана ранее,
+  // syncRealtimeChannel повторно не входит — синхронизируем сразу.
+  // Иначе выполняем pending-запрос, отложенный на время загрузки.
+  void _syncRealtimeChannelAfterBaseline(AppChannel? channel) {
+    // Без активной identified-сессии комната не подтверждена: синхронизация
+    // запустится по ack из identifyAndRejoin после переподключения.
+    final alreadyJoined =
+        channel != null &&
+        channel.type == ChannelType.text &&
+        realtimeChannelId == channel.id &&
+        realtimeClient.isIdentified;
+    syncRealtimeChannel(channel);
+    if (alreadyJoined) {
+      unawaited(_messageSync.onRoomJoined(channel.id));
+    } else {
+      unawaited(_messageSync.flushPending());
+    }
+  }
+
   Future<void> loadInitialData() async {
     setState(() {
       isLoading = true;
@@ -2632,9 +2403,10 @@ class _MainShellState extends State<MainShell> {
         hasMoreMessages = loadedMessages.length >= 50;
         isLoading = false;
       });
+      _confirmLoadedBaseline(firstChannel, loadedMessages);
       _scrollMessagesToBottom();
       syncRealtimeServer(firstServerId);
-      syncRealtimeChannel(firstChannel);
+      _syncRealtimeChannelAfterBaseline(firstChannel);
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
       setState(() {
@@ -2660,6 +2432,7 @@ class _MainShellState extends State<MainShell> {
       isLoading = true;
       errorMessage = null;
     });
+    _messageSync.resetForChannel(null);
 
     try {
       final loadedChannels = await apiClient.getChannels(serverId);
@@ -2683,9 +2456,10 @@ class _MainShellState extends State<MainShell> {
         hasMoreMessages = loadedMessages.length >= 50;
         isLoading = false;
       });
+      _confirmLoadedBaseline(firstChannel, loadedMessages);
       _scrollMessagesToBottom();
       syncRealtimeServer(serverId);
-      syncRealtimeChannel(firstChannel);
+      _syncRealtimeChannelAfterBaseline(firstChannel);
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
       final statusCode = error.response?.statusCode;
@@ -2730,6 +2504,10 @@ class _MainShellState extends State<MainShell> {
       errorMessage = null;
       messagesError = null;
     });
+    _messageSync.resetForChannel(
+      channelId,
+      baselineLoading: channel.type == ChannelType.text,
+    );
 
     if (channel.type == ChannelType.voice) {
       setState(() {
@@ -2756,12 +2534,11 @@ class _MainShellState extends State<MainShell> {
         isMessagesLoading = false;
         messagesError = null;
       });
+      _messageSync.confirmBaseline(channelId, loadedMessages);
       _scrollMessagesToBottom();
-      syncRealtimeChannel(channel);
       // Реконнект мог прийти во время этой первоначальной загрузки и быть
-      // отложен из-за isMessagesLoading — выполняем его сразу теперь, а не
-      // ждём случайного следующего реконнекта.
-      await _flushPendingReconnectSync();
+      // отложен — он выполнится здесь же, а не при случайном следующем.
+      _syncRealtimeChannelAfterBaseline(channel);
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
 
@@ -2771,12 +2548,9 @@ class _MainShellState extends State<MainShell> {
         messagesError = 'Ошибка загрузки сообщений: ${describeRequestError(error)}';
         isMessagesLoading = false;
       });
-      syncRealtimeChannel(channel);
-      // Реконнект мог прийти во время этой первоначальной загрузки и быть
-      // отложен из-за isMessagesLoading — если загрузка упала с ошибкой,
-      // отложенный запрос нельзя оставлять висеть до случайного следующего
-      // реконнекта.
-      await _flushPendingReconnectSync();
+      // Baseline остаётся неизвестным; отложенный запрос не должен висеть.
+      _messageSync.abortBaseline(channelId);
+      _syncRealtimeChannelAfterBaseline(channel);
     } catch (error) {
       if (!mounted || selectedChannelId != channelId) return;
 
@@ -2784,8 +2558,8 @@ class _MainShellState extends State<MainShell> {
         messagesError = 'Не удалось загрузить сообщения: ${describeRequestError(error)}';
         isMessagesLoading = false;
       });
-      syncRealtimeChannel(channel);
-      await _flushPendingReconnectSync();
+      _messageSync.abortBaseline(channelId);
+      _syncRealtimeChannelAfterBaseline(channel);
     }
   }
 
@@ -2827,7 +2601,8 @@ class _MainShellState extends State<MainShell> {
           : 0.0;
 
       setState(() {
-        messages = [...olderMessages, ...messages];
+        // Merge вместо склейки: страница могла уже прийти докачкой назад.
+        messages = mergeMessagesChronologically(messages, olderMessages);
         hasMoreMessages = olderMessages.length >= pageSize;
         isLoadingMoreMessages = false;
       });
@@ -3304,11 +3079,9 @@ class _MainShellState extends State<MainShell> {
       if (!mounted || selectedChannelId != channelId) return true;
 
       setState(() {
-        if (messages.any((item) => item.id == sentMessage.id)) {
-          return;
-        }
-
-        messages = [...messages, sentMessage];
+        // Merge по id и (createdAt, id): то же сообщение могло уже прийти
+        // через message:new, а чужое live-сообщение — раньше HTTP-ответа.
+        messages = mergeMessagesChronologically(messages, [sentMessage]);
       });
 
       return true;
@@ -3454,6 +3227,9 @@ class _MainShellState extends State<MainShell> {
         messages = [];
         isLoading = false;
       });
+      // Сообщения не загружались: baseline неизвестен, после входа в комнату
+      // контроллер восстановит последнюю страницу без курсора.
+      _messageSync.resetForChannel(selectedChannelId);
       syncRealtimeServer(server.id);
       syncRealtimeChannel(
         loadedChannels.isNotEmpty ? loadedChannels.first : null,
@@ -3691,9 +3467,10 @@ class _MainShellState extends State<MainShell> {
         hasMoreMessages = loadedMessages.length >= 50;
         isLoading = false;
       });
+      _confirmLoadedBaseline(firstChannel, loadedMessages);
       _scrollMessagesToBottom();
       syncRealtimeServer(server.id);
-      syncRealtimeChannel(firstChannel);
+      _syncRealtimeChannelAfterBaseline(firstChannel);
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
 
@@ -6685,7 +6462,7 @@ List<AppMessage> mergeMessagesChronologically(
 // Чистая функция без побочных эффектов и сети, поэтому тестируется без
 // виджетов: вызывающий код сам отвечает за setState и обязан передавать
 // актуальный [current] перед каждым вызовом, чтобы не потерять сообщение,
-// пришедшее по realtime во время докачки (см. _catchUpMessagesBefore).
+// пришедшее по realtime во время докачки (см. MessageSyncController).
 class CatchUpPageStep {
   CatchUpPageStep({
     required this.messages,
@@ -6725,44 +6502,263 @@ CatchUpPageStep applyCatchUpPage({
   );
 }
 
-// Какую стратегию докачки после реконнекта выбрать для канала [channelId]
-// (см. _runReconnectSync, main.dart ~1839). Чистая функция без побочных
-// эффектов — вынесена отдельно, чтобы тест мог вызывать именно эту
-// production-логику выбора, а не копию в test harness.
+// Стратегия докачки после входа в комнату канала. Курсором `after` служит
+// только подтверждённая точка непрерывной синхронизации — никогда не
+// последнее отображённое (возможно, live) сообщение.
 enum ReconnectSyncStrategy {
-  // Есть якорь (последнее сообщение, увиденное ДО обрыва) — докачиваем
-  // `after` этого якоря.
-  afterAnchor,
-  // Якорь явно говорит, что канал был пуст на момент обрыва (или для этого
-  // канала вообще не было onDisconnect, и messages сейчас пуст) — курсора
-  // `after` нет, восстанавливаем с нуля через _catchUpEmptyChannel.
-  emptyChannelRestore,
-  // Якоря для этого канала нет вовсе (реконнект не был предварён
-  // onDisconnect для него), а messages не пуст — запасной вариант, как и
-  // раньше: докачка от текущего последнего сообщения.
-  afterLastMessage,
+  // Baseline известен и непуст — докачка вперёд `after` подтверждённой точки.
+  afterConfirmed,
+  // Baseline неизвестен или подтверждённо пуст — последняя страница без
+  // курсора и, если она полная, докачка назад по `before`.
+  restoreLatest,
 }
 
 ReconnectSyncStrategy chooseReconnectSyncStrategy({
-  required bool hasAnchorForChannel,
-  required String? anchorMessageId,
-  required bool messagesEmpty,
+  required bool baselineKnown,
+  required String? confirmedMessageId,
 }) {
-  if (hasAnchorForChannel) {
-    // Якорь для канала есть: либо он указывает конкретное сообщение (есть
-    // курсор), либо явно null, что означает "канал был пуст на момент
-    // обрыва" — и тогда НЕЛЬЗЯ ориентироваться на текущий messagesEmpty,
-    // потому что по восстановленному соединению уже могло прилететь
-    // live-сообщение, из-за чего список стал непустым, но реальная история
-    // ДО обрыва всё равно не докачана.
-    return anchorMessageId != null
-        ? ReconnectSyncStrategy.afterAnchor
-        : ReconnectSyncStrategy.emptyChannelRestore;
+  return baselineKnown && confirmedMessageId != null
+      ? ReconnectSyncStrategy.afterConfirmed
+      : ReconnectSyncStrategy.restoreLatest;
+}
+
+typedef FetchMessagesPage =
+    Future<List<AppMessage>> Function(
+      String channelId, {
+      required int limit,
+      String? after,
+      String? before,
+    });
+
+// Синхронизация истории выбранного канала с backend после (пере)входа в
+// комнату Socket.IO. Хранит подтверждённую точку непрерывной синхронизации
+// (confirmedMessageId): до неё история канала гарантированно без пробелов.
+// Live-сообщения продвигают её только в состоянии inSync (комната подтверждена
+// и докачка завершилась без обрыва). Чистый Dart без виджетов и сети —
+// сеть и состояние UI передаются колбэками, поэтому класс тестируется напрямую.
+class MessageSyncController {
+  MessageSyncController({
+    required this.fetch,
+    required this.readMessages,
+    required this.writeMessages,
+    required this.isChannelActive,
+    required this.onIncomplete,
+    this.pageSize = 50,
+    this.maxPages = 40,
+    this.maxFlushRounds = 8,
+  });
+
+  final FetchMessagesPage fetch;
+  final List<AppMessage> Function() readMessages;
+  final void Function(List<AppMessage> messages, {bool? hasMore})
+  writeMessages;
+  // mounted && selectedChannelId == channelId
+  final bool Function(String channelId) isChannelActive;
+  // Неполная синхронизация (ошибка страницы / maxPages): UI показывает
+  // «Повторить», retry продолжает с сохранённой точки под тем же guard'ом.
+  final void Function(String channelId, Future<void> Function() retry)
+  onIncomplete;
+  final int pageSize;
+  final int maxPages;
+  final int maxFlushRounds;
+
+  String? _channelId;
+  bool _baselineKnown = false;
+  bool _baselineLoading = false;
+  String? _confirmed;
+  // Незавершённая докачка назад после restoreLatest (продолжается в retry).
+  String? _backwardCursor;
+  bool _inSync = false;
+  int _generation = 0;
+  int _cycleCounter = 0;
+  int? _activeCycle;
+  String? _pending;
+
+  String? get channelId => _channelId;
+  bool get baselineKnown => _baselineKnown;
+  bool get isBaselineLoading => _baselineLoading;
+  String? get confirmedMessageId => _confirmed;
+  bool get inSync => _inSync;
+  bool get isRunning => _activeCycle != null;
+  String? get pendingChannelId => _pending;
+
+  // Смена канала/сервера: baseline неизвестен, текущий цикл (если был)
+  // брошен — его результаты будут отброшены после ближайшего await.
+  void resetForChannel(String? channelId, {bool baselineLoading = false}) {
+    _channelId = channelId;
+    _baselineKnown = false;
+    _baselineLoading = channelId != null && baselineLoading;
+    _confirmed = null;
+    _backwardCursor = null;
+    _inSync = false;
+    _activeCycle = null;
+    _pending = null;
   }
 
-  return messagesEmpty
-      ? ReconnectSyncStrategy.emptyChannelRestore
-      : ReconnectSyncStrategy.afterLastMessage;
+  // Успешная REST-загрузка последней страницы канала.
+  void confirmBaseline(String channelId, List<AppMessage> restPage) {
+    if (_channelId != channelId) resetForChannel(channelId);
+    _baselineLoading = false;
+    _baselineKnown = true;
+    _confirmed = restPage.isEmpty ? null : restPage.last.id;
+    _backwardCursor = null;
+  }
+
+  // REST-загрузка не удалась: baseline остаётся неизвестным, отложенная
+  // синхронизация больше не ждёт загрузку (вызывающий делает flushPending).
+  void abortBaseline(String channelId) {
+    if (_channelId == channelId) _baselineLoading = false;
+  }
+
+  void onDisconnected() {
+    _inSync = false;
+    _generation++;
+  }
+
+  void onLiveMessage(AppMessage message) {
+    if (_inSync && message.channelId == _channelId) {
+      _confirmed = message.id;
+    }
+  }
+
+  // Вход в комнату подтверждён ack: с этого момента live-события канала
+  // доходят, поэтому докачка от подтверждённой точки закрывает пробел.
+  Future<void> onRoomJoined(String channelId) async {
+    if (!isChannelActive(channelId)) return;
+    if (_channelId != channelId) resetForChannel(channelId);
+    _pending = channelId;
+    await flushPending();
+  }
+
+  // Выполняет отложенную синхронизацию, если ничего не занято. Число
+  // раундов ограничено; оставшийся запрос не теряется молча — onIncomplete.
+  Future<void> flushPending() async {
+    for (var round = 0; round < maxFlushRounds; round++) {
+      final channelId = _pending;
+      if (channelId == null || isRunning || _baselineLoading) return;
+      _pending = null;
+      if (channelId != _channelId || !isChannelActive(channelId)) return;
+      await _runCycle(channelId);
+    }
+    final leftover = _pending;
+    if (leftover != null &&
+        !isRunning &&
+        !_baselineLoading &&
+        leftover == _channelId &&
+        isChannelActive(leftover)) {
+      _pending = null;
+      onIncomplete(leftover, () => _retry(leftover));
+    }
+  }
+
+  Future<void> _retry(String channelId) async {
+    if (channelId != _channelId || !isChannelActive(channelId)) return;
+    _pending = channelId;
+    await flushPending();
+  }
+
+  Future<void> _runCycle(String channelId) async {
+    final cycle = ++_cycleCounter;
+    _activeCycle = cycle;
+    final generation = _generation;
+    _inSync = false;
+    bool alive() =>
+        _activeCycle == cycle &&
+        _channelId == channelId &&
+        isChannelActive(channelId);
+
+    var complete = false;
+    try {
+      complete = await _syncSteps(channelId, alive);
+    } catch (_) {
+      // Ошибка страницы: confirmed остаётся на последней успешной странице.
+      complete = false;
+    }
+
+    if (_activeCycle != cycle) return; // цикл брошен resetForChannel
+    _activeCycle = null;
+    if (_channelId != channelId || !isChannelActive(channelId)) return;
+
+    if (complete) {
+      // Обрыв во время цикла: точка продвинута, но непрерывность после неё
+      // не гарантирована — продолжит следующая (pending) синхронизация.
+      if (generation == _generation) _inSync = true;
+    } else {
+      onIncomplete(channelId, () => _retry(channelId));
+    }
+  }
+
+  Future<bool> _syncSteps(String channelId, bool Function() alive) async {
+    switch (chooseReconnectSyncStrategy(
+      baselineKnown: _baselineKnown,
+      confirmedMessageId: _confirmed,
+    )) {
+      case ReconnectSyncStrategy.afterConfirmed:
+        if (!await _syncForward(channelId, alive)) return false;
+      case ReconnectSyncStrategy.restoreLatest:
+        if (!await _restoreLatest(channelId, alive)) return false;
+    }
+    if (_backwardCursor != null) return _syncBackward(channelId, alive);
+    return true;
+  }
+
+  // Вперёд от подтверждённой точки; каждая страница сливается с актуальным
+  // списком (live-сообщения, пришедшие во время await, не теряются).
+  Future<bool> _syncForward(String channelId, bool Function() alive) async {
+    for (var page = 0; page < maxPages; page++) {
+      final cursor = _confirmed;
+      if (cursor == null) return false;
+      final next = await fetch(channelId, limit: pageSize, after: cursor);
+      if (!alive()) return false;
+      if (next.isNotEmpty) {
+        writeMessages(mergeMessagesChronologically(readMessages(), next));
+        _confirmed = next.last.id;
+      }
+      if (next.length < pageSize) return true;
+    }
+    return false; // maxPages исчерпан при полной странице — не «успех»
+  }
+
+  Future<bool> _restoreLatest(String channelId, bool Function() alive) async {
+    final latest = await fetch(channelId, limit: pageSize);
+    if (!alive()) return false;
+    final step = applyCatchUpPage(
+      current: readMessages(),
+      page: latest,
+      pageSize: pageSize,
+    );
+    writeMessages(step.messages, hasMore: step.isFull);
+    _baselineKnown = true;
+    _confirmed = latest.isEmpty ? null : latest.last.id;
+    _backwardCursor = step.isFull ? step.nextCursor : null;
+    return true;
+  }
+
+  // Назад до начала истории; confirmed не меняет.
+  Future<bool> _syncBackward(String channelId, bool Function() alive) async {
+    for (var page = 0; page < maxPages; page++) {
+      final cursor = _backwardCursor;
+      if (cursor == null) return true;
+      final previous = await fetch(
+        channelId,
+        limit: pageSize,
+        before: cursor,
+      );
+      if (!alive()) return false;
+      final step = applyCatchUpPage(
+        current: readMessages(),
+        page: previous,
+        pageSize: pageSize,
+      );
+      writeMessages(step.messages, hasMore: step.isFull);
+      if (!step.isFull) {
+        _backwardCursor = null;
+        return true;
+      }
+      _backwardCursor = step.nextCursor;
+    }
+    return false;
+  }
 }
 
 Color? parseHexColor(String? hex) {

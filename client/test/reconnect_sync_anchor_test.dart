@@ -1,508 +1,388 @@
-// Покрывает P1-дефект "новое live-сообщение может стать курсором докачки,
-// пропустив реальный пробел": handleRealtimeReconnected раньше брало курсор
-// из messages.last.id уже ПОСЛЕ реконнекта, а к этому моменту по
-// восстановленному соединению может успеть прийти новое live-сообщение
-// (handleRealtimeMessage синхронный и ничего не ждёт), из-за чего реальный
-// пробел истории молча терялся.
-//
-// MainShell сейчас не DI-параметризован для apiClient/RealtimeClient (как
-// уже отмечено в auth_gate_restore_session_test.dart для apiClient), и
-// realtimeClient создаётся внутри _MainShellState без возможности подменить
-// socketUrl — полноценный widget-тест с реальным Socket.IO потребовал бы
-// отдельного DI-рефакторинга MainShell, затрагивающего ~60 обращений к
-// apiClient/realtimeClient по всему файлу, что противоречит правилу
-// минимального diff для этой задачи. Поэтому, как и остальные сценарии
-// catch-up в catch_up_messages_test.dart, тест мирроит РЕАЛЬНУЮ логику
-// _MainShellState (handleRealtimeDisconnected/handleRealtimeReconnected/
-// _runReconnectSync/_flushPendingReconnectSync/handleRealtimeMessage,
-// main.dart ~1812-1900) построчно, используя настоящие экспортированные
-// чистые функции mergeMessagesChronologically/applyCatchUpPage, и подменяя
-// только сетевой вызов apiClient.getMessages на инжектируемую функцию.
+// Восстановление истории после (пере)входа в комнату Socket.IO (A04).
+// Тесты драйвят РЕАЛЬНЫЙ MessageSyncController из main.dart поверх
+// in-memory backend (test/support/fake_message_backend.dart); от
+// _MainShellState повторена только тривиальная обвязка handleRealtimeMessage
+// (SyncFixture.live: добавить без дубля + controller.onLiveMessage).
 import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:client/main.dart';
 
-AppMessage _msg(String id, DateTime createdAt) {
-  return AppMessage(
-    id: id,
-    channelId: 'channel-1',
-    authorId: 'author-1',
-    author: 'tester',
-    content: 'content-$id',
-    time: '00:00',
-    createdAt: createdAt,
-    updatedAt: createdAt,
-  );
-}
+import 'support/fake_message_backend.dart';
 
-List<AppMessage> _range(int from, int to) {
-  return [
-    for (var i = from; i <= to; i++)
-      _msg('$i', DateTime.utc(2026, 1, 1).add(Duration(seconds: i))),
-  ];
-}
-
-typedef _GetMessagesFn =
-    Future<List<AppMessage>> Function(
-      String channelId, {
-      int? limit,
-      String? after,
-      String? before,
-    });
-
-// Мини-фикстура backend-пагинации: ids — числовые строки, `after`/`before`
-// фильтруют и режут по `limit`, как реальный REST-курсор getMessages.
-_GetMessagesFn _backedBy(List<AppMessage> all) {
-  final sorted = [...all]
-    ..sort((a, b) => int.parse(a.id).compareTo(int.parse(b.id)));
-
-  return (channelId, {limit, after, before}) async {
-    var pool = sorted;
-    if (after != null) {
-      final afterId = int.parse(after);
-      pool = pool.where((m) => int.parse(m.id) > afterId).toList();
-    }
-    if (before != null) {
-      final beforeId = int.parse(before);
-      pool = pool.where((m) => int.parse(m.id) < beforeId).toList();
-    }
-    final take = limit ?? pool.length;
-    if (pool.length <= take) return pool;
-    // `after` (докачка вперёд): следующая страница — самые СТАРЫЕ из
-    // оставшихся после курсора. Без курсора вовсе (как и `before`, докачка
-    // назад/начальная загрузка) — backend отдаёт самые НОВЫЕ: сначала
-    // последнюю страницу, которую затем можно докачивать `before` вглубь
-    // истории (см. _catchUpEmptyChannel/selectChannel).
-    return after != null
-        ? pool.sublist(0, take)
-        : pool.sublist(pool.length - take);
-  };
-}
-
-class _ReconnectSyncHarness {
-  _ReconnectSyncHarness(this._getMessages);
-
-  final _GetMessagesFn _getMessages;
-
-  List<AppMessage> messages = [];
-  String? selectedChannelId;
-  bool isMessagesLoading = false;
-  bool reconnectCatchUpInProgress = false;
-  String? syncAnchorChannelId;
-  String? syncAnchorMessageId;
-  String? pendingReconnectSyncChannelId;
-  final mounted = true;
-
-  // Фиксирует, какой курсор `after` реально использовал REST-запрос —
-  // ключевая проверка сценария: должен быть якорь ('10'), а не
-  // messages.last.id ('71'), захваченное после гонки с live-событием.
-  final List<String> afterCursorsUsed = [];
-
-  void handleRealtimeMessage(AppMessage message) {
-    if (!mounted || message.channelId != selectedChannelId) return;
-    if (messages.any((item) => item.id == message.id)) return;
-    messages = [...messages, message];
-  }
-
-  void handleRealtimeDisconnected() {
-    syncAnchorChannelId = selectedChannelId;
-    syncAnchorMessageId =
-        (selectedChannelId != null && messages.isNotEmpty)
-            ? messages.last.id
-            : null;
-  }
-
-  Future<void> handleRealtimeReconnected(String? channelId) async {
-    if (!mounted || channelId == null || channelId != selectedChannelId) {
-      return;
-    }
-    if (isMessagesLoading || reconnectCatchUpInProgress) {
-      pendingReconnectSyncChannelId = channelId;
-      return;
-    }
-    await _runReconnectSync(channelId);
-  }
-
-  Future<void> _runReconnectSync(String channelId) async {
-    pendingReconnectSyncChannelId = null;
-    reconnectCatchUpInProgress = true;
-    try {
-      final hasAnchorForChannel = syncAnchorChannelId == channelId;
-      final anchorId = hasAnchorForChannel ? syncAnchorMessageId : null;
-
-      // Вызывает настоящую production-функцию выбора стратегии
-      // (main.dart ~6600), а не копию логики — только сами ветки докачки
-      // (сетевые вызовы) всё ещё мирроятся harness-ом ниже.
-      switch (chooseReconnectSyncStrategy(
-        hasAnchorForChannel: hasAnchorForChannel,
-        anchorMessageId: anchorId,
-        messagesEmpty: messages.isEmpty,
-      )) {
-        case ReconnectSyncStrategy.afterAnchor:
-          await _catchUpMessagesAfter(channelId, anchorId!);
-        case ReconnectSyncStrategy.emptyChannelRestore:
-          await _catchUpEmptyChannel(channelId);
-        case ReconnectSyncStrategy.afterLastMessage:
-          await _catchUpMessagesAfter(channelId, messages.last.id);
-      }
-    } catch (_) {
-      // как и в реальном коде — молча игнорируем.
-    } finally {
-      reconnectCatchUpInProgress = false;
-    }
-    await flushPendingReconnectSync();
-  }
-
-  Future<void> flushPendingReconnectSync() async {
-    final pending = pendingReconnectSyncChannelId;
-    if (pending == null ||
-        !mounted ||
-        pending != selectedChannelId ||
-        isMessagesLoading ||
-        reconnectCatchUpInProgress) {
-      return;
-    }
-    await _runReconnectSync(pending);
-  }
-
-  Future<void> _catchUpMessagesAfter(
-    String channelId,
-    String startCursor,
-  ) async {
-    const pageSize = 50;
-    const maxPages = 40;
-    var cursor = startCursor;
-
-    for (var page = 0; page < maxPages; page++) {
-      afterCursorsUsed.add(cursor);
-      final next = await _getMessages(channelId, limit: pageSize, after: cursor);
-
-      if (!mounted || selectedChannelId != channelId) return;
-
-      if (next.isNotEmpty) {
-        messages = mergeMessagesChronologically(messages, next);
-        cursor = next.last.id;
-      }
-
-      if (next.length < pageSize) return;
-    }
-  }
-
-  Future<void> _catchUpEmptyChannel(String channelId) async {
-    const pageSize = 50;
-    final latest = await _getMessages(channelId, limit: pageSize);
-
-    if (!mounted || selectedChannelId != channelId) return;
-
-    final step = applyCatchUpPage(
-      current: messages,
-      page: latest,
-      pageSize: pageSize,
-    );
-    messages = step.messages;
-
-    final nextCursor = step.nextCursor;
-    if (!step.isFull || nextCursor == null) return;
-
-    await _catchUpMessagesBefore(channelId, nextCursor);
-  }
-
-  Future<void> _catchUpMessagesBefore(
-    String channelId,
-    String startCursor,
-  ) async {
-    const pageSize = 50;
-    const maxPages = 40;
-    var cursor = startCursor;
-
-    for (var page = 0; page < maxPages; page++) {
-      final previous = await _getMessages(channelId, limit: pageSize, before: cursor);
-
-      if (!mounted || selectedChannelId != channelId) return;
-
-      final step = applyCatchUpPage(
-        current: messages,
-        page: previous,
-        pageSize: pageSize,
-      );
-      messages = step.messages;
-
-      final nextCursor = step.nextCursor;
-      if (nextCursor != null) cursor = nextCursor;
-
-      if (!step.isFull) return;
-    }
+Future<void> _settle() async {
+  for (var i = 0; i < 10; i++) {
+    await Future<void>.delayed(Duration.zero);
   }
 }
 
 void main() {
-  group('reconnect sync anchor (mirrors handleRealtimeDisconnected/'
-      'handleRealtimeReconnected, main.dart ~1812-1878)', () {
+  group('MessageSyncController: confirmed sync point', () {
     test(
-      'a live message that arrives before catch-up runs does not become '
-      'the cursor and does not hide the real gap',
+      '1. first connect: live #71 during the first page never becomes the '
+      'cursor; history 1-71 is restored from the REST baseline',
       () async {
-        // Backend ("A") содержит сообщения 1-70 — 11-70 отправлены за время
-        // обрыва B. #71 придёт отдельно, только по realtime (см. ниже).
-        final harness = _ReconnectSyncHarness(_backedBy(_range(1, 70)));
-        harness.selectedChannelId = 'channel-1';
-        harness.messages = _range(1, 10);
+        final backend = FakeMessageBackend()..add(range(1, 10));
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', range(1, 10));
 
-        // B видел 1-10. Соединение рвётся: якорь фиксирует последнее УВИДЕННОЕ
-        // сообщение (#10) ДО того, как что-то новое сможет прийти.
-        harness.handleRealtimeDisconnected();
-        expect(harness.syncAnchorChannelId, 'channel-1');
-        expect(harness.syncAnchorMessageId, '10');
+        // Пока сокет ещё не в комнате, A отправляет 11-70.
+        backend.add(range(11, 70));
+        // B вошёл в комнату; live #71 приходит во время первой REST-страницы.
+        backend.beforeRespond = (call) {
+          if (call == 1) f.live(msg(71));
+        };
 
-        // Реконнект восстановился, и ДО того, как выполнится REST-докачка,
-        // по сокету уже прилетело #71 — ровно гонка из описания дефекта.
-        harness.handleRealtimeMessage(_msg('71', DateTime.utc(2026, 1, 1, 0, 1, 11)));
-        // Без фикса курсором стало бы именно это значение.
-        expect(harness.messages.last.id, '71');
+        await f.sync.onRoomJoined('channel-1');
 
-        await harness.handleRealtimeReconnected('channel-1');
-
-        // Докачка пошла от якоря '10' (не от '71'), двумя страницами по 50:
-        // 11-60 (полная, pageSize=50) и 61-70 (короче — докачка завершена).
-        expect(harness.afterCursorsUsed, ['10', '60']);
-        expect(
-          harness.messages.map((m) => m.id).toList(),
-          [for (var i = 1; i <= 71; i++) '$i'],
-        );
-        expect(
-          harness.messages.map((m) => m.id).toSet().length,
-          71,
-          reason: 'без дублей',
-        );
+        expect(backend.calls.first.after, '10');
+        expect(backend.afterCursors, ['10', '60']);
+        expect(ids(f.messages), idRange(1, 71));
+        expect(f.sync.inSync, isTrue);
+        expect(f.sync.confirmedMessageId, '71');
+        expect(f.incomplete, isEmpty);
       },
     );
 
     test(
-      'repeated disconnect/reconnect cycles keep rewriting the anchor to '
-      'the latest known message without duplicates or stale cursors',
+      '2. channel empty at disconnect + live #71 before sync -> full '
+      'restore 1-71 without a forward cursor',
       () async {
-        var callCount = 0;
-        final harness = _ReconnectSyncHarness((channelId, {limit, after, before}) async {
-          callCount++;
-          if (callCount == 1) return _range(6, 10);
-          // Второй цикл: backend уже содержит #11 (та же live-доставка, что
-          // пришла и по сокету) — REST-ответ идемпотентно пересечётся с ней.
-          return [_msg('11', DateTime.utc(2026, 1, 1, 0, 0, 11))];
-        });
-        harness.selectedChannelId = 'channel-1';
-        harness.messages = _range(1, 5);
+        final backend = FakeMessageBackend();
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', const []);
+        expect(f.sync.baselineKnown, isTrue);
+        expect(f.sync.confirmedMessageId, isNull);
 
-        harness.handleRealtimeDisconnected();
-        expect(harness.syncAnchorMessageId, '5');
-        await harness.handleRealtimeReconnected('channel-1');
-        expect(harness.afterCursorsUsed, ['5']);
-        expect(harness.messages.map((m) => m.id).toList(), [for (var i = 1; i <= 10; i++) '$i']);
+        f.sync.onDisconnected();
+        backend.add(range(1, 70));
+        f.live(msg(71));
+        expect(ids(f.messages), ['71']);
 
-        // Второй обрыв: якорь должен перезаписаться на актуальное #10, а не
-        // остаться на #5 и не накопить мусор от первого цикла.
-        harness.handleRealtimeDisconnected();
-        expect(harness.syncAnchorMessageId, '10');
+        await f.sync.onRoomJoined('channel-1');
 
-        harness.handleRealtimeMessage(_msg('11', DateTime.utc(2026, 1, 1, 0, 0, 11)));
-        await harness.handleRealtimeReconnected('channel-1');
-
-        expect(harness.afterCursorsUsed, ['5', '10']);
-        expect(
-          harness.messages.map((m) => m.id).toList(),
-          [for (var i = 1; i <= 11; i++) '$i'],
-        );
-        expect(harness.messages.map((m) => m.id).toSet().length, 11);
+        expect(backend.afterCursors, everyElement(isNull));
+        expect(backend.calls.map((c) => c.before).toList(), [null, '22']);
+        expect(ids(f.messages), idRange(1, 71));
+        expect(f.hasMore, isFalse);
+        expect(f.sync.confirmedMessageId, '71');
+        expect(f.sync.inSync, isTrue);
       },
     );
 
     test(
-      'a reconnect that arrives while busy is not lost and runs right '
-      'after the current operation frees up',
+      '3. non-empty channel: 10 + 60 missed + live #71 -> 1-71 without '
+      'duplicates, cursor is the confirmed point (10), not #71',
       () async {
-        final harness = _ReconnectSyncHarness(_backedBy(_range(1, 10)));
-        harness.selectedChannelId = 'channel-1';
-        harness.messages = _range(1, 5);
-        harness.handleRealtimeDisconnected();
+        final backend = FakeMessageBackend()..add(range(1, 10));
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', range(1, 10));
+        await f.sync.onRoomJoined('channel-1');
+        expect(f.sync.inSync, isTrue);
 
-        // Первоначальная загрузка канала ещё идёт — реконнект не должен
-        // молча потеряться, а должен быть отложен.
-        harness.isMessagesLoading = true;
-        await harness.handleRealtimeReconnected('channel-1');
-        expect(harness.afterCursorsUsed, isEmpty);
-        expect(harness.pendingReconnectSyncChannelId, 'channel-1');
+        f.sync.onDisconnected();
+        backend.add(range(11, 70));
+        f.live(msg(71));
+        expect(f.sync.confirmedMessageId, '10');
 
-        // Первоначальная загрузка завершилась — отложенная синхронизация
-        // выполняется немедленно, а не ждёт следующего случайного реконнекта.
-        harness.isMessagesLoading = false;
-        await harness.flushPendingReconnectSync();
+        await f.sync.onRoomJoined('channel-1');
 
-        expect(harness.afterCursorsUsed, ['5']);
-        expect(harness.pendingReconnectSyncChannelId, isNull);
-        expect(
-          harness.messages.map((m) => m.id).toList(),
-          [for (var i = 1; i <= 10; i++) '$i'],
-        );
+        expect(backend.afterCursors, ['10', '10', '60']);
+        expect(ids(f.messages), idRange(1, 71));
+        expect(ids(f.messages).toSet(), hasLength(71));
       },
     );
 
     test(
-      'switching the selected channel while catch-up for the previous '
-      'channel is still in flight does not leak messages across channels',
+      '4. two quick disconnect/reconnect cycles: the second join is pending '
+      'and runs after the first cycle, fetch is never concurrent',
       () async {
-        final pageA = Completer<List<AppMessage>>();
-        final harness = _ReconnectSyncHarness((channelId, {limit, after, before}) {
-          return pageA.future;
-        });
-        harness.selectedChannelId = 'channel-1';
-        harness.messages = _range(1, 5);
-        harness.handleRealtimeDisconnected();
+        final backend = FakeMessageBackend()..add(range(1, 10));
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', range(1, 10));
+        backend.add(range(11, 130));
+        final gate = Completer<void>();
+        backend.beforeRespond = (call) async {
+          if (call == 1) await gate.future;
+        };
 
-        final pending = harness.handleRealtimeReconnected('channel-1');
+        f.sync.onDisconnected();
+        final first = f.sync.onRoomJoined('channel-1');
+        await _settle();
+        expect(backend.calls, hasLength(1));
+        expect(f.sync.isRunning, isTrue);
 
-        // Пока REST-ответ канала A ещё не пришёл, пользователь переключается
-        // на канал B — это защищено существующей проверкой
-        // selectedChannelId != channelId внутри _catchUpMessagesAfter.
-        harness.selectedChannelId = 'channel-2';
-        harness.messages = _range(100, 102);
+        f.sync.onDisconnected();
+        final second = f.sync.onRoomJoined('channel-1');
+        await _settle();
+        expect(backend.calls, hasLength(1), reason: 'no concurrent cycle');
+        expect(f.sync.pendingChannelId, 'channel-1');
 
-        pageA.complete(_range(6, 50));
-        await pending;
+        gate.complete();
+        await Future.wait([first, second]);
 
-        expect(
-          harness.messages.map((m) => m.id).toList(),
-          ['100', '101', '102'],
-          reason: 'докачка канала A не должна писать в messages канала B',
-        );
+        expect(backend.maxInFlight, 1);
+        expect(backend.afterCursors, ['10', '60', '110', '130']);
+        expect(ids(f.messages), idRange(1, 130));
+        expect(f.sync.pendingChannelId, isNull);
+        expect(f.sync.inSync, isTrue);
+        expect(f.incomplete, isEmpty);
       },
     );
 
     test(
-      'channel empty at disconnect time + a live message arriving before '
-      'reconnect runs must still trigger full empty-channel restore, not '
-      'be mistaken for "no anchor at all"',
+      '5. disconnect in the middle of catch-up: the next cycle resumes from '
+      'the last confirmed page (60), not from live #71',
       () async {
-        // Backend содержит полную историю 1-70 (канал был пуст у B только
-        // локально — например, B присоединился во время обрыва и ещё не
-        // успел ничего загрузить).
-        final harness = _ReconnectSyncHarness(_backedBy(_range(1, 70)));
-        harness.selectedChannelId = 'channel-1';
-        harness.messages = [];
+        final backend = FakeMessageBackend()..add(range(1, 10));
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', range(1, 10));
+        backend.add(range(11, 70));
+        backend.failOnCalls.add(2);
+        backend.beforeRespond = (call) {
+          if (call == 2) {
+            f.live(msg(71));
+            f.sync.onDisconnected();
+          }
+        };
 
-        // Разрыв застаёт канал пустым: якорь зафиксирован (канал == этот),
-        // но anchorMessageId == null — это НЕ "якоря нет вовсе".
-        harness.handleRealtimeDisconnected();
-        expect(harness.syncAnchorChannelId, 'channel-1');
-        expect(harness.syncAnchorMessageId, isNull);
+        await f.sync.onRoomJoined('channel-1');
+        expect(f.sync.confirmedMessageId, '60');
+        expect(f.sync.inSync, isFalse);
+        expect(ids(f.messages), [...idRange(1, 60), '71']);
 
-        // До того, как реально выполнится докачка, по восстановленному
-        // соединению уже пришло #71 по realtime.
-        harness.handleRealtimeMessage(
-          _msg('71', DateTime.utc(2026, 1, 1, 0, 1, 11)),
-        );
-        expect(harness.messages.map((m) => m.id).toList(), ['71']);
+        backend.add(range(72, 120));
+        await f.sync.onRoomJoined('channel-1');
 
-        await harness.handleRealtimeReconnected('channel-1');
-
-        // Без фикса messages было бы непустым («71») и код бы попал в ветку
-        // "докачка after messages.last.id('71')" — backend ничего не вернёт
-        // после 71, и история 1-70 потерялась бы молча. Форвард-курсор не
-        // использовался вовсе — восстановление прошло через
-        // _catchUpEmptyChannel (без курсора) + докачку назад.
-        expect(harness.afterCursorsUsed, isEmpty);
-        expect(
-          harness.messages.map((m) => m.id).toList(),
-          [for (var i = 1; i <= 71; i++) '$i'],
-        );
-        expect(
-          harness.messages.map((m) => m.id).toSet().length,
-          71,
-          reason: 'без дублей',
-        );
+        expect(backend.calls[2].after, '60');
+        expect(ids(f.messages), idRange(1, 120));
+        expect(ids(f.messages).toSet(), hasLength(120));
+        expect(f.sync.inSync, isTrue);
       },
     );
-  });
 
-  group('chooseReconnectSyncStrategy (pure decision function, main.dart '
-      '~6600, used directly by _runReconnectSync)', () {
-    test('anchor present for the channel -> afterAnchor', () {
-      expect(
-        chooseReconnectSyncStrategy(
-          hasAnchorForChannel: true,
-          anchorMessageId: 'm10',
-          messagesEmpty: false,
-        ),
-        ReconnectSyncStrategy.afterAnchor,
-      );
+    test(
+      '6. join confirmed while the baseline is still loading -> pending, '
+      'runs after confirmBaseline + flushPending',
+      () async {
+        final backend = FakeMessageBackend()..add(range(1, 30));
+        final f = SyncFixture(backend);
+        f.sync.resetForChannel('channel-1', baselineLoading: true);
 
-      // Якорь главнее текущего messagesEmpty (которое может быть устаревшим
-      // из-за гонки с live-сообщением) — проверяем, что сам messagesEmpty не
-      // влияет на эту ветку.
-      expect(
-        chooseReconnectSyncStrategy(
-          hasAnchorForChannel: true,
-          anchorMessageId: 'm10',
-          messagesEmpty: true,
-        ),
-        ReconnectSyncStrategy.afterAnchor,
-      );
+        await f.sync.onRoomJoined('channel-1');
+        expect(backend.calls, isEmpty);
+        expect(f.sync.pendingChannelId, 'channel-1');
+
+        f.messages = range(1, 10);
+        f.sync.confirmBaseline('channel-1', range(1, 10));
+        await f.sync.flushPending();
+
+        expect(backend.afterCursors, ['10']);
+        expect(ids(f.messages), idRange(1, 30));
+        expect(f.sync.pendingChannelId, isNull);
+        expect(f.sync.inSync, isTrue);
+      },
+    );
+
+    test(
+      '6b. baseline REST failed -> pending join restores without a cursor',
+      () async {
+        final backend = FakeMessageBackend()..add(range(1, 30));
+        final f = SyncFixture(backend);
+        f.sync.resetForChannel('channel-1', baselineLoading: true);
+        await f.sync.onRoomJoined('channel-1');
+        expect(backend.calls, isEmpty);
+
+        f.sync.abortBaseline('channel-1');
+        await f.sync.flushPending();
+
+        expect(backend.calls.single.after, isNull);
+        expect(backend.calls.single.before, isNull);
+        expect(ids(f.messages), idRange(1, 30));
+        expect(f.sync.baselineKnown, isTrue);
+        expect(f.sync.confirmedMessageId, '30');
+      },
+    );
+
+    test(
+      '7. second page fails -> onIncomplete, confirmed stays at the first '
+      'page boundary, retry completes without duplicates',
+      () async {
+        final backend = FakeMessageBackend()..add(range(1, 130));
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', range(1, 10));
+        backend.failOnCalls.add(2);
+
+        await f.sync.onRoomJoined('channel-1');
+
+        expect(f.incomplete, ['channel-1']);
+        expect(f.sync.confirmedMessageId, '60');
+        expect(f.sync.inSync, isFalse);
+        expect(ids(f.messages), idRange(1, 60));
+
+        await f.lastRetry!();
+
+        expect(backend.afterCursors, ['10', '60', '60', '110']);
+        expect(ids(f.messages), idRange(1, 130));
+        expect(f.sync.inSync, isTrue);
+        expect(f.incomplete, hasLength(1));
+      },
+    );
+
+    test(
+      '8. switching the channel during catch-up drops the old results',
+      () async {
+        final backend = FakeMessageBackend()
+          ..add(range(1, 40))
+          ..add(range(100, 102, channelId: 'channel-2'));
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', range(1, 10));
+        final gate = Completer<void>();
+        backend.beforeRespond = (call) async {
+          if (call == 1) await gate.future;
+        };
+
+        final stale = f.sync.onRoomJoined('channel-1');
+        await _settle();
+        f.loadBaseline(
+          'channel-2',
+          range(100, 102, channelId: 'channel-2'),
+        );
+        expect(f.sync.isRunning, isFalse);
+
+        gate.complete();
+        await stale;
+
+        expect(ids(f.messages), ['100', '101', '102']);
+        expect(f.incomplete, isEmpty);
+        expect(f.sync.confirmedMessageId, '102');
+
+        await f.sync.onRoomJoined('channel-2');
+        expect(backend.calls.last.channelId, 'channel-2');
+        expect(backend.calls.last.after, '102');
+        expect(ids(f.messages), ['100', '101', '102']);
+        expect(f.sync.inSync, isTrue);
+      },
+    );
+
+    test('9. the same message via REST and live is kept once', () async {
+      final backend = FakeMessageBackend()..add(range(1, 10));
+      final f = SyncFixture(backend);
+      f.loadBaseline('channel-1', range(1, 10));
+      await f.sync.onRoomJoined('channel-1');
+
+      f.sync.onDisconnected();
+      f.live(msg(11));
+      await f.sync.onRoomJoined('channel-1');
+
+      expect(backend.calls.last.after, '10');
+      expect(ids(f.messages), idRange(1, 11));
+      expect(ids(f.messages).where((id) => id == '11'), hasLength(1));
     });
 
     test(
-      'anchor for the channel exists but is explicitly null (channel was '
-      'empty at disconnect) -> emptyChannelRestore, regardless of current '
-      'messagesEmpty',
-      () {
-        expect(
-          chooseReconnectSyncStrategy(
-            hasAnchorForChannel: true,
-            anchorMessageId: null,
-            messagesEmpty: false,
-          ),
-          ReconnectSyncStrategy.emptyChannelRestore,
-          reason: 'даже если messages уже непустой из-за live-гонки',
-        );
+      '10. maxPages reached with a full page -> onIncomplete, not a silent '
+      'success; retry continues from the confirmed point',
+      () async {
+        final backend = FakeMessageBackend()..add(range(1, 210));
+        final f = SyncFixture(backend, maxPages: 2);
+        f.loadBaseline('channel-1', range(1, 10));
 
-        expect(
-          chooseReconnectSyncStrategy(
-            hasAnchorForChannel: true,
-            anchorMessageId: null,
-            messagesEmpty: true,
-          ),
-          ReconnectSyncStrategy.emptyChannelRestore,
-        );
+        await f.sync.onRoomJoined('channel-1');
+        expect(f.incomplete, ['channel-1']);
+        expect(f.sync.inSync, isFalse);
+        expect(f.sync.confirmedMessageId, '110');
+
+        await f.lastRetry!();
+        expect(f.incomplete, hasLength(2), reason: '161-210 is full again');
+        expect(f.sync.confirmedMessageId, '210');
+
+        await f.lastRetry!();
+        expect(f.incomplete, hasLength(2));
+        expect(f.sync.inSync, isTrue);
+        expect(ids(f.messages), idRange(1, 210));
       },
     );
 
-    test(
-      'no anchor for the channel at all (e.g. first connect, no prior '
-      'onDisconnect) and messages not empty -> afterLastMessage fallback',
-      () {
-        expect(
-          chooseReconnectSyncStrategy(
-            hasAnchorForChannel: false,
-            anchorMessageId: null,
-            messagesEmpty: false,
-          ),
-          ReconnectSyncStrategy.afterLastMessage,
-        );
-      },
-    );
+    test('11. 150 missed messages are restored page by page', () async {
+      final backend = FakeMessageBackend()..add(range(1, 160));
+      final f = SyncFixture(backend);
+      f.loadBaseline('channel-1', range(1, 10));
+
+      await f.sync.onRoomJoined('channel-1');
+
+      expect(backend.afterCursors, ['10', '60', '110', '160']);
+      expect(ids(f.messages), idRange(1, 160));
+      expect(f.sync.inSync, isTrue);
+      expect(f.incomplete, isEmpty);
+    });
 
     test(
-      'no anchor for the channel at all and messages empty -> '
-      'emptyChannelRestore (boundary case)',
-      () {
-        expect(
-          chooseReconnectSyncStrategy(
-            hasAnchorForChannel: false,
-            anchorMessageId: null,
-            messagesEmpty: true,
-          ),
-          ReconnectSyncStrategy.emptyChannelRestore,
-        );
+      '12. live messages advance the point only while in sync',
+      () async {
+        final backend = FakeMessageBackend()..add(range(1, 10));
+        final f = SyncFixture(backend);
+        f.loadBaseline('channel-1', range(1, 10));
+
+        f.live(msg(11));
+        expect(f.sync.confirmedMessageId, '10', reason: 'not joined yet');
+
+        await f.sync.onRoomJoined('channel-1');
+        expect(f.sync.inSync, isTrue);
+        expect(f.sync.confirmedMessageId, '11');
+
+        f.live(msg(12));
+        expect(f.sync.confirmedMessageId, '12');
+
+        f.sync.onDisconnected();
+        f.live(msg(13));
+        expect(f.sync.confirmedMessageId, '12');
+
+        await f.sync.onRoomJoined('channel-1');
+        expect(backend.calls.last.after, '12');
+        expect(ids(f.messages), idRange(1, 13));
       },
     );
+
+    test('join for a channel that is not selected is ignored', () async {
+      final backend = FakeMessageBackend()..add(range(1, 10));
+      final f = SyncFixture(backend);
+      f.loadBaseline('channel-1', range(1, 10));
+      f.selected = 'channel-2';
+
+      await f.sync.onRoomJoined('channel-1');
+
+      expect(backend.calls, isEmpty);
+    });
+  });
+
+  group('chooseReconnectSyncStrategy', () {
+    test('known non-empty baseline -> afterConfirmed', () {
+      expect(
+        chooseReconnectSyncStrategy(
+          baselineKnown: true,
+          confirmedMessageId: '10',
+        ),
+        ReconnectSyncStrategy.afterConfirmed,
+      );
+    });
+
+    test('confirmed empty or unknown baseline -> restoreLatest', () {
+      expect(
+        chooseReconnectSyncStrategy(
+          baselineKnown: true,
+          confirmedMessageId: null,
+        ),
+        ReconnectSyncStrategy.restoreLatest,
+      );
+      expect(
+        chooseReconnectSyncStrategy(
+          baselineKnown: false,
+          confirmedMessageId: null,
+        ),
+        ReconnectSyncStrategy.restoreLatest,
+      );
+    });
   });
 }
