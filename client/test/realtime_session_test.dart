@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -13,11 +14,12 @@ class _SocketIoProbe {
   bool holdIdentifyAck = false;
   String? pendingAckId;
   bool holdChannelAck = false;
+  bool denyServerJoin = false;
   String? pendingChannelAckId;
   String? pendingChannelId;
 
-  static Future<_SocketIoProbe> start() async {
-    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  static Future<_SocketIoProbe> start({int port = 0}) async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
     final probe = _SocketIoProbe._(server);
     probe._listen();
     return probe;
@@ -49,6 +51,11 @@ class _SocketIoProbe {
           } else {
             connected.add('43$ackId[{"userId":"user-1"}]');
           }
+        } else if (name == 'server:join' && denyServerJoin) {
+          final serverId = (body[1] as Map)['serverId'] as String;
+          connected.add(
+            '42["server:error",${jsonEncode({'serverId': serverId, 'error': 'Нет доступа к серверу'})}]',
+          );
         } else if (name == 'channel:join' && ackId.isNotEmpty) {
           final channelId = (body[1] as Map)['channelId'] as String;
           if (holdChannelAck) {
@@ -66,6 +73,10 @@ class _SocketIoProbe {
 
   void expireSession() {
     socket!.add('42["session:expired",{"reason":"token_expired"}]');
+  }
+
+  void disconnectNamespace() {
+    socket!.add('41');
   }
 
   void releaseIdentifyAck() {
@@ -118,6 +129,59 @@ void main() {
     expect(identical(first.socket, second.socket), isFalse);
   });
 
+  test('restores the selected channel after the backend restarts', () async {
+    final first = await _SocketIoProbe.start();
+    final port = first.server.port;
+    final client = RealtimeClient(socketUrl: 'http://127.0.0.1:$port');
+    _SocketIoProbe? restarted;
+    addTearDown(() async {
+      client.dispose();
+      await restarted?.close();
+    });
+
+    final reconnectedChannels = <String?>[];
+    client.connect(
+      getAccessToken: () async => 'valid-token',
+      onSessionExpired: () {},
+      onIdentified: () async {},
+      onMessageNew: (_) {},
+      onMessageUpdate: (_) {},
+      onMessageDelete: (_) {},
+      onChannelNew: (_) {},
+      onChannelUpdate: (_) {},
+      onChannelDelete: (_) {},
+      onServerAccessDenied: (_) {},
+      onMemberLeave: (_) {},
+      onMemberJoin: (_) {},
+      onUserStatus: (_) {},
+      onRoleNew: (_) {},
+      onRoleUpdate: (_) {},
+      onRoleDelete: (_) {},
+      onMemberRolesUpdate: (_) {},
+      onReconnected: reconnectedChannels.add,
+    );
+    client.joinServer('server-1');
+    client.joinChannel('channel-1');
+    await first.waitFor('channel:join', 1);
+
+    await first.close();
+    await Future<void>.delayed(const Duration(seconds: 4));
+    restarted = await _SocketIoProbe.start(port: port);
+    await restarted.waitFor('channel:join', 1);
+    expect(
+      restarted.events.where((event) => event.$1 == 'server:join').length,
+      1,
+    );
+    expect(reconnectedChannels, ['channel-1', 'channel-1']);
+
+    client.socket.disconnect();
+    await Future<void>.delayed(const Duration(milliseconds: 3500));
+    expect(
+      restarted.events.where((event) => event.$1 == 'presence:identify').length,
+      1,
+    );
+  });
+
   test(
     'expiry reidentifies and rejoins only the selected channel after ack',
     () async {
@@ -133,15 +197,26 @@ void main() {
       var token = 'old-token';
       var loggedOut = false;
       final reconnectedChannels = <String?>[];
+      final deniedServers = <String>[];
+      final accessRefreshGate = Completer<void>();
+      var holdAccessRefresh = false;
+      var accessRefreshStarted = false;
       void connect() => client.connect(
         getAccessToken: () async => token,
         onSessionExpired: () => loggedOut = true,
+        onIdentified: () async {
+          if (holdAccessRefresh) {
+            accessRefreshStarted = true;
+            await accessRefreshGate.future;
+          }
+        },
         onMessageNew: (_) {},
         onMessageUpdate: (_) {},
         onMessageDelete: (_) {},
         onChannelNew: (_) {},
         onChannelUpdate: (_) {},
         onChannelDelete: (_) {},
+        onServerAccessDenied: deniedServers.add,
         onMemberLeave: (_) {},
         onMemberJoin: (_) {},
         onUserStatus: (_) {},
@@ -168,6 +243,7 @@ void main() {
       token = 'new-token';
       probe.holdIdentifyAck = true;
       probe.holdChannelAck = true;
+      holdAccessRefresh = true;
       probe.expireSession();
       await probe.waitFor('presence:identify', 2);
       client.leaveChannel('channel-old');
@@ -178,6 +254,12 @@ void main() {
       );
 
       probe.releaseIdentifyAck();
+      await probe.waitForCondition(() => accessRefreshStarted);
+      expect(
+        probe.events.where((event) => event.$1 == 'channel:join'),
+        hasLength(1),
+      );
+      accessRefreshGate.complete();
       await probe.waitFor('channel:join', 2);
       expect(reconnectedChannels, isNot(contains('channel-new')));
       probe.releaseChannelAck();
@@ -197,6 +279,21 @@ void main() {
           .toList();
       expect((identify.last.$2 as Map)['token'], 'new-token');
       expect(loggedOut, isFalse);
+
+      // Access was revoked while the transport was down. A failed server
+      // rejoin must notify the UI so it can discard cached server metadata.
+      probe.holdIdentifyAck = false;
+      probe.holdChannelAck = false;
+      probe.denyServerJoin = true;
+      await probe.socket!.close();
+      await probe.waitFor('server:join', 3);
+      await probe.waitForCondition(() => deniedServers.isNotEmpty);
+      expect(deniedServers, ['server-1']);
+
+      probe.denyServerJoin = false;
+      probe.disconnectNamespace();
+      await probe.waitFor('presence:identify', 4);
+      await probe.waitFor('server:join', 4);
     },
   );
 }

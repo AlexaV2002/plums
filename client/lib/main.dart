@@ -686,17 +686,21 @@ class RealtimeClient {
   bool _identified = false;
   bool _disposed = false;
   bool _handlersInstalled = false;
+  bool _manuallyDisconnected = false;
+  Timer? _reconnectWatchdog;
   int _connectionEpoch = 0;
 
   void connect({
     required Future<String?> Function() getAccessToken,
     required VoidCallback onSessionExpired,
+    required Future<void> Function() onIdentified,
     required ValueChanged<AppMessage> onMessageNew,
     required ValueChanged<AppMessage> onMessageUpdate,
     required ValueChanged<RealtimeMessageDelete> onMessageDelete,
     required ValueChanged<AppChannel> onChannelNew,
     required ValueChanged<AppChannel> onChannelUpdate,
     required ValueChanged<RealtimeChannelDelete> onChannelDelete,
+    required ValueChanged<String> onServerAccessDenied,
     required ValueChanged<RealtimeMemberLeave> onMemberLeave,
     required ValueChanged<AppServerMember> onMemberJoin,
     required ValueChanged<RealtimeUserStatus> onUserStatus,
@@ -730,6 +734,8 @@ class RealtimeClient {
         }
 
         _identified = true;
+        await onIdentified();
+        if (_disposed || !socket.connected || epoch != _connectionEpoch) return;
         final serverId = _currentServerId;
         if (serverId != null) socket.emit('server:join', {'serverId': serverId});
         var channelId = _currentChannelId;
@@ -777,10 +783,24 @@ class RealtimeClient {
       }
     }
 
-    socket.onConnect((_) => identifyAndRejoin());
-    socket.onDisconnect((_) {
+    socket.onConnect((_) {
+      _manuallyDisconnected = false;
+      identifyAndRejoin();
+    });
+    socket.onDisconnect((reason) {
       _identified = false;
       _connectionEpoch++;
+      _manuallyDisconnected = reason == 'io client disconnect';
+      // Socket.IO не переподключает namespace после штатного отключения
+      // сервером (io server disconnect). После перезапуска backend запускаем
+      // повторное подключение сами.
+      if (!_disposed && reason == 'io server disconnect') {
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (!_disposed && !_manuallyDisconnected && !socket.connected) {
+            socket.connect();
+          }
+        });
+      }
     });
     socket.on('session:expired', (_) {
       if (_disposed || !socket.connected) return;
@@ -788,6 +808,12 @@ class RealtimeClient {
       // getMe (401 запускает refresh), затем вступаем обратно только после ack.
       _identified = false;
       identifyAndRejoin();
+    });
+
+    socket.on('server:error', (data) {
+      if (data is Map && data['serverId'] is String) {
+        onServerAccessDenied(data['serverId'] as String);
+      }
     });
 
     socket.on('message:new', (data) {
@@ -882,6 +908,15 @@ class RealtimeClient {
       }
     });
 
+    // На случай, если автоматическое переподключение транспорта остановилось,
+    // периодически пробуем вернуть сессию. Намеренный disconnect() и dispose()
+    // повторно не подключаем.
+    _reconnectWatchdog ??= Timer.periodic(const Duration(seconds: 3), (_) {
+      if (!_disposed && !_manuallyDisconnected && !socket.connected) {
+        socket.connect();
+      }
+    });
+
     if (socket.connected) identifyAndRejoin();
     socket.connect();
   }
@@ -923,6 +958,7 @@ class RealtimeClient {
   void dispose() {
     _disposed = true;
     _connectionEpoch++;
+    _reconnectWatchdog?.cancel();
     socket.dispose();
   }
 }
@@ -1624,12 +1660,14 @@ class _MainShellState extends State<MainShell> {
       onSessionExpired: () {
         if (mounted) unawaited(widget.onLoggedOut());
       },
+      onIdentified: refreshAccessAfterReidentify,
       onMessageNew: handleRealtimeMessage,
       onMessageUpdate: handleRealtimeMessageUpdate,
       onMessageDelete: handleRealtimeMessageDelete,
       onChannelNew: handleRealtimeChannelNew,
       onChannelUpdate: handleRealtimeChannelUpdate,
       onChannelDelete: handleRealtimeChannelDelete,
+      onServerAccessDenied: handleRealtimeServerAccessDenied,
       onMemberLeave: handleRealtimeMemberLeave,
       onMemberJoin: handleRealtimeMemberJoin,
       onUserStatus: handleRealtimeUserStatus,
@@ -1688,6 +1726,61 @@ class _MainShellState extends State<MainShell> {
 
     logout();
     return true;
+  }
+
+  // События kick/ban/скрытия канала могли пройти, пока сокет был отключён.
+  // Перед восстановлением комнат сверяем локальные списки с REST, сохраняя
+  // выбранный канал и уже загруженные сообщения, если доступ не изменился.
+  Future<void> refreshAccessAfterReidentify() async {
+    if (!mounted || isLoading) return;
+    final serverId = selectedServerId;
+
+    try {
+      final availableServers = await apiClient.getServers();
+      if (!mounted || selectedServerId != serverId) return;
+
+      if (serverId == null) {
+        setState(() => servers = availableServers);
+        return;
+      }
+      if (!availableServers.any((server) => server.id == serverId)) {
+        setState(() => servers = availableServers);
+        await selectNextServerAfterRemoving(serverId);
+        if (mounted) {
+          showErrorSnackBar(context, 'Вы больше не состоите на этом сервере');
+        }
+        return;
+      }
+
+      final visibleChannels = await apiClient.getChannels(serverId);
+      if (!mounted || selectedServerId != serverId) return;
+      final currentChannelId = selectedChannelId;
+      setState(() {
+        servers = availableServers;
+        channels = sortChannels(visibleChannels);
+      });
+      if (currentChannelId != null &&
+          !visibleChannels.any((channel) => channel.id == currentChannelId)) {
+        final nextChannel = visibleChannels.isNotEmpty ? visibleChannels.first : null;
+        setState(() {
+          selectedChannelId = null;
+          messages = [];
+          hasMoreMessages = false;
+        });
+        syncRealtimeChannel(null);
+        if (nextChannel != null) await selectChannel(nextChannel.id);
+      }
+    } on DioException catch (error) {
+      if (serverId != null &&
+          (error.response?.statusCode == 403 ||
+              error.response?.statusCode == 404) &&
+          mounted &&
+          selectedServerId == serverId) {
+        await selectNextServerAfterRemoving(serverId);
+      }
+      // При временной ошибке сети оставляем локальные данные. Проверки join
+      // на backend всё равно не разрешат вернуть отозванный доступ.
+    }
   }
 
   // После обрыва и восстановления Socket.IO-соединения клиент заново
@@ -2029,6 +2122,12 @@ class _MainShellState extends State<MainShell> {
 
       showErrorSnackBar(context, message);
     }
+  }
+
+  void handleRealtimeServerAccessDenied(String serverId) {
+    if (!mounted || selectedServerId != serverId) return;
+    unawaited(selectNextServerAfterRemoving(serverId));
+    showErrorSnackBar(context, 'Вы больше не состоите на этом сервере');
   }
 
   void handleRealtimeMemberJoin(AppServerMember member) {

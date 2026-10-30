@@ -80,6 +80,15 @@ class SocketProbe {
     return (JSON.parse(packet.slice(2)) as [string, unknown])[1];
   }
 
+  async expectNoEvent(name: string) {
+    await expect(
+      this.waitPacket((item) => {
+        if (!item.startsWith('42')) return false;
+        return (JSON.parse(item.slice(2)) as [string, unknown])[0] === name;
+      }, 200),
+    ).rejects.toThrow('Socket.IO packet timeout');
+  }
+
   close() {
     this.socket.close();
   }
@@ -262,5 +271,63 @@ describe('realtime access (e2e)', () => {
     await waitForRoom(`channel:${channelId}`, member.id, false);
     reconnected.emit('server:join', { serverId });
     expect(await reconnected.event('server:error')).toMatchObject({ serverId });
+  }, 30000);
+
+  it('evicts a banned member and rejects joins after reconnect', async () => {
+    const owner = await user('ban-owner');
+    const member = await user('ban-member');
+    const auth = (token: string) => ({ Authorization: `Bearer ${token}` });
+    const server = await request(app.getHttpServer())
+      .post('/servers')
+      .set(auth(owner.token))
+      .send({ name: 'Ban smoke' })
+      .expect(201);
+    const serverId = (server.body as { id: string }).id;
+    const channel = await request(app.getHttpServer())
+      .post(`/servers/${serverId}/channels`)
+      .set(auth(owner.token))
+      .send({ name: 'general' })
+      .expect(201);
+    const channelId = (channel.body as { id: string }).id;
+    await prisma.serverMember.create({
+      data: { serverId, userId: member.id },
+    });
+
+    const socket = await SocketProbe.connect(port);
+    probes.push(socket);
+    await socket.identify(member.token);
+    socket.emit('server:join', { serverId });
+    socket.emit('channel:join', { channelId });
+    await waitForRoom(`server:${serverId}`, member.id, true);
+    await waitForRoom(`channel:${channelId}`, member.id, true);
+
+    await request(app.getHttpServer())
+      .post(`/servers/${serverId}/bans/${member.id}`)
+      .set(auth(owner.token))
+      .send({ reason: 'test' })
+      .expect(201);
+    await waitForRoom(`server:${serverId}`, member.id, false);
+    await waitForRoom(`channel:${channelId}`, member.id, false);
+
+    socket.emit('server:join', { serverId });
+    expect(await socket.event('server:error')).toMatchObject({ serverId });
+    socket.emit('channel:join', { channelId });
+    expect(await socket.event('channel:error')).toMatchObject({ channelId });
+
+    socket.close();
+    const reconnected = await SocketProbe.connect(port);
+    probes.push(reconnected);
+    await reconnected.identify(member.token);
+    reconnected.emit('server:join', { serverId });
+    expect(await reconnected.event('server:error')).toMatchObject({ serverId });
+    reconnected.emit('channel:join', { channelId });
+    expect(await reconnected.event('channel:error')).toMatchObject({ channelId });
+
+    await request(app.getHttpServer())
+      .post(`/channels/${channelId}/messages`)
+      .set(auth(owner.token))
+      .send({ content: 'after ban' })
+      .expect(201);
+    await reconnected.expectNoEvent('message:new');
   }, 30000);
 });
