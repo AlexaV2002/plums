@@ -2,10 +2,13 @@ import 'dart:async';
 import 'dart:math';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
+
+part 'dm.dart';
 
 void main() {
   runApp(const PlumsApp());
@@ -90,8 +93,14 @@ String describeRequestError(Object error) {
 
     final data = response.data;
 
-    if (data is Map && data['message'] is String) {
-      return data['message'] as String;
+    if (data is Map) {
+      final message = data['message'];
+      if (message is String) return message;
+      // Nest ValidationPipe returns an array for invalid form fields.
+      if (message is List) {
+        final details = message.whereType<String>().toList();
+        if (details.isNotEmpty) return details.join('; ');
+      }
     }
 
     if (data is String && data.isNotEmpty) {
@@ -622,6 +631,73 @@ class ApiClient {
   Future<void> deleteMessage({required String messageId}) async {
     await dio.delete('/messages/$messageId', options: authOptions);
   }
+
+  Future<List<AppDmUser>> searchUsers(String query, {int? limit}) async {
+    final response = await dio.get(
+      '/users/search',
+      options: authOptions,
+      queryParameters: {'q': query, 'limit': ?limit},
+    );
+
+    return (response.data as List)
+        .map((item) => AppDmUser.fromJson(item as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<List<AppDmConversation>> getDmConversations() async {
+    final response = await dio.get('/dm/conversations', options: authOptions);
+
+    return (response.data as List)
+        .map(
+          (item) => AppDmConversation.fromJson(item as Map<String, dynamic>),
+        )
+        .toList();
+  }
+
+  Future<AppDmConversation> openDmConversation(String userId) async {
+    final response = await dio.post(
+      '/dm/conversations',
+      options: authOptions,
+      data: {'userId': userId},
+    );
+
+    return AppDmConversation.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<List<AppMessage>> getDmMessages(
+    String conversationId, {
+    int limit = 50,
+    String? before,
+    String? after,
+  }) async {
+    final response = await dio.get(
+      '/dm/conversations/$conversationId/messages',
+      options: authOptions,
+      queryParameters: {
+        'limit': limit,
+        'before': ?before,
+        'after': ?after,
+      },
+    );
+
+    return (response.data as List)
+        .map((item) => AppMessage.fromDmJson(item as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<AppMessage> sendDmMessage(String conversationId, String content) async {
+    final response = await dio.post(
+      '/dm/conversations/$conversationId/messages',
+      options: authOptions,
+      data: {'content': content},
+    );
+
+    return AppMessage.fromDmJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<void> deleteDmMessage(String messageId) async {
+    await dio.delete('/dm/messages/$messageId', options: authOptions);
+  }
 }
 
 final apiClient = ApiClient();
@@ -696,6 +772,19 @@ class RealtimeClient {
   int _connectionEpoch = 0;
   ValueChanged<String?>? _onRoomJoined;
   ValueChanged<RealtimeChannelDelete>? _onChannelJoinDenied;
+  // Выбранный личный диалог (комната dm:<id>), восстанавливается после identify.
+  String? _currentDmId;
+  ValueChanged<String>? _onDmJoined;
+  ValueChanged<RealtimeDmJoinDenied>? _onDmJoinDenied;
+
+  // Наблюдаемое состояние «сессия подтверждена»: UI отключает отправку без
+  // сети. Обновляется при identify/разрыве/истечении сессии.
+  final ValueNotifier<bool> identifiedListenable = ValueNotifier<bool>(false);
+
+  void _setIdentified(bool value) {
+    _identified = value;
+    if (!_disposed) identifiedListenable.value = value;
+  }
 
   // Сокет подключён и сессия подтверждена presence:identify — только тогда
   // ранее выбранная комната канала действительно активна на backend.
@@ -721,15 +810,22 @@ class RealtimeClient {
     required ValueChanged<RealtimeMemberRolesUpdate> onMemberRolesUpdate,
     required ValueChanged<String?> onReconnected,
     VoidCallback? onDisconnected,
+    ValueChanged<AppMessage>? onDmNew,
+    ValueChanged<RealtimeDmDelete>? onDmDelete,
+    ValueChanged<String>? onDmJoined,
+    ValueChanged<RealtimeDmJoinDenied>? onDmJoinDenied,
+    ValueChanged<String>? onDmConversationChanged,
   }) {
     if (_disposed || _handlersInstalled) return;
     _handlersInstalled = true;
     _onRoomJoined = onReconnected;
     _onChannelJoinDenied = onChannelDelete;
+    _onDmJoined = onDmJoined;
+    _onDmJoinDenied = onDmJoinDenied;
 
     Future<void> identifyAndRejoin() async {
       final epoch = ++_connectionEpoch;
-      _identified = false;
+      _setIdentified(false);
       try {
         // getMe обновляет истёкший access-токен через существующий Dio interceptor.
         final token = await getAccessToken();
@@ -747,12 +843,14 @@ class RealtimeClient {
           throw StateError('Не получено подтверждение сессии');
         }
 
-        _identified = true;
+        _setIdentified(true);
         await onIdentified();
         if (_disposed || !socket.connected || epoch != _connectionEpoch) return;
         final serverId = _currentServerId;
         if (serverId != null) socket.emit('server:join', {'serverId': serverId});
         var channelId = _currentChannelId;
+        String? joinedChannelId;
+        var channelDenied = false;
         while (channelId != null) {
           // Догрузка должна начинаться после фактического входа в комнату:
           // иначе сообщение между REST-ответом и join теряется.
@@ -779,14 +877,20 @@ class RealtimeClient {
                   serverId: _currentServerId!,
                 ),
               );
-              return;
+              channelDenied = true;
+              break;
             }
             throw StateError('Не получено подтверждение входа в канал');
           }
-          onReconnected(channelId);
-          return;
+          joinedChannelId = channelId;
+          break;
         }
-        onReconnected(null);
+        if (!channelDenied) onReconnected(joinedChannelId);
+        // Комната личного диалога — после канальной ветки; свой ack и свои
+        // повторы, ошибка DM не перезапускает identify и вход в канал.
+        if (_disposed || !socket.connected || epoch != _connectionEpoch) return;
+        final dmId = _currentDmId;
+        if (dmId != null) await _joinDmWithAck(dmId);
       } catch (_) {
         if (_disposed || !socket.connected || epoch != _connectionEpoch) return;
         Future.delayed(const Duration(seconds: 5), () {
@@ -807,7 +911,7 @@ class RealtimeClient {
       // realtime-событие, поэтому вызывающая сторона может безопасно
       // использовать текущее состояние как надёжный якорь для докачки.
       onDisconnected?.call();
-      _identified = false;
+      _setIdentified(false);
       _connectionEpoch++;
       _manuallyDisconnected = reason == 'io client disconnect';
       // Socket.IO не переподключает namespace после штатного отключения
@@ -825,7 +929,7 @@ class RealtimeClient {
       if (_disposed || !socket.connected) return;
       // Backend уже удалил защищённые комнаты. Получаем актуальный JWT через
       // getMe (401 запускает refresh), затем вступаем обратно только после ack.
-      _identified = false;
+      _setIdentified(false);
       identifyAndRejoin();
     });
 
@@ -852,6 +956,32 @@ class RealtimeClient {
         onMessageDelete(
           RealtimeMessageDelete.fromJson(Map<String, dynamic>.from(data)),
         );
+      }
+    });
+
+    socket.on('dm:new', (data) {
+      if (onDmNew == null || data is! Map) return;
+      final AppMessage message;
+      try {
+        message = AppMessage.fromDmJson(Map<String, dynamic>.from(data));
+      } catch (_) {
+        return; // некорректный payload не должен ронять обработчик сокета
+      }
+      onDmNew(message);
+    });
+
+    socket.on('dm:delete', (data) {
+      if (onDmDelete == null || data is! Map) return;
+      final id = data['id'];
+      final conversationId = data['conversationId'];
+      if (id is String && conversationId is String) {
+        onDmDelete(RealtimeDmDelete(id: id, conversationId: conversationId));
+      }
+    });
+
+    socket.on('dm:conversation:changed', (data) {
+      if (data is Map && data['conversationId'] is String) {
+        onDmConversationChanged?.call(data['conversationId'] as String);
       }
     });
 
@@ -1014,6 +1144,79 @@ class RealtimeClient {
     if (socket.connected) socket.emit('channel:leave', {'channelId': channelId});
   }
 
+  // Личный диалог: одновременно активна одна комната dm:<id>. Вход только
+  // identified-сокетом с ack; до identify комнату восстановит identifyAndRejoin.
+  void joinDm(String conversationId) {
+    final previous = _currentDmId;
+    if (previous == conversationId) return;
+    if (previous != null) leaveDm(previous);
+    _currentDmId = conversationId;
+    if (!socket.connected) {
+      socket.connect();
+      return;
+    }
+    if (_identified) unawaited(_joinDmWithAck(conversationId));
+  }
+
+  void leaveDm(String conversationId) {
+    if (_currentDmId == conversationId) _currentDmId = null;
+    if (socket.connected) {
+      socket.emit('dm:leave', {'conversationId': conversationId});
+    }
+  }
+
+  Future<void> _joinDmWithAck(String conversationId) async {
+    final epoch = _connectionEpoch;
+    bool stale() =>
+        _disposed ||
+        !socket.connected ||
+        epoch != _connectionEpoch ||
+        !_identified ||
+        _currentDmId != conversationId;
+    try {
+      final ack = await socket.timeout(5000).emitWithAckAsync('dm:join', {
+        'conversationId': conversationId,
+      });
+      if (stale()) {
+        // Backend мог завершить асинхронный join уже после dm:leave при
+        // переключении A → B. Убираем оставшуюся комнату после позднего ack.
+        if (!_disposed &&
+            socket.connected &&
+            epoch == _connectionEpoch &&
+            _currentDmId != conversationId &&
+            ack is Map &&
+            ack['joined'] == true) {
+          socket.emit('dm:leave', {'conversationId': conversationId});
+        }
+        return;
+      }
+      if (ack is Map &&
+          ack['joined'] == true &&
+          ack['conversationId'] == conversationId) {
+        _onDmJoined?.call(conversationId);
+        return;
+      }
+      final reason = ack is Map ? ack['reason'] : null;
+      if (reason == 'forbidden' || reason == 'not_found') {
+        _currentDmId = null;
+        _onDmJoinDenied?.call(
+          RealtimeDmJoinDenied(
+            conversationId: conversationId,
+            reason: reason as String,
+          ),
+        );
+        return;
+      }
+      // 'unidentified': backend сам пришлёт session:expired либо identity
+      // сменилась — повтор ниже отменится сменой эпохи.
+    } catch (_) {
+      if (stale()) return;
+    }
+    Future.delayed(const Duration(seconds: 5), () {
+      if (!stale()) unawaited(_joinDmWithAck(conversationId));
+    });
+  }
+
   void dispose() {
     _disposed = true;
     _connectionEpoch++;
@@ -1034,6 +1237,24 @@ class RealtimeMessageDelete {
       channelId: json['channelId'] as String,
     );
   }
+}
+
+class RealtimeDmDelete {
+  const RealtimeDmDelete({required this.id, required this.conversationId});
+
+  final String id;
+  final String conversationId;
+}
+
+class RealtimeDmJoinDenied {
+  const RealtimeDmJoinDenied({
+    required this.conversationId,
+    required this.reason,
+  });
+
+  final String conversationId;
+  // 'forbidden' | 'not_found'
+  final String reason;
 }
 
 class RealtimeMemberLeave {
@@ -1681,11 +1902,26 @@ class _MainShellState extends State<MainShell> {
   List<AppMessage> messages = [];
   List<AppServerMember> members = [];
   List<AppRole> serverRoles = [];
+  int _rolesRefreshGeneration = 0;
 
   String? selectedServerId;
   String? selectedChannelId;
   String? realtimeServerId;
   String? realtimeChannelId;
+
+  // Режим «Личные сообщения»: средняя и правая панели показывают ЛС, а
+  // выбранный сервер/канал и их комнаты остаются без изменений.
+  bool isDmMode = false;
+  late final DmController dmController = DmController(
+    api: ApiClientDmApi(apiClient),
+    joinRoom: realtimeClient.joinDm,
+    leaveRoom: realtimeClient.leaveDm,
+    isConnected: () => realtimeClient.isIdentified,
+    myUserId: () => currentUser?.id,
+    onUnauthorized: () {
+      if (mounted) logout();
+    },
+  );
 
   bool isLoading = true;
   bool isMessagesLoading = false;
@@ -1747,7 +1983,10 @@ class _MainShellState extends State<MainShell> {
       onSessionExpired: () {
         if (mounted) unawaited(widget.onLoggedOut());
       },
-      onIdentified: refreshAccessAfterReidentify,
+      onIdentified: () async {
+        await refreshAccessAfterReidentify();
+        dmController.handleReidentified();
+      },
       onMessageNew: handleRealtimeMessage,
       onMessageUpdate: handleRealtimeMessageUpdate,
       onMessageDelete: handleRealtimeMessageDelete,
@@ -1764,6 +2003,11 @@ class _MainShellState extends State<MainShell> {
       onMemberRolesUpdate: handleRealtimeMemberRolesUpdate,
       onReconnected: handleRealtimeReconnected,
       onDisconnected: handleRealtimeDisconnected,
+      onDmNew: dmController.handleDmNew,
+      onDmDelete: dmController.handleDmDelete,
+      onDmJoined: dmController.handleDmJoined,
+      onDmJoinDenied: dmController.handleDmJoinDenied,
+      onDmConversationChanged: dmController.handleConversationChanged,
     );
     loadInitialData();
   }
@@ -1772,6 +2016,7 @@ class _MainShellState extends State<MainShell> {
   void dispose() {
     messagesScrollController.removeListener(_handleMessagesScroll);
     messagesScrollController.dispose();
+    dmController.dispose();
     realtimeClient.dispose();
     super.dispose();
   }
@@ -1879,6 +2124,23 @@ class _MainShellState extends State<MainShell> {
   // сообщение курсором не становится.
   void handleRealtimeDisconnected() {
     _messageSync.onDisconnected();
+    dmController.handleDisconnected();
+  }
+
+  void openDirectMessages() {
+    if (!isDmMode) setState(() => isDmMode = true);
+    unawaited(dmController.activate());
+  }
+
+  // Клик по серверу выходит из режима ЛС. Тот же сервер не перезагружается,
+  // чтобы не было лишних leave/join комнат сервера и канала.
+  void handleServerSelected(String serverId) {
+    if (isDmMode) {
+      setState(() => isDmMode = false);
+      dmController.deactivate();
+      if (serverId == selectedServerId) return;
+    }
+    selectServer(serverId);
   }
 
   // Вызывается RealtimeClient после подтверждённого (ack) входа в комнату —
@@ -2103,11 +2365,14 @@ class _MainShellState extends State<MainShell> {
   // unawaited не превратил их в unhandled future, а существующая полная
   // роль не потеряла permissions при неудачном refresh.
   Future<void> _refreshServerRolesAndMembers(String serverId) async {
+    final generation = ++_rolesRefreshGeneration;
     try {
       final latestRoles = await apiClient.getServerRoles(serverId);
       final latestMembers = await apiClient.getServerMembers(serverId);
 
-      if (!mounted || serverId != selectedServerId) {
+      if (!mounted ||
+          serverId != selectedServerId ||
+          generation != _rolesRefreshGeneration) {
         return;
       }
 
@@ -2117,14 +2382,18 @@ class _MainShellState extends State<MainShell> {
       });
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
-      if (!mounted || serverId != selectedServerId) return;
+      if (!mounted ||
+          serverId != selectedServerId ||
+          generation != _rolesRefreshGeneration) return;
 
       showErrorSnackBar(
         context,
         'Не удалось обновить роли: ${describeRequestError(error)}',
       );
     } catch (error) {
-      if (!mounted || serverId != selectedServerId) return;
+      if (!mounted ||
+          serverId != selectedServerId ||
+          generation != _rolesRefreshGeneration) return;
 
       showErrorSnackBar(context, 'Не удалось обновить роли: ${describeRequestError(error)}');
     }
@@ -2152,6 +2421,7 @@ class _MainShellState extends State<MainShell> {
           )
           .toList();
     });
+    unawaited(_refreshServerRolesAndMembers(event.serverId));
   }
 
   void handleRealtimeMemberRolesUpdate(RealtimeMemberRolesUpdate event) {
@@ -2168,6 +2438,7 @@ class _MainShellState extends State<MainShell> {
           )
           .toList();
     });
+    unawaited(_refreshServerRolesAndMembers(event.serverId));
   }
 
   void handleRealtimeUserStatus(RealtimeUserStatus event) {
@@ -2422,6 +2693,7 @@ class _MainShellState extends State<MainShell> {
   }
 
   Future<void> selectServer(String serverId) async {
+    _rolesRefreshGeneration++;
     setState(() {
       selectedServerId = serverId;
       channels = [];
@@ -2871,10 +3143,10 @@ class _MainShellState extends State<MainShell> {
         permissions: result.permissions,
       );
 
-      if (!mounted) return;
+      if (!mounted || selectedServerId != serverId) return;
 
       setState(() {
-        serverRoles = [...serverRoles, role];
+        serverRoles = _mergeUpdatedRoleInto(serverRoles, role);
       });
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
@@ -2890,6 +3162,7 @@ class _MainShellState extends State<MainShell> {
   }
 
   Future<void> editRoleFlow(AppRole role) async {
+    final serverId = selectedServerId;
     final result = await showRoleFormDialog(context: context, existing: role);
 
     if (result == null) {
@@ -2904,7 +3177,7 @@ class _MainShellState extends State<MainShell> {
         permissions: result.permissions,
       );
 
-      if (!mounted) return;
+      if (!mounted || selectedServerId != serverId) return;
 
       setState(() {
         serverRoles = serverRoles
@@ -2939,6 +3212,7 @@ class _MainShellState extends State<MainShell> {
   }
 
   Future<void> deleteServerRole(AppRole role) async {
+    final serverId = selectedServerId;
     final confirmed = await showConfirmDialog(
       context: context,
       title: 'Удалить роль?',
@@ -2953,7 +3227,7 @@ class _MainShellState extends State<MainShell> {
     try {
       await apiClient.deleteRole(roleId: role.id);
 
-      if (!mounted) return;
+      if (!mounted || selectedServerId != serverId) return;
 
       setState(() {
         serverRoles = serverRoles.where((item) => item.id != role.id).toList();
@@ -3018,7 +3292,7 @@ class _MainShellState extends State<MainShell> {
         );
       }
 
-      if (!mounted) return;
+      if (!mounted || selectedServerId != serverId) return;
 
       setState(() {
         members = members
@@ -3821,16 +4095,41 @@ class _MainShellState extends State<MainShell> {
         canManageChannels ||
         selectedChannel.resolvedPermissions.canSendMessages;
 
+    final serversSidebar = ServersSidebar(
+      servers: servers,
+      selectedServerId: isDmMode ? null : selectedServerId,
+      onServerSelected: handleServerSelected,
+      onCreateServer: createServer,
+      onJoinServer: joinServerByInvite,
+      isDmMode: isDmMode,
+      onOpenDirectMessages: openDirectMessages,
+    );
+
+    if (isDmMode) {
+      return Scaffold(
+        body: Row(
+          children: [
+            serversSidebar,
+            Expanded(
+              child: DmView(
+                controller: dmController,
+                connection: realtimeClient.identifiedListenable,
+                footer: UserPanel(
+                  user: user,
+                  onEditProfile: editProfile,
+                  onLogout: logout,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Scaffold(
       body: Row(
         children: [
-          ServersSidebar(
-            servers: servers,
-            selectedServerId: selectedServerId,
-            onServerSelected: selectServer,
-            onCreateServer: createServer,
-            onJoinServer: joinServerByInvite,
-          ),
+          serversSidebar,
           ChannelsPanel(
             serverName: selectedServer?.name ?? 'Нет серверов',
             channels: channels,
@@ -3918,6 +4217,8 @@ class ServersSidebar extends StatelessWidget {
     required this.onServerSelected,
     required this.onCreateServer,
     required this.onJoinServer,
+    this.isDmMode = false,
+    this.onOpenDirectMessages,
   });
 
   final List<AppServer> servers;
@@ -3925,6 +4226,8 @@ class ServersSidebar extends StatelessWidget {
   final ValueChanged<String> onServerSelected;
   final VoidCallback onCreateServer;
   final VoidCallback onJoinServer;
+  final bool isDmMode;
+  final VoidCallback? onOpenDirectMessages;
 
   @override
   Widget build(BuildContext context) {
@@ -3935,6 +4238,31 @@ class ServersSidebar extends StatelessWidget {
         children: [
           const SizedBox(height: 14),
           const PlumsLogoButton(),
+          if (onOpenDirectMessages != null) ...[
+            const SizedBox(height: 10),
+            Tooltip(
+              message: 'Личные сообщения',
+              child: InkWell(
+                borderRadius: BorderRadius.circular(isDmMode ? 18 : 26),
+                onTap: onOpenDirectMessages,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 160),
+                  width: 52,
+                  height: 52,
+                  decoration: BoxDecoration(
+                    color: isDmMode
+                        ? const Color(0xFF8D5CFF)
+                        : const Color(0xFF24202B),
+                    borderRadius: BorderRadius.circular(isDmMode ? 18 : 26),
+                  ),
+                  child: Icon(
+                    Icons.chat_bubble_outline,
+                    color: isDmMode ? Colors.white : const Color(0xFFCFC4E8),
+                  ),
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 12),
           Container(width: 44, height: 1, color: const Color(0xFF2B2633)),
           const SizedBox(height: 12),
@@ -5063,6 +5391,9 @@ class MessagesList extends StatelessWidget {
     required this.onEditMessage,
     required this.onDeleteMessage,
     required this.onLoadMoreMessages,
+    this.emptyText = 'В этом канале пока нет сообщений',
+    this.canEditMessage,
+    this.canDeleteMessage,
   });
 
   final List<AppMessage> messages;
@@ -5072,14 +5403,18 @@ class MessagesList extends StatelessWidget {
   final ValueChanged<AppMessage> onEditMessage;
   final ValueChanged<AppMessage> onDeleteMessage;
   final VoidCallback onLoadMoreMessages;
+  final String emptyText;
+  // null — действие показывается для всех сообщений (поведение каналов).
+  final bool Function(AppMessage message)? canEditMessage;
+  final bool Function(AppMessage message)? canDeleteMessage;
 
   @override
   Widget build(BuildContext context) {
     if (messages.isEmpty) {
-      return const Center(
+      return Center(
         child: Text(
-          'В этом канале пока нет сообщений',
-          style: TextStyle(
+          emptyText,
+          style: const TextStyle(
             color: Color(0xFFB8ADC8),
             fontSize: 15,
             fontWeight: FontWeight.w700,
@@ -5126,8 +5461,12 @@ class MessagesList extends StatelessWidget {
 
         return MessageBubble(
           message: message,
-          onEdit: () => onEditMessage(message),
-          onDelete: () => onDeleteMessage(message),
+          onEdit: canEditMessage?.call(message) ?? true
+              ? () => onEditMessage(message)
+              : null,
+          onDelete: canDeleteMessage?.call(message) ?? true
+              ? () => onDeleteMessage(message)
+              : null,
         );
       },
     );
@@ -5143,8 +5482,9 @@ class MessageBubble extends StatelessWidget {
   });
 
   final AppMessage message;
-  final VoidCallback onEdit;
-  final VoidCallback onDelete;
+  // null — кнопка действия не показывается.
+  final VoidCallback? onEdit;
+  final VoidCallback? onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -5209,29 +5549,32 @@ class MessageBubble extends StatelessWidget {
                         ),
                       ),
                       const Spacer(),
-                      IconButton(
-                        tooltip: 'Редактировать сообщение',
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(),
-                        onPressed: onEdit,
-                        icon: const Icon(
-                          Icons.edit_outlined,
-                          size: 16,
-                          color: Color(0xFF8F849F),
+                      if (onEdit != null)
+                        IconButton(
+                          tooltip: 'Редактировать сообщение',
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(),
+                          onPressed: onEdit,
+                          icon: const Icon(
+                            Icons.edit_outlined,
+                            size: 16,
+                            color: Color(0xFF8F849F),
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      IconButton(
-                        tooltip: 'Удалить сообщение',
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(),
-                        onPressed: onDelete,
-                        icon: const Icon(
-                          Icons.delete_outline,
-                          size: 16,
-                          color: Color(0xFFFF7A7A),
+                      if (onEdit != null && onDelete != null)
+                        const SizedBox(width: 8),
+                      if (onDelete != null)
+                        IconButton(
+                          tooltip: 'Удалить сообщение',
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(),
+                          onPressed: onDelete,
+                          icon: const Icon(
+                            Icons.delete_outline,
+                            size: 16,
+                            color: Color(0xFFFF7A7A),
+                          ),
                         ),
-                      ),
                     ],
                   ),
                   const SizedBox(height: 6),
@@ -5283,6 +5626,8 @@ class MessageInput extends StatefulWidget {
     required this.channelName,
     required this.canSendMessages,
     required this.onSendMessage,
+    this.hintText,
+    this.disabledHintText,
   });
 
   final String channelId;
@@ -5290,6 +5635,9 @@ class MessageInput extends StatefulWidget {
   final bool canSendMessages;
   final Future<bool> Function(String content, String clientMessageId)
   onSendMessage;
+  // Необязательные подсказки (ЛС); по умолчанию — тексты канала.
+  final String? hintText;
+  final String? disabledHintText;
 
   @override
   State<MessageInput> createState() => _MessageInputState();
@@ -5396,8 +5744,9 @@ class _MessageInputState extends State<MessageInput> {
                 style: const TextStyle(color: Color(0xFFF3EEFF), fontSize: 14),
                 decoration: InputDecoration(
                   hintText: widget.canSendMessages
-                      ? 'Написать в #${widget.channelName}'
-                      : 'Нет прав писать в этот канал',
+                      ? widget.hintText ?? 'Написать в #${widget.channelName}'
+                      : widget.disabledHintText ??
+                            'Нет прав писать в этот канал',
                   hintStyle: const TextStyle(color: Color(0xFF8F849F)),
                   border: InputBorder.none,
                 ),
@@ -7427,6 +7776,27 @@ class AppMessage {
     );
   }
 
+  // DmMessage → AppMessage: «канал» = conversationId, автор = sender. Так
+  // личные сообщения переиспользуют MessageSyncController и MessagesList.
+  factory AppMessage.fromDmJson(Map<String, dynamic> json) {
+    final senderJson = json['sender'];
+    final createdAtRaw = json['createdAt'] as String?;
+    final updatedAtRaw = json['updatedAt'] as String?;
+
+    return AppMessage(
+      id: json['id'] as String,
+      channelId: json['conversationId'] as String,
+      authorId: json['senderId'] as String,
+      author: senderJson is Map
+          ? senderJson['username'] as String? ?? 'unknown'
+          : 'unknown',
+      content: json['content'] as String,
+      time: _formatTime(createdAtRaw),
+      createdAt: DateTime.tryParse(createdAtRaw ?? ''),
+      updatedAt: DateTime.tryParse(updatedAtRaw ?? ''),
+    );
+  }
+
   static String _formatTime(String? rawDate) {
     if (rawDate == null) {
       return '';
@@ -7443,6 +7813,78 @@ class AppMessage {
     final minute = local.minute.toString().padLeft(2, '0');
 
     return '$hour:$minute';
+  }
+}
+
+class AppDmUser {
+  const AppDmUser({required this.id, required this.username, this.avatarUrl});
+
+  final String id;
+  final String username;
+  final String? avatarUrl;
+
+  String get initial =>
+      username.isEmpty ? '?' : username.characters.first.toUpperCase();
+
+  factory AppDmUser.fromJson(Map<String, dynamic> json) {
+    return AppDmUser(
+      id: json['id'] as String,
+      username: json['username'] as String? ?? 'unknown',
+      avatarUrl: json['avatarUrl'] as String?,
+    );
+  }
+}
+
+class AppDmConversation {
+  const AppDmConversation({
+    required this.id,
+    required this.userA,
+    required this.userB,
+    this.createdAt,
+    this.updatedAt,
+    this.lastMessage,
+  });
+
+  final String id;
+  final AppDmUser userA;
+  final AppDmUser userB;
+  final DateTime? createdAt;
+  final DateTime? updatedAt;
+  final AppMessage? lastMessage;
+
+  // Собеседник текущего пользователя (userA/userB в каноническом порядке).
+  AppDmUser peerFor(String? myUserId) => userA.id == myUserId ? userB : userA;
+
+  DateTime get activityAt =>
+      lastMessage?.createdAt ??
+      updatedAt ??
+      createdAt ??
+      DateTime.fromMillisecondsSinceEpoch(0);
+
+  AppDmConversation withLastMessage(AppMessage? message) {
+    return AppDmConversation(
+      id: id,
+      userA: userA,
+      userB: userB,
+      createdAt: createdAt,
+      updatedAt: message?.createdAt ?? updatedAt,
+      lastMessage: message,
+    );
+  }
+
+  factory AppDmConversation.fromJson(Map<String, dynamic> json) {
+    final lastMessageJson = json['lastMessage'];
+
+    return AppDmConversation(
+      id: json['id'] as String,
+      userA: AppDmUser.fromJson(json['userA'] as Map<String, dynamic>),
+      userB: AppDmUser.fromJson(json['userB'] as Map<String, dynamic>),
+      createdAt: DateTime.tryParse(json['createdAt'] as String? ?? ''),
+      updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? ''),
+      lastMessage: lastMessageJson is Map<String, dynamic>
+          ? AppMessage.fromDmJson(lastMessageJson)
+          : null,
+    );
   }
 }
 

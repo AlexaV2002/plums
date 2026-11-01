@@ -65,8 +65,16 @@ describe('DmGateway', () => {
       );
 
       const client = createSocket();
-      await gateway.joinConversation({ conversationId }, client as never);
+      const ack = await gateway.joinConversation(
+        { conversationId },
+        client as never,
+      );
 
+      expect(ack).toEqual({
+        joined: false,
+        conversationId,
+        reason: 'unidentified',
+      });
       expect(client.emit).toHaveBeenCalledWith('dm:error', {
         conversationId,
         error: 'Требуется presence:identify перед вступлением в диалог',
@@ -85,8 +93,12 @@ describe('DmGateway', () => {
       client.data.authExpiresAt = Date.now() + 60000;
       client.data.identityVersion = 1;
 
-      await gateway.joinConversation({ conversationId }, client as never);
+      const ack = await gateway.joinConversation(
+        { conversationId },
+        client as never,
+      );
 
+      expect(ack).toEqual({ joined: true, conversationId });
       expect(client.join).toHaveBeenCalledWith(roomName);
       expect(client.emit).not.toHaveBeenCalledWith(
         'dm:error',
@@ -104,8 +116,16 @@ describe('DmGateway', () => {
       client.data.authExpiresAt = Date.now() + 60000;
       client.data.identityVersion = 1;
 
-      await gateway.joinConversation({ conversationId }, client as never);
+      const ack = await gateway.joinConversation(
+        { conversationId },
+        client as never,
+      );
 
+      expect(ack).toEqual({
+        joined: false,
+        conversationId,
+        reason: 'forbidden',
+      });
       expect(client.emit).toHaveBeenCalledWith(
         'dm:error',
         expect.objectContaining({ conversationId }),
@@ -121,8 +141,16 @@ describe('DmGateway', () => {
       client.data.authExpiresAt = Date.now() + 60000;
       client.data.identityVersion = 1;
 
-      await gateway.joinConversation({ conversationId }, client as never);
+      const ack = await gateway.joinConversation(
+        { conversationId },
+        client as never,
+      );
 
+      expect(ack).toEqual({
+        joined: false,
+        conversationId,
+        reason: 'not_found',
+      });
       expect(client.emit).toHaveBeenCalledWith(
         'dm:error',
         expect.objectContaining({
@@ -138,9 +166,76 @@ describe('DmGateway', () => {
       client.data.userId = 'user-a';
       client.data.authExpiresAt = Date.now() - 1;
       client.data.identityVersion = 1;
-      await gateway.joinConversation({ conversationId }, client as never);
+      const ack = await gateway.joinConversation(
+        { conversationId },
+        client as never,
+      );
+      expect(ack).toMatchObject({ joined: false, reason: 'unidentified' });
       expect(prisma.directConversation.findUnique).not.toHaveBeenCalled();
       expect(client.join).not.toHaveBeenCalled();
+    });
+
+    it('rejects a payload without conversationId', async () => {
+      const client = createSocket();
+      const ack = await gateway.joinConversation({}, client as never);
+
+      expect(ack).toEqual({
+        joined: false,
+        conversationId: null,
+        reason: 'not_found',
+      });
+      expect(prisma.directConversation.findUnique).not.toHaveBeenCalled();
+      expect(client.join).not.toHaveBeenCalled();
+    });
+
+    it('returns joined:false when identity changes during the membership check', async () => {
+      const client = createSocket();
+      client.data.userId = 'user-a';
+      client.data.authExpiresAt = Date.now() + 60000;
+      client.data.identityVersion = 1;
+      prisma.directConversation.findUnique.mockImplementation(() => {
+        // Пока шёл запрос к БД, сокет переидентифицировался.
+        client.data.identityVersion = 2;
+        return conversation('user-a', 'user-b');
+      });
+
+      const ack = await gateway.joinConversation(
+        { conversationId },
+        client as never,
+      );
+
+      expect(ack).toEqual({
+        joined: false,
+        conversationId,
+        reason: 'unidentified',
+      });
+      expect(client.join).not.toHaveBeenCalled();
+    });
+
+    it('returns joined:false when identity changes while joining the room', async () => {
+      prisma.directConversation.findUnique.mockResolvedValue(
+        conversation('user-a', 'user-b'),
+      );
+      const client = createSocket();
+      client.data.userId = 'user-a';
+      client.data.authExpiresAt = Date.now() + 60000;
+      client.data.identityVersion = 1;
+      client.join.mockImplementation((room: string) => {
+        client.rooms.add(room);
+        client.data.identityVersion = 2;
+      });
+
+      const ack = await gateway.joinConversation(
+        { conversationId },
+        client as never,
+      );
+
+      expect(ack).toEqual({
+        joined: false,
+        conversationId,
+        reason: 'unidentified',
+      });
+      expect(client.rooms.has(roomName)).toBe(false);
     });
   });
 
@@ -157,8 +252,49 @@ describe('DmGateway', () => {
   });
 
   describe('realtime emitters', () => {
+    it('notifies only identified recipient sockets about a changed conversation', () => {
+      const recipient = createSocket();
+      recipient.data.userId = 'user-b';
+      recipient.data.authExpiresAt = Date.now() + 60000;
+      recipient.data.identityVersion = 1;
+      const outsider = createSocket();
+      outsider.data.userId = 'user-c';
+      outsider.data.authExpiresAt = Date.now() + 60000;
+      outsider.data.identityVersion = 1;
+      const expired = createSocket();
+      expired.data.userId = 'user-b';
+      expired.data.authExpiresAt = Date.now() - 1;
+      expired.data.identityVersion = 1;
+      gateway.server = {
+        to: serverTo,
+        sockets: {
+          sockets: new Map([
+            ['recipient', recipient],
+            ['outsider', outsider],
+            ['expired', expired],
+          ]),
+        },
+      } as never;
+
+      gateway.emitConversationChanged('user-b', conversationId);
+
+      expect(recipient.emit).toHaveBeenCalledWith('dm:conversation:changed', {
+        conversationId,
+      });
+      expect(outsider.emit).not.toHaveBeenCalled();
+      expect(expired.emit).not.toHaveBeenCalled();
+    });
+
     it('should emit dm:new only to the conversation room', () => {
-      const message = { id: 'message-1', content: 'hello' };
+      const message = {
+        id: 'message-1',
+        conversationId,
+        senderId: 'user-a',
+        content: 'hello',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        sender: { id: 'user-a', username: 'user_a', avatarUrl: null },
+      };
 
       gateway.emitMessageNew(conversationId, message);
 
@@ -213,7 +349,9 @@ describe('DmGateway', () => {
       prisma.directConversation.findUnique.mockResolvedValue(
         conversation('user-a', 'user-b'),
       );
-      await gateway.joinConversation({ conversationId }, client as never);
+      await expect(
+        gateway.joinConversation({ conversationId }, client as never),
+      ).resolves.toEqual({ joined: true, conversationId });
 
       expect(client.join).toHaveBeenCalledWith(roomName);
       expect(client.emit).not.toHaveBeenCalledWith(

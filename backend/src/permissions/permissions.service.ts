@@ -119,7 +119,7 @@ export class PermissionsService {
       const rolePermissions = this.parseRolePermissions(role.permissions);
 
       for (const key of SERVER_PERMISSION_KEYS) {
-        if (rolePermissions[key]) {
+        if (rolePermissions[key] === true) {
           merged[key] = true;
         }
       }

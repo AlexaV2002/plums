@@ -125,6 +125,20 @@ describe('PermissionsService', () => {
     );
   });
 
+  it('does not grant permissions for non-boolean stored values', async () => {
+    prisma.server.findUnique.mockResolvedValue({ id: serverId, ownerId });
+    prisma.serverMember.findUnique.mockResolvedValue({
+      id: memberId,
+      roles: [{ permissions: { manageRoles: 'false', manageBans: 1 } }],
+    });
+
+    await expect(
+      service.assertPermission(memberId, serverId, 'manageRoles', 'Denied'),
+    ).rejects.toThrow(ForbiddenException);
+    const permissions = await service.getEffectivePermissions(memberId, serverId);
+    expect(permissions.manageBans).toBe(false);
+  });
+
   describe('assertPermission', () => {
     it('allows the owner and returns the server without checking membership', async () => {
       prisma.server.findUnique.mockResolvedValue({ id: serverId, ownerId });

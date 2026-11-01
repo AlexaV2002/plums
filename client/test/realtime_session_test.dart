@@ -15,6 +15,9 @@ class _SocketIoProbe {
   String? pendingAckId;
   bool holdChannelAck = false;
   bool denyServerJoin = false;
+  bool denyDmJoin = false;
+  bool holdDmAck = false;
+  final Map<String, String> pendingDmAcks = {};
   String? pendingChannelAckId;
   String? pendingChannelId;
 
@@ -56,6 +59,15 @@ class _SocketIoProbe {
           connected.add(
             '42["server:error",${jsonEncode({'serverId': serverId, 'error': 'Нет доступа к серверу'})}]',
           );
+        } else if (name == 'dm:join' && ackId.isNotEmpty) {
+          final conversationId = (body[1] as Map)['conversationId'] as String;
+          if (holdDmAck) {
+            pendingDmAcks[conversationId] = ackId;
+          } else {
+            connected.add(
+              '43$ackId[${jsonEncode(denyDmJoin ? {'joined': false, 'conversationId': conversationId, 'reason': 'forbidden'} : {'joined': true, 'conversationId': conversationId})}]',
+            );
+          }
         } else if (name == 'channel:join' && ackId.isNotEmpty) {
           final channelId = (body[1] as Map)['channelId'] as String;
           if (holdChannelAck) {
@@ -90,6 +102,14 @@ class _SocketIoProbe {
     );
     pendingChannelAckId = null;
     pendingChannelId = null;
+  }
+
+  void releaseDmAck(String conversationId) {
+    final ackId = pendingDmAcks.remove(conversationId);
+    if (ackId == null) throw StateError('No pending DM ack');
+    socket!.add(
+      '43$ackId[${jsonEncode({'joined': true, 'conversationId': conversationId})}]',
+    );
   }
 
   Future<void> waitForCondition(bool Function() condition) async {
@@ -296,4 +316,140 @@ void main() {
       await probe.waitFor('server:join', 4);
     },
   );
+
+  test('joins the DM room after identify and rejoins it after the channel', () async {
+    final probe = await _SocketIoProbe.start();
+    final client = RealtimeClient(
+      socketUrl: 'http://127.0.0.1:${probe.server.port}',
+    );
+    addTearDown(() async {
+      client.dispose();
+      await probe.close();
+    });
+
+    final dmJoined = <String>[];
+    final dmDenied = <String>[];
+    final dmMessages = <AppMessage>[];
+    final dmChanges = <String>[];
+    client.connect(
+      getAccessToken: () async => 'valid-token',
+      onSessionExpired: () {},
+      onIdentified: () async {},
+      onMessageNew: (_) {},
+      onMessageUpdate: (_) {},
+      onMessageDelete: (_) {},
+      onChannelNew: (_) {},
+      onChannelUpdate: (_) {},
+      onChannelDelete: (_) {},
+      onServerAccessDenied: (_) {},
+      onMemberLeave: (_) {},
+      onMemberJoin: (_) {},
+      onUserStatus: (_) {},
+      onRoleNew: (_) {},
+      onRoleUpdate: (_) {},
+      onRoleDelete: (_) {},
+      onMemberRolesUpdate: (_) {},
+      onReconnected: (_) {},
+      onDmNew: dmMessages.add,
+      onDmJoined: dmJoined.add,
+      onDmJoinDenied: (event) => dmDenied.add(event.reason),
+      onDmConversationChanged: dmChanges.add,
+    );
+    client.joinServer('server-1');
+    client.joinChannel('channel-1');
+    await probe.waitFor('channel:join', 1);
+    await probe.waitForCondition(() => client.identifiedListenable.value);
+
+    client.joinDm('dm-1');
+    await probe.waitFor('dm:join', 1);
+    await probe.waitForCondition(() => dmJoined.length == 1);
+    expect(dmJoined, ['dm-1']);
+
+    probe.socket!.add(
+      '42["dm:new",${jsonEncode({'id': 'm1', 'conversationId': 'dm-1', 'senderId': 'u2', 'content': 'hi', 'createdAt': '2026-01-01T00:00:00.000Z', 'updatedAt': '2026-01-01T00:00:00.000Z', 'sender': {'id': 'u2', 'username': 'bob'}})}]',
+    );
+    await probe.waitForCondition(() => dmMessages.isNotEmpty);
+    expect(dmMessages.single.channelId, 'dm-1');
+    expect(dmMessages.single.author, 'bob');
+
+    probe.socket!.add('42["dm:conversation:changed",{"conversationId":"dm-1"}]');
+    await probe.waitForCondition(() => dmChanges.isNotEmpty);
+    expect(dmChanges, ['dm-1']);
+
+    probe.disconnectNamespace();
+    await probe.waitFor('dm:join', 2);
+    await probe.waitForCondition(() => dmJoined.length == 2);
+    final names = probe.events.map((event) => event.$1).toList();
+    expect(
+      names.lastIndexOf('dm:join'),
+      greaterThan(names.lastIndexOf('channel:join')),
+    );
+    expect(client.identifiedListenable.value, isTrue);
+
+    probe.denyDmJoin = true;
+    client.joinDm('dm-2');
+    await probe.waitForCondition(() => dmDenied.isNotEmpty);
+    expect(dmDenied, ['forbidden']);
+    expect(
+      probe.events.where((event) => event.$1 == 'dm:leave').map(
+        (event) => (event.$2 as Map)['conversationId'],
+      ),
+      ['dm-1'],
+    );
+  });
+
+  test('late DM join ack leaves the room after switching dialogs', () async {
+    final probe = await _SocketIoProbe.start();
+    final client = RealtimeClient(
+      socketUrl: 'http://127.0.0.1:${probe.server.port}',
+    );
+    addTearDown(() async {
+      client.dispose();
+      await probe.close();
+    });
+
+    final joined = <String>[];
+    client.connect(
+      getAccessToken: () async => 'valid-token',
+      onSessionExpired: () {},
+      onIdentified: () async {},
+      onMessageNew: (_) {},
+      onMessageUpdate: (_) {},
+      onMessageDelete: (_) {},
+      onChannelNew: (_) {},
+      onChannelUpdate: (_) {},
+      onChannelDelete: (_) {},
+      onServerAccessDenied: (_) {},
+      onMemberLeave: (_) {},
+      onMemberJoin: (_) {},
+      onUserStatus: (_) {},
+      onRoleNew: (_) {},
+      onRoleUpdate: (_) {},
+      onRoleDelete: (_) {},
+      onMemberRolesUpdate: (_) {},
+      onReconnected: (_) {},
+      onDmJoined: joined.add,
+    );
+    await probe.waitForCondition(() => client.isIdentified);
+
+    probe.holdDmAck = true;
+    client.joinDm('dm-A');
+    await probe.waitFor('dm:join', 1);
+    client.joinDm('dm-B');
+    await probe.waitFor('dm:join', 2);
+
+    probe.releaseDmAck('dm-B');
+    probe.holdDmAck = false;
+    await probe.waitForCondition(() => joined.contains('dm-B'));
+    probe.releaseDmAck('dm-A'); // Join A завершается после leave A.
+    await probe.waitForCondition(
+      () =>
+          probe.events.where(
+            (event) =>
+                event.$1 == 'dm:leave' &&
+                (event.$2 as Map)['conversationId'] == 'dm-A',
+          ).length == 2,
+    );
+    expect(joined, ['dm-B']);
+  });
 }

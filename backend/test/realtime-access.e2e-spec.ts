@@ -174,6 +174,208 @@ describe('realtime access (e2e)', () => {
     throw new Error(`Room ${room}: user ${userId} presence was not ${present}`);
   }
 
+  it('applies role assignment, updates, removal and deletion to a connected member', async () => {
+    const owner = await user('roles-owner');
+    const member = await user('roles-member');
+    const outsider = await user('roles-outsider');
+    const auth = (token: string) => ({ Authorization: `Bearer ${token}` });
+    const http = () => request(app.getHttpServer());
+    const server = await http()
+      .post('/servers')
+      .set(auth(owner.token))
+      .send({ name: 'Roles acceptance' })
+      .expect(201);
+    const serverId = (server.body as { id: string }).id;
+    const invite = await http()
+      .post(`/servers/${serverId}/invites`)
+      .set(auth(owner.token))
+      .send({})
+      .expect(201);
+    await http()
+      .post(`/invites/${(invite.body as { code: string }).code}/join`)
+      .set(auth(member.token))
+      .send({})
+      .expect(201);
+    const membership = await prisma.serverMember.findUniqueOrThrow({
+      where: { serverId_userId: { serverId, userId: member.id } },
+    });
+    const socket = await SocketProbe.connect(port);
+    probes.push(socket);
+    await socket.identify(member.token);
+    socket.emit('server:join', { serverId });
+    await waitForRoom(`server:${serverId}`, member.id, true);
+
+    await http()
+      .get(`/servers/${serverId}/roles`)
+      .set(auth(outsider.token))
+      .expect(403);
+    await http()
+      .post(`/servers/${serverId}/channels`)
+      .set(auth(member.token))
+      .send({ name: 'denied-before-role' })
+      .expect(403);
+    const role = await http()
+      .post(`/servers/${serverId}/roles`)
+      .set(auth(owner.token))
+      .send({ name: 'Channel manager', manageChannels: true })
+      .expect(201);
+    const roleId = (role.body as { id: string }).id;
+    expect(await socket.event('role:new')).toMatchObject({ serverId });
+    const assignment = `/servers/${serverId}/members/${membership.id}/roles/${roleId}`;
+    await http().post(assignment).set(auth(member.token)).send({}).expect(403);
+    await http().post(assignment).set(auth(owner.token)).send({}).expect(201);
+    expect(await socket.event('member:roles:update')).toMatchObject({
+      serverId,
+      memberId: membership.id,
+    });
+    await http()
+      .post(`/servers/${serverId}/channels`)
+      .set(auth(member.token))
+      .send({ name: 'allowed-by-role' })
+      .expect(201);
+
+    await http()
+      .patch(`/roles/${roleId}`)
+      .set(auth(owner.token))
+      .send({ manageChannels: false })
+      .expect(200);
+    expect(await socket.event('role:update')).toMatchObject({ serverId });
+    await http()
+      .post(`/servers/${serverId}/channels`)
+      .set(auth(member.token))
+      .send({ name: 'denied-after-update' })
+      .expect(403);
+    await http()
+      .patch(`/roles/${roleId}`)
+      .set(auth(owner.token))
+      .send({ manageChannels: true })
+      .expect(200);
+    await http().delete(assignment).set(auth(owner.token)).expect(200);
+    await http()
+      .post(`/servers/${serverId}/channels`)
+      .set(auth(member.token))
+      .send({ name: 'denied-after-removal' })
+      .expect(403);
+    await http().post(assignment).set(auth(owner.token)).send({}).expect(201);
+    await http().delete(`/roles/${roleId}`).set(auth(owner.token)).expect(200);
+    expect(await socket.event('role:delete')).toMatchObject({
+      serverId,
+      roleId,
+    });
+    await http()
+      .post(`/servers/${serverId}/channels`)
+      .set(auth(member.token))
+      .send({ name: 'denied-after-deletion' })
+      .expect(403);
+  }, 30000);
+
+  it('enforces each server role permission when granted and revoked', async () => {
+    const owner = await user('flags-owner');
+    const member = await user('flags-member');
+    const target = await user('flags-target');
+    const auth = (token: string) => ({ Authorization: `Bearer ${token}` });
+    const http = () => request(app.getHttpServer());
+    const server = await http()
+      .post('/servers')
+      .set(auth(owner.token))
+      .send({ name: 'Role flags' })
+      .expect(201);
+    const serverId = (server.body as { id: string }).id;
+    const invite = await http()
+      .post(`/servers/${serverId}/invites`)
+      .set(auth(owner.token))
+      .send({})
+      .expect(201);
+    const joinPath = `/invites/${(invite.body as { code: string }).code}/join`;
+    await http().post(joinPath).set(auth(member.token)).send({}).expect(201);
+    await http().post(joinPath).set(auth(target.token)).send({}).expect(201);
+    const membership = await prisma.serverMember.findUniqueOrThrow({
+      where: { serverId_userId: { serverId, userId: member.id } },
+    });
+    const targetMembership = await prisma.serverMember.findUniqueOrThrow({
+      where: { serverId_userId: { serverId, userId: target.id } },
+    });
+    const role = await http()
+      .post(`/servers/${serverId}/roles`)
+      .set(auth(owner.token))
+      .send({ name: 'Selective' })
+      .expect(201);
+    const roleId = (role.body as { id: string }).id;
+    await http()
+      .post(`/servers/${serverId}/members/${membership.id}/roles/${roleId}`)
+      .set(auth(owner.token))
+      .send({})
+      .expect(201);
+
+    const cases = [
+      {
+        key: 'manageServer',
+        allowed: 200,
+        call: () =>
+          http()
+            .patch(`/servers/${serverId}`)
+            .set(auth(member.token))
+            .send({ name: 'Renamed' }),
+      },
+      {
+        key: 'manageChannels',
+        allowed: 201,
+        call: () =>
+          http()
+            .post(`/servers/${serverId}/channels`)
+            .set(auth(member.token))
+            .send({ name: 'role-channel' }),
+      },
+      {
+        key: 'manageBans',
+        allowed: 200,
+        call: () =>
+          http().get(`/servers/${serverId}/bans`).set(auth(member.token)),
+      },
+      {
+        key: 'manageInvites',
+        allowed: 201,
+        call: () =>
+          http()
+            .post(`/servers/${serverId}/invites`)
+            .set(auth(member.token))
+            .send({}),
+      },
+      {
+        key: 'manageRoles',
+        allowed: 201,
+        call: () =>
+          http()
+            .post(`/servers/${serverId}/roles`)
+            .set(auth(member.token))
+            .send({ name: 'Delegated' }),
+      },
+      {
+        key: 'manageMembers',
+        allowed: 200,
+        call: () =>
+          http()
+            .delete(`/servers/${serverId}/members/${targetMembership.id}`)
+            .set(auth(member.token)),
+      },
+    ];
+    for (const scenario of cases) {
+      await scenario.call().expect(403);
+      await http()
+        .patch(`/roles/${roleId}`)
+        .set(auth(owner.token))
+        .send({ [scenario.key]: true })
+        .expect(200);
+      await scenario.call().expect(scenario.allowed);
+      await http()
+        .patch(`/roles/${roleId}`)
+        .set(auth(owner.token))
+        .send({ [scenario.key]: false })
+        .expect(200);
+      await scenario.call().expect(403);
+    }
+  }, 30000);
+
   it('rejects strangers, restores rooms, and evicts users after access changes', async () => {
     const owner = await user('owner');
     const member = await user('member');
