@@ -25,7 +25,10 @@ describe('invite join concurrency (e2e)', () => {
         transform: true,
       }),
     );
-    await app.init();
+    // Слушаем порт один раз: без этого supertest на каждый запрос делает
+    // listen(0)/close() на одном http.Server, и пачка параллельных запросов
+    // получает ECONNRESET вместо реального ответа.
+    await app.listen(0, '127.0.0.1');
     prisma = app.get(PrismaService);
   });
 
