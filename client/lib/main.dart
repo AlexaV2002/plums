@@ -11,6 +11,7 @@ import 'package:socket_io_client/socket_io_client.dart' as io;
 
 part 'dm.dart';
 part 'attachments.dart';
+part 'profile_images.dart';
 
 void main() {
   runApp(const PlumsApp());
@@ -839,6 +840,7 @@ class RealtimeClient {
     ValueChanged<String>? onDmJoined,
     ValueChanged<RealtimeDmJoinDenied>? onDmJoinDenied,
     ValueChanged<String>? onDmConversationChanged,
+    ValueChanged<Map<String, dynamic>>? onProfileImageUpdate,
   }) {
     if (_disposed || _handlersInstalled) return;
     _handlersInstalled = true;
@@ -924,6 +926,10 @@ class RealtimeClient {
         });
       }
     }
+
+    socket.on('profile-image:update', (data) {
+      if (data is Map) onProfileImageUpdate?.call(Map<String, dynamic>.from(data));
+    });
 
     socket.onConnect((_) {
       _manuallyDisconnected = false;
@@ -1993,7 +1999,11 @@ class _MainShellState extends State<MainShell> {
   @override
   void initState() {
     super.initState();
+    _profileSessionEpoch++;
+    profileImageRevisions.clear();
+    profileImageUpdates.value = {};
     currentUser = widget.initialUser;
+    _activeProfileUserId = widget.initialUser.id;
     messagesScrollController.addListener(_handleMessagesScroll);
     realtimeClient.connect(
       getAccessToken: () async {
@@ -2033,6 +2043,7 @@ class _MainShellState extends State<MainShell> {
       onDmJoined: dmController.handleDmJoined,
       onDmJoinDenied: dmController.handleDmJoinDenied,
       onDmConversationChanged: dmController.handleConversationChanged,
+      onProfileImageUpdate: applyProfileImageUpdate,
     );
     loadInitialData();
   }
@@ -2043,6 +2054,8 @@ class _MainShellState extends State<MainShell> {
     messagesScrollController.dispose();
     dmController.dispose();
     channelAttachmentDrafts.dispose();
+    _profileSessionEpoch++;
+    _activeProfileUserId = null;
     realtimeClient.dispose();
     super.dispose();
   }
@@ -2096,6 +2109,10 @@ class _MainShellState extends State<MainShell> {
 
     try {
       final availableServers = await apiClient.getServers();
+      final me = await apiClient.getMe();
+      final freshMembers = serverId == null ? <AppServerMember>[] : await apiClient.getServerMembers(serverId);
+      if (!mounted || selectedServerId != serverId) return;
+      syncProfileImages(availableServers, freshMembers, me);
       if (!mounted || selectedServerId != serverId) return;
 
       if (serverId == null) {
@@ -2688,6 +2705,7 @@ class _MainShellState extends State<MainShell> {
         orElse: () => null,
       );
 
+      syncProfileImages(loadedServers, loadedMembers, me);
       setState(() {
         currentUser = currentMember?.user ?? me;
         servers = loadedServers;
@@ -2736,6 +2754,7 @@ class _MainShellState extends State<MainShell> {
       final loadedChannels = await apiClient.getChannels(serverId);
       final loadedMembers = await apiClient.getServerMembers(serverId);
       final loadedRoles = await apiClient.getServerRoles(serverId);
+      syncProfileImages(const [], loadedMembers, null);
       final firstChannel = loadedChannels.isNotEmpty
           ? loadedChannels.first
           : null;
@@ -3928,7 +3947,11 @@ class _MainShellState extends State<MainShell> {
       return;
     }
 
-    final result = await showEditProfileDialog(context: context, user: user);
+    final result = await showEditProfileDialog(
+      context: context, user: user,
+      onChangeAvatar: () => changeProfileImage(context, isServer: false),
+      onDeleteAvatar: () => changeProfileImage(context, isServer: false, remove: true),
+    );
 
     if (result == null) {
       return;
@@ -4203,6 +4226,8 @@ class _MainShellState extends State<MainShell> {
             onEditChannelPermissions: editChannelPermissions,
             onCreateInvite: createInvite,
             onManageRoles: selectedServer == null ? null : manageServerRoles,
+            onChangeServerIcon: selectedServer == null ? null : () => changeProfileImage(context, isServer: true, serverId: selectedServer.id),
+            onDeleteServerIcon: selectedServer == null ? null : () => changeProfileImage(context, isServer: true, serverId: selectedServer.id, remove: true),
             onRenameServer: selectedServer == null
                 ? null
                 : () => renameServer(selectedServer),
@@ -4426,7 +4451,9 @@ class ServerIconButton extends StatelessWidget {
                 : const Color(0xFF24202B),
             borderRadius: BorderRadius.circular(isSelected ? 18 : 26),
           ),
-          child: Center(
+          child: ProfileImage(
+            entityKey: 'server:${server.id}', url: server.iconUrl, revision: server.profileImageRevision, size: 52,
+            child: Center(
             child: Text(
               server.shortName,
               style: TextStyle(
@@ -4435,6 +4462,7 @@ class ServerIconButton extends StatelessWidget {
                 fontWeight: FontWeight.w700,
               ),
             ),
+          ),
           ),
         ),
       ),
@@ -4464,6 +4492,8 @@ class ChannelsPanel extends StatelessWidget {
     required this.onEditChannelPermissions,
     required this.onCreateInvite,
     this.onManageRoles,
+    required this.onChangeServerIcon,
+    required this.onDeleteServerIcon,
     required this.onRenameServer,
     required this.onDeleteServer,
     required this.onLeaveServer,
@@ -4486,6 +4516,8 @@ class ChannelsPanel extends StatelessWidget {
   final ValueChanged<AppChannel> onEditChannelPermissions;
   final VoidCallback onCreateInvite;
   final VoidCallback? onManageRoles;
+  final VoidCallback? onChangeServerIcon;
+  final VoidCallback? onDeleteServerIcon;
   final VoidCallback? onRenameServer;
   final VoidCallback? onDeleteServer;
   final VoidCallback? onLeaveServer;
@@ -4515,6 +4547,8 @@ class ChannelsPanel extends StatelessWidget {
             canCreateInvite: canManageChannels,
             onCreateInvite: onCreateInvite,
             onManageRoles: onManageRoles,
+            onChangeServerIcon: onChangeServerIcon,
+            onDeleteServerIcon: onDeleteServerIcon,
             onRenameServer: onRenameServer,
             onDeleteServer: onDeleteServer,
             onLeaveServer: onLeaveServer,
@@ -4578,6 +4612,8 @@ class ServerHeader extends StatelessWidget {
     required this.canCreateInvite,
     required this.onCreateInvite,
     this.onManageRoles,
+    required this.onChangeServerIcon,
+    required this.onDeleteServerIcon,
     required this.onRenameServer,
     required this.onDeleteServer,
     required this.onLeaveServer,
@@ -4590,6 +4626,8 @@ class ServerHeader extends StatelessWidget {
   final bool canCreateInvite;
   final VoidCallback onCreateInvite;
   final VoidCallback? onManageRoles;
+  final VoidCallback? onChangeServerIcon;
+  final VoidCallback? onDeleteServerIcon;
   final VoidCallback? onRenameServer;
   final VoidCallback? onDeleteServer;
   final VoidCallback? onLeaveServer;
@@ -4634,6 +4672,12 @@ class ServerHeader extends StatelessWidget {
             ),
             onSelected: (value) {
               switch (value) {
+                case 'icon':
+                  onChangeServerIcon?.call();
+                  break;
+                case 'deleteIcon':
+                  onDeleteServerIcon?.call();
+                  break;
                 case 'rename':
                   onRenameServer?.call();
                   break;
@@ -4651,6 +4695,10 @@ class ServerHeader extends StatelessWidget {
             itemBuilder: (context) {
               if (canManageServer || canManageRoles) {
                 return [
+                  if (canManageServer)
+                    const PopupMenuItem(value: 'icon', child: Text('Изменить иконку сервера')),
+                  if (canManageServer)
+                    const PopupMenuItem(value: 'deleteIcon', child: Text('Удалить иконку сервера')),
                   if (canManageServer)
                     const PopupMenuItem(
                       value: 'rename',
@@ -4872,7 +4920,9 @@ class UserPanel extends StatelessWidget {
         children: [
           Stack(
             children: [
-              Container(
+              ProfileImage(
+                entityKey: 'user:${user.id}', url: user.avatarUrl, revision: user.profileImageRevision, size: 42,
+                child: Container(
                 width: 42,
                 height: 42,
                 decoration: BoxDecoration(
@@ -4889,6 +4939,7 @@ class UserPanel extends StatelessWidget {
                     ),
                   ),
                 ),
+              ),
               ),
               Positioned(
                 right: 0,
@@ -5324,7 +5375,9 @@ class MembersSidebar extends StatelessWidget {
                       return Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Container(
+                          ProfileImage(
+                            entityKey: 'user:${user.id}', url: user.avatarUrl, revision: user.profileImageRevision, size: 36,
+                            child: Container(
                             width: 36,
                             height: 36,
                             decoration: BoxDecoration(
@@ -5341,6 +5394,7 @@ class MembersSidebar extends StatelessWidget {
                                 ),
                               ),
                             ),
+                          ),
                           ),
                           const SizedBox(width: 10),
                           Expanded(
@@ -5555,7 +5609,9 @@ class MessageBubble extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
+          ProfileImage(
+            entityKey: 'user:${message.authorId}', url: message.authorAvatarUrl, revision: message.authorImageRevision, size: 42,
+            child: Container(
             width: 42,
             height: 42,
             decoration: BoxDecoration(
@@ -5573,6 +5629,7 @@ class MessageBubble extends StatelessWidget {
                 ),
               ),
             ),
+          ),
           ),
           const SizedBox(width: 12),
           Expanded(
@@ -6253,6 +6310,8 @@ Future<bool?> showConfirmDialog({
 Future<EditProfileResult?> showEditProfileDialog({
   required BuildContext context,
   required AppUser user,
+  required VoidCallback onChangeAvatar,
+  required VoidCallback onDeleteAvatar,
 }) {
   final usernameController = TextEditingController(text: user.username);
   final bioController = TextEditingController(text: user.bio ?? '');
@@ -6268,6 +6327,11 @@ Future<EditProfileResult?> showEditProfileDialog({
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                ProfileImage(entityKey: 'user:${user.id}', url: user.avatarUrl, revision: user.profileImageRevision, size: 64, child: const Icon(Icons.person, size: 48)),
+                Wrap(alignment: WrapAlignment.center, children: [
+                  TextButton(onPressed: onChangeAvatar, child: const Text('Изменить аватар')),
+                  TextButton(onPressed: onDeleteAvatar, child: const Text('Удалить аватар')),
+                ]),
                 PlumsTextField(
                   controller: usernameController,
                   label: 'Username',
@@ -7583,6 +7647,7 @@ class AppUser {
     required this.username,
     this.email,
     this.avatarUrl,
+    this.profileImageRevision = 0,
     this.bio,
     required this.status,
   });
@@ -7591,6 +7656,7 @@ class AppUser {
   final String username;
   final String? email;
   final String? avatarUrl;
+  final int profileImageRevision;
   final String? bio;
   final String status;
 
@@ -7600,6 +7666,7 @@ class AppUser {
       username: json['username'] as String,
       email: json['email'] as String?,
       avatarUrl: json['avatarUrl'] as String?,
+      profileImageRevision: json['profileImageRevision'] as int? ?? 0,
       bio: json['bio'] as String?,
       status: json['status'] as String? ?? 'OFFLINE',
     );
@@ -7610,6 +7677,7 @@ class AppUser {
     String? username,
     String? email,
     String? avatarUrl,
+    int? profileImageRevision,
     String? bio,
     String? status,
   }) {
@@ -7618,6 +7686,7 @@ class AppUser {
       username: username ?? this.username,
       email: email ?? this.email,
       avatarUrl: avatarUrl ?? this.avatarUrl,
+      profileImageRevision: profileImageRevision ?? this.profileImageRevision,
       bio: bio ?? this.bio,
       status: status ?? this.status,
     );
@@ -7629,12 +7698,14 @@ class AppServer {
     required this.id,
     required this.name,
     this.iconUrl,
+    this.profileImageRevision = 0,
     this.ownerId,
   });
 
   final String id;
   final String name;
   final String? iconUrl;
+  final int profileImageRevision;
   final String? ownerId;
 
   String get shortName {
@@ -7650,6 +7721,7 @@ class AppServer {
       id: json['id'] as String,
       name: json['name'] as String,
       iconUrl: json['iconUrl'] as String?,
+      profileImageRevision: json['profileImageRevision'] as int? ?? 0,
       ownerId: json['ownerId'] as String?,
     );
   }
@@ -7792,6 +7864,8 @@ class AppMessage {
     required this.createdAt,
     required this.updatedAt,
     this.attachments = const [],
+    this.authorAvatarUrl,
+    this.authorImageRevision = 0,
   });
 
   final String id;
@@ -7803,6 +7877,8 @@ class AppMessage {
   final DateTime? createdAt;
   final DateTime? updatedAt;
   final List<AppAttachment> attachments;
+  final String? authorAvatarUrl;
+  final int authorImageRevision;
 
   String get authorInitial {
     if (author.isEmpty) {
@@ -7833,6 +7909,8 @@ class AppMessage {
       channelId: json['channelId'] as String,
       authorId: json['authorId'] as String,
       author: authorJson?['username'] as String? ?? 'unknown',
+      authorAvatarUrl: authorJson?['avatarUrl'] as String?,
+      authorImageRevision: authorJson?['profileImageRevision'] as int? ?? 0,
       content: json['content'] as String,
       time: _formatTime(createdAtRaw),
       createdAt: DateTime.tryParse(createdAtRaw ?? ''),
@@ -7857,6 +7935,8 @@ class AppMessage {
       author: senderJson is Map
           ? senderJson['username'] as String? ?? 'unknown'
           : 'unknown',
+      authorAvatarUrl: senderJson is Map ? senderJson['avatarUrl'] as String? : null,
+      authorImageRevision: senderJson is Map ? senderJson['profileImageRevision'] as int? ?? 0 : 0,
       content: json['content'] as String,
       time: _formatTime(createdAtRaw),
       createdAt: DateTime.tryParse(createdAtRaw ?? ''),

@@ -96,6 +96,7 @@ export class ServersService {
         id: true,
         name: true,
         iconUrl: true,
+        profileImageRevision: true,
         ownerId: true,
         createdAt: true,
         updatedAt: true,
@@ -116,6 +117,7 @@ export class ServersService {
                 id: true,
                 username: true,
                 avatarUrl: true,
+                profileImageRevision: true,
                 status: true,
                 bio: true,
               },
@@ -167,6 +169,7 @@ export class ServersService {
             id: true,
             username: true,
             avatarUrl: true,
+            profileImageRevision: true,
             status: true,
             bio: true,
           },
@@ -187,6 +190,46 @@ export class ServersService {
   async updateServer(userId: string, serverId: string, dto: UpdateServerDto) {
     await this.getServerOwnerOrThrow(userId, serverId);
 
+    // Legacy clients may still set iconUrl directly. Retire any managed image
+    // transactionally when they replace it, without rewriting existing URLs.
+    if (dto.iconUrl !== undefined) {
+      const updated = await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM servers WHERE id = ${serverId} FOR UPDATE`;
+        const current = await tx.server.findUniqueOrThrow({
+          where: { id: serverId },
+          select: { iconUrl: true },
+        });
+        if (current.iconUrl !== dto.iconUrl) {
+          await tx.profileImage.deleteMany({ where: { serverId } });
+        }
+        return tx.server.update({
+          where: { id: serverId },
+          data: {
+            name: dto.name,
+            iconUrl: dto.iconUrl,
+            ...(current.iconUrl !== dto.iconUrl
+              ? { profileImageRevision: { increment: 1 } }
+              : {}),
+          },
+          select: {
+            id: true,
+            name: true,
+            iconUrl: true,
+            profileImageRevision: true,
+            ownerId: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        });
+      });
+      this.serversGateway.emitServerIconUpdate(
+        serverId,
+        updated.iconUrl,
+        updated.profileImageRevision,
+      );
+      return updated;
+    }
+
     return this.prisma.server.update({
       where: {
         id: serverId,
@@ -199,6 +242,7 @@ export class ServersService {
         id: true,
         name: true,
         iconUrl: true,
+        profileImageRevision: true,
         ownerId: true,
         createdAt: true,
         updatedAt: true,
@@ -432,6 +476,7 @@ export class ServersService {
             id: true,
             username: true,
             avatarUrl: true,
+            profileImageRevision: true,
             bio: true,
           },
         },

@@ -7,6 +7,7 @@ describe('AttachmentsService', () => {
   const prisma = {
     channel: { findUnique: jest.fn() },
     serverMember: { findUnique: jest.fn() },
+    profileImage: { findUnique: jest.fn() },
     attachment: {
       create: jest.fn(),
       deleteMany: jest.fn(),
@@ -109,7 +110,13 @@ describe('AttachmentsService', () => {
   });
 
   it('removes only orphaned old files, preserving live and queued keys', async () => {
-    storage.oldKeys.mockResolvedValue(['live', 'queued', 'orphan']);
+    storage.oldKeys.mockResolvedValue(['live', 'queued', 'profile', 'orphan']);
+    prisma.profileImage.findUnique.mockImplementation(
+      ({ where }: { where: { storageKey: string } }) =>
+        Promise.resolve(
+          where.storageKey === 'profile' ? { id: 'profile' } : null,
+        ),
+    );
     prisma.attachment.findUnique.mockImplementation(
       ({ where }: { where: { storageKey: string } }) =>
         Promise.resolve(where.storageKey === 'live' ? { id: 'live' } : null),

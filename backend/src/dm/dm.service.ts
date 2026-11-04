@@ -16,6 +16,7 @@ export type DmUser = {
   id: string;
   username: string;
   avatarUrl: string | null;
+  profileImageRevision?: number;
 };
 
 export type DmMessage = {
@@ -41,6 +42,7 @@ const publicUserSelect = {
   id: true,
   username: true,
   avatarUrl: true,
+  profileImageRevision: true,
 } satisfies Prisma.UserSelect;
 
 const dmMessageSelect = {
@@ -71,6 +73,7 @@ export function toDmUser(user: DmUser): DmUser {
     id: user.id,
     username: user.username,
     avatarUrl: user.avatarUrl ?? null,
+    profileImageRevision: user.profileImageRevision ?? 0,
   };
 }
 

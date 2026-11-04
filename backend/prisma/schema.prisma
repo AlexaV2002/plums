@@ -29,6 +29,7 @@ model User {
   username     String
   passwordHash String
   avatarUrl    String?
+  profileImageRevision Int @default(0)
   status       UserStatus @default(OFFLINE)
   bio          String?
   createdAt    DateTime   @default(now())
@@ -38,6 +39,7 @@ model User {
   memberships  ServerMember[]
   messages     Message[]
   attachments  Attachment[]
+  profileImage ProfileImage?
   createdInvites Invite[]     @relation("InviteCreator")
   refreshTokens  RefreshToken[]
   bannedFrom     ServerBan[]  @relation("BannedUser")
@@ -66,6 +68,7 @@ model Server {
   id        String   @id @default(uuid())
   name      String
   iconUrl   String?
+  profileImageRevision Int @default(0)
   ownerId   String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -76,6 +79,7 @@ model Server {
   invites  Invite[]
   bans     ServerBan[]
   roles    Role[]
+  profileImage ProfileImage?
 
   @@map("servers")
 }
@@ -180,6 +184,21 @@ model AttachmentCleanup {
   lastAttemptAt DateTime?
 
   @@map("attachment_cleanup")
+}
+
+// Profile and server icons share the private attachment storage and cleanup queue.
+model ProfileImage {
+  id         String   @id @default(uuid())
+  userId     String?  @unique
+  serverId   String?  @unique
+  mimeType   String
+  sizeBytes  Int
+  storageKey String   @unique
+  createdAt  DateTime @default(now())
+  user       User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  server     Server?  @relation(fields: [serverId], references: [id], onDelete: Cascade)
+
+  @@map("profile_images")
 }
 
 model Invite {

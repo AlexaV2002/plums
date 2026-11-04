@@ -100,7 +100,12 @@ describe('DmService', () => {
     'senderId',
     'updatedAt',
   ];
-  const expectedUserKeys = ['avatarUrl', 'id', 'username'];
+  const expectedUserKeys = [
+    'avatarUrl',
+    'id',
+    'profileImageRevision',
+    'username',
+  ];
 
   beforeEach(async () => {
     prisma = {
@@ -174,6 +179,7 @@ describe('DmService', () => {
         id: userId,
         username: `name-${userId}`,
         avatarUrl: null,
+        profileImageRevision: 0,
       });
       expect(conversation.userB.id).toBe(otherUserId);
       expect(Object.keys(conversation.lastMessage!).sort()).toEqual(

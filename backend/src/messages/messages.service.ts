@@ -23,6 +23,7 @@ const messageRelations = {
       id: true,
       username: true,
       avatarUrl: true,
+      profileImageRevision: true,
       status: true,
     },
   },

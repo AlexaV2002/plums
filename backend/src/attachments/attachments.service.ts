@@ -263,7 +263,7 @@ export class AttachmentsService implements OnModuleInit, OnModuleDestroy {
       for (const key of await this.storage.oldKeys(
         new Date(Date.now() - ORPHAN_GRACE_MS),
       )) {
-        const [record, pending] = await Promise.all([
+        const [record, pending, profile] = await Promise.all([
           this.prisma.attachment.findUnique({
             where: { storageKey: key },
             select: { id: true },
@@ -272,8 +272,12 @@ export class AttachmentsService implements OnModuleInit, OnModuleDestroy {
             where: { storageKey: key },
             select: { storageKey: true },
           }),
+          this.prisma.profileImage.findUnique({
+            where: { storageKey: key },
+            select: { id: true },
+          }),
         ]);
-        if (!record && !pending) await this.storage.remove(key);
+        if (!record && !pending && !profile) await this.storage.remove(key);
       }
     } catch {
       this.logger.warn('Attachment cleanup failed; it will be retried');

@@ -26,6 +26,7 @@ export class UsersService {
         id: true,
         username: true,
         avatarUrl: true,
+        profileImageRevision: true,
       },
       orderBy: { username: 'asc' },
       take: limit ?? 10,
@@ -40,6 +41,7 @@ export class UsersService {
         username: true,
         email: true,
         avatarUrl: true,
+        profileImageRevision: true,
         status: true,
         bio: true,
         createdAt: true,
@@ -62,6 +64,7 @@ export class UsersService {
         username: true,
         email: true,
         avatarUrl: true,
+        profileImageRevision: true,
         status: true,
         bio: true,
         createdAt: true,
@@ -83,6 +86,7 @@ export class UsersService {
         username: true,
         email: true,
         avatarUrl: true,
+        profileImageRevision: true,
         status: true,
         bio: true,
         createdAt: true,
@@ -102,6 +106,7 @@ export class UsersService {
     username: string;
     email: string;
     avatarUrl: string | null;
+    profileImageRevision: number;
     status: string;
     bio: string | null;
     createdAt: Date;
@@ -112,6 +117,7 @@ export class UsersService {
       username: user.username,
       email: user.email,
       avatarUrl: user.avatarUrl,
+      profileImageRevision: user.profileImageRevision,
       status: user.status,
       bio: user.bio,
       createdAt: user.createdAt,

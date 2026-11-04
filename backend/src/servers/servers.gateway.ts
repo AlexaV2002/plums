@@ -124,6 +124,14 @@ export class ServersGateway {
       .emit('member:join', payload);
   }
 
+  emitServerIconUpdate(serverId: string, url: string | null, revision: number) {
+    this.server?.to(this.getServerRoom(serverId)).emit('profile-image:update', {
+      serverId,
+      url,
+      revision,
+    });
+  }
+
   emitRoleNew(payload: RoleEventPayload) {
     this.server
       .to(this.getServerRoom(payload.serverId))
