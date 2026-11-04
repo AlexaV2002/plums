@@ -8,7 +8,7 @@ import { PermissionsService } from '../permissions/permissions.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
 import { UpdateChannelPermissionsDto } from './dto/update-channel-permissions.dto';
 import { UpdateChannelDto } from './dto/update-channel.dto';
-import { ChannelsGateway } from './channels.gateway';
+import { ChannelsGateway, withChannelRoomLock } from './channels.gateway';
 
 type ChannelPermissions = {
   canView?: boolean;
@@ -179,29 +179,34 @@ export class ChannelsService {
   }
 
   async deleteChannel(userId: string, channelId: string) {
-    const channel = await this.getChannelOrThrow(channelId);
+    return withChannelRoomLock(channelId, async () => {
+      const channel = await this.getChannelOrThrow(channelId);
 
-    await this.checkServerOwner(userId, channel.serverId);
+      await this.checkServerOwner(userId, channel.serverId);
 
-    await this.prisma.channel.delete({
-      where: {
-        id: channelId,
-      },
+      await this.prisma.channel.delete({
+        where: {
+          id: channelId,
+        },
+      });
+
+      try {
+        await this.channelsGateway.emitChannelDelete(
+          channel.serverId,
+          {
+            id: channel.id,
+            serverId: channel.serverId,
+          },
+          this.getPermissions(channel.permissions).canView === false,
+        );
+      } finally {
+        this.channelsGateway.evictChannel(channelId);
+      }
+
+      return {
+        message: 'Канал удалён',
+      };
     });
-
-    await this.channelsGateway.emitChannelDelete(
-      channel.serverId,
-      {
-        id: channel.id,
-        serverId: channel.serverId,
-      },
-      this.getPermissions(channel.permissions).canView === false,
-    );
-    this.channelsGateway.evictChannel(channelId);
-
-    return {
-      message: 'Канал удалён',
-    };
   }
 
   async updateChannelPermissions(
@@ -209,53 +214,55 @@ export class ChannelsService {
     channelId: string,
     dto: UpdateChannelPermissionsDto,
   ) {
-    const channel = await this.getChannelOrThrow(channelId);
+    return withChannelRoomLock(channelId, async () => {
+      const channel = await this.getChannelOrThrow(channelId);
 
-    await this.checkServerOwner(userId, channel.serverId);
+      await this.checkServerOwner(userId, channel.serverId);
 
-    const currentPermissions = this.getPermissions(channel.permissions);
+      const currentPermissions = this.getPermissions(channel.permissions);
 
-    const updatedChannel = await this.prisma.channel.update({
-      where: {
-        id: channelId,
-      },
-      data: {
-        permissions: {
-          ...currentPermissions,
-          ...dto,
+      const updatedChannel = await this.prisma.channel.update({
+        where: {
+          id: channelId,
         },
-      },
-    });
-
-    const isNowHidden =
-      this.getPermissions(updatedChannel.permissions).canView === false;
-
-    if (isNowHidden) {
-      const server = await this.prisma.server.findUnique({
-        where: { id: updatedChannel.serverId },
-        select: { ownerId: true },
+        data: {
+          permissions: {
+            ...currentPermissions,
+            ...dto,
+          },
+        },
       });
-      if (server) {
-        await this.channelsGateway.evictChannelViewers(
-          channelId,
-          server.ownerId,
-        );
-        if (currentPermissions.canView) {
-          await this.channelsGateway.notifyChannelHidden(
-            updatedChannel.serverId,
+
+      const isNowHidden =
+        this.getPermissions(updatedChannel.permissions).canView === false;
+
+      if (isNowHidden) {
+        const server = await this.prisma.server.findUnique({
+          where: { id: updatedChannel.serverId },
+          select: { ownerId: true },
+        });
+        if (server) {
+          await this.channelsGateway.evictChannelViewers(
             channelId,
             server.ownerId,
           );
+          if (currentPermissions.canView) {
+            await this.channelsGateway.notifyChannelHidden(
+              updatedChannel.serverId,
+              channelId,
+              server.ownerId,
+            );
+          }
         }
       }
-    }
 
-    await this.channelsGateway.emitChannelUpdate(
-      updatedChannel.serverId,
-      updatedChannel,
-      isNowHidden,
-    );
+      await this.channelsGateway.emitChannelUpdate(
+        updatedChannel.serverId,
+        updatedChannel,
+        isNowHidden,
+      );
 
-    return updatedChannel;
+      return updatedChannel;
+    });
   }
 }

@@ -65,6 +65,58 @@ describe('MessagesService', () => {
   });
 
   describe('findByChannel', () => {
+    function firstFindManyQuery(): unknown {
+      const firstCall: unknown = prisma.message.findMany.mock.calls[0];
+      if (!Array.isArray(firstCall) || firstCall.length !== 1) {
+        throw new Error('Expected one argument in the first findMany call');
+      }
+      const [query] = firstCall as [unknown];
+      return query;
+    }
+
+    it('uses the composite before cursor and returns the page in chronological order', async () => {
+      const createdAt = new Date('2024-01-01T00:00:00Z');
+      prisma.message.findUnique.mockResolvedValue({ createdAt, channelId });
+      prisma.message.findMany.mockResolvedValue([
+        { id: 'm2', createdAt },
+        { id: 'm1', createdAt },
+      ]);
+
+      const result = await service.findByChannel(channelId, userId, {
+        before: 'm3',
+        limit: 2,
+      });
+
+      expect(firstFindManyQuery()).toMatchObject({
+        where: {
+          channelId,
+          deletedAt: null,
+          OR: [
+            { createdAt: { lt: createdAt } },
+            { createdAt, id: { lt: 'm3' } },
+          ],
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: 2,
+      });
+      expect(result.map((message: { id: string }) => message.id)).toEqual([
+        'm1',
+        'm2',
+      ]);
+    });
+
+    it('rejects a before cursor from another channel without querying messages', async () => {
+      prisma.message.findUnique.mockResolvedValue({
+        createdAt: new Date(),
+        channelId: 'other-channel',
+      });
+
+      await expect(
+        service.findByChannel(channelId, userId, { before: 'm1' }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.message.findMany).not.toHaveBeenCalled();
+    });
+
     it('возвращает сообщения после курсора after в хронологическом порядке', async () => {
       prisma.message.findUnique.mockResolvedValue({
         createdAt: new Date('2024-01-01T00:00:00Z'),
@@ -96,6 +148,30 @@ describe('MessagesService', () => {
         }),
       );
       expect(result).toBe(found);
+    });
+
+    it('uses the id tie-breaker when after messages share createdAt', async () => {
+      const createdAt = new Date('2024-01-01T00:00:00Z');
+      prisma.message.findUnique.mockResolvedValue({ createdAt, channelId });
+      prisma.message.findMany.mockResolvedValue([{ id: 'm2', createdAt }]);
+
+      const result = await service.findByChannel(channelId, userId, {
+        after: 'm1',
+      });
+
+      expect(firstFindManyQuery()).toMatchObject({
+        where: {
+          deletedAt: null,
+          OR: [
+            { createdAt: { gt: createdAt } },
+            { createdAt, id: { gt: 'm1' } },
+          ],
+        },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      });
+      expect(result.map((message: { id: string }) => message.id)).toEqual([
+        'm2',
+      ]);
     });
 
     it('передаёт limit дальше в Prisma для курсора after', async () => {

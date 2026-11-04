@@ -91,6 +91,8 @@ describe('MessagesGateway rooms', () => {
     prisma.serverMember.findUnique.mockResolvedValue({ id: 'member-1' });
     prisma.channel.findUnique
       .mockResolvedValueOnce(channel(true))
+      .mockResolvedValueOnce(channel(true))
+      .mockResolvedValueOnce(channel(false))
       .mockResolvedValueOnce(channel(false));
     await gateway.joinChannel({ channelId: 'channel-1' }, socket as never);
     expect(socket.join).toHaveBeenCalledWith('channel:channel-1');
@@ -106,5 +108,62 @@ describe('MessagesGateway rooms', () => {
     await gateway.joinChannel({ channelId: 'channel-1' }, socket as never);
     expect(prisma.channel.findUnique).not.toHaveBeenCalled();
     expect(socket.join).not.toHaveBeenCalled();
+  });
+
+  it('rejects a pending join after the socket switches accounts', async () => {
+    const socket = client();
+    const ack = jest.fn();
+    let finishLookup!: (member: { id: string }) => void;
+    prisma.channel.findUnique.mockResolvedValue(channel(true));
+    prisma.serverMember.findUnique.mockReturnValue(
+      new Promise<{ id: string }>((resolve) => {
+        finishLookup = resolve;
+      }),
+    );
+
+    const pending = gateway.joinChannel(
+      { channelId: 'channel-1' },
+      socket as never,
+      ack,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    socket.data.userId = 'user-2';
+    socket.data.identityVersion = 2;
+    finishLookup({ id: 'member-1' });
+    await pending;
+
+    expect(socket.join).not.toHaveBeenCalled();
+    expect(ack).toHaveBeenCalledWith({
+      joined: false,
+      reason: 'session_required',
+    });
+  });
+
+  it('rejects a pending join when its JWT expires during membership lookup', async () => {
+    const socket = client();
+    const ack = jest.fn();
+    let finishLookup!: (member: { id: string }) => void;
+    prisma.channel.findUnique.mockResolvedValue(channel(true));
+    prisma.serverMember.findUnique.mockReturnValue(
+      new Promise<{ id: string }>((resolve) => {
+        finishLookup = resolve;
+      }),
+    );
+
+    const pending = gateway.joinChannel(
+      { channelId: 'channel-1' },
+      socket as never,
+      ack,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    socket.data.authExpiresAt = Date.now() - 1;
+    finishLookup({ id: 'member-1' });
+    await pending;
+
+    expect(socket.join).not.toHaveBeenCalled();
+    expect(ack).toHaveBeenCalledWith({
+      joined: false,
+      reason: 'session_required',
+    });
   });
 });

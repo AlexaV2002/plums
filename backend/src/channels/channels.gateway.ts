@@ -4,6 +4,30 @@ import { PrismaService } from '../prisma/prisma.service';
 
 type ChannelEvent = 'channel:new' | 'channel:update' | 'channel:delete';
 
+// Serializes room joins with deletion/eviction for one channel in this process.
+const channelRoomOperations = new Map<string, Promise<void>>();
+
+export async function withChannelRoomLock<T>(
+  channelId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = channelRoomOperations.get(channelId) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  channelRoomOperations.set(channelId, current);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (channelRoomOperations.get(channelId) === current) {
+      channelRoomOperations.delete(channelId);
+    }
+  }
+}
+
 @WebSocketGateway({
   cors: {
     origin: '*',
