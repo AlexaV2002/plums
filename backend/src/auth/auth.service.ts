@@ -4,6 +4,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { Prisma } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -39,10 +40,13 @@ export class AuthService {
     );
   }
 
-  private async issueRefreshToken(userId: string) {
+  private async issueRefreshToken(
+    userId: string,
+    prisma: Prisma.TransactionClient = this.prisma,
+  ) {
     const refreshToken = randomBytes(48).toString('base64url');
 
-    await this.prisma.refreshToken.create({
+    await prisma.refreshToken.create({
       data: {
         userId,
         tokenHash: this.hashToken(refreshToken),
@@ -127,15 +131,27 @@ export class AuthService {
       );
     }
 
-    // Ротация: старый refresh-токен становится недействителен сразу после использования.
-    await this.prisma.refreshToken.update({
-      where: { id: storedToken.id },
-      data: { revokedAt: new Date() },
-    });
+    // Подписываем JWT до транзакции: при ошибке подписи старый токен останется рабочим.
+    const accessToken = await this.generateAccessToken(storedToken.user);
+    const refreshToken = await this.prisma.$transaction(async (tx) => {
+      // Условный UPDATE блокирует строку в PostgreSQL. После первой ротации
+      // конкурирующий запрос получит count = 0 и ответит 401.
+      const claimed = await tx.refreshToken.updateMany({
+        where: {
+          id: storedToken.id,
+          revokedAt: null,
+          expiresAt: { gt: new Date() },
+        },
+        data: { revokedAt: new Date() },
+      });
+      if (claimed.count !== 1) {
+        throw new UnauthorizedException(
+          'Недействительный или истёкший refresh-токен',
+        );
+      }
 
-    const { accessToken, refreshToken } = await this.issueTokenPair(
-      storedToken.user,
-    );
+      return this.issueRefreshToken(storedToken.user.id, tx);
+    });
 
     return {
       accessToken,

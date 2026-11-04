@@ -12,4 +12,8 @@ export class GetMessagesQueryDto {
   @IsOptional()
   @IsString()
   before?: string;
+
+  @IsOptional()
+  @IsString()
+  after?: string;
 }

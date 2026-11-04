@@ -1,11 +1,8 @@
-import {
-  ConnectedSocket,
-  MessageBody,
-  SubscribeMessage,
-  WebSocketGateway,
-  WebSocketServer,
-} from '@nestjs/websockets';
-import { Server, Socket } from 'socket.io';
+import { WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
+import { Server } from 'socket.io';
+import { PrismaService } from '../prisma/prisma.service';
+
+type ChannelEvent = 'channel:new' | 'channel:update' | 'channel:delete';
 
 @WebSocketGateway({
   cors: {
@@ -16,44 +13,78 @@ export class ChannelsGateway {
   @WebSocketServer()
   server!: Server;
 
-  @SubscribeMessage('server:join')
-  joinServer(
-    @MessageBody() payload: { serverId?: string },
-    @ConnectedSocket() client: Socket,
+  constructor(private readonly prisma: PrismaService) {}
+
+  async emitChannelNew(serverId: string, channel: unknown, hidden = false) {
+    await this.emitChannelEvent(serverId, 'channel:new', channel, hidden);
+  }
+
+  async emitChannelUpdate(serverId: string, channel: unknown, hidden = false) {
+    await this.emitChannelEvent(serverId, 'channel:update', channel, hidden);
+  }
+
+  async emitChannelDelete(serverId: string, channel: unknown, hidden = false) {
+    await this.emitChannelEvent(serverId, 'channel:delete', channel, hidden);
+  }
+
+  async evictChannelViewers(channelId: string, ownerId: string) {
+    const room = `channel:${channelId}`;
+    for (const socket of await this.server.in(room).fetchSockets()) {
+      if ((socket.data as { userId?: string }).userId !== ownerId)
+        socket.leave(room);
+    }
+  }
+
+  // Участник мог уже загрузить видимый канал. При скрытии отправляем только
+  // ранее известный id, чтобы клиент убрал его и сообщения из локального UI.
+  async notifyChannelHidden(
+    serverId: string,
+    channelId: string,
+    ownerId: string,
   ) {
-    if (!payload.serverId) {
+    const payload = { id: channelId, serverId };
+    for (const socket of await this.server
+      .in(this.getServerRoom(serverId))
+      .fetchSockets()) {
+      if ((socket.data as { userId?: string }).userId !== ownerId) {
+        socket.emit('channel:delete', payload);
+      }
+    }
+  }
+
+  evictChannel(channelId: string) {
+    const room = `channel:${channelId}`;
+    this.server.in(room).socketsLeave(room);
+  }
+
+  // Видимый канал транслируется всем участникам серверной комнаты как раньше.
+  // Скрытый канал (canView: false) не должен раскрывать своё существование
+  // или метаданные никому, кроме владельца сервера — таким участникам
+  // событие отправляется точечно, в обход комнаты server:<id>.
+  private async emitChannelEvent(
+    serverId: string,
+    event: ChannelEvent,
+    channel: unknown,
+    hidden: boolean,
+  ) {
+    const room = this.getServerRoom(serverId);
+
+    if (!hidden) {
+      this.server.to(room).emit(event, channel);
       return;
     }
 
-    client.join(this.getServerRoom(payload.serverId));
-  }
+    const server = await this.prisma.server.findUnique({
+      where: { id: serverId },
+      select: { ownerId: true },
+    });
+    if (!server) return;
 
-  @SubscribeMessage('server:leave')
-  leaveServer(
-    @MessageBody() payload: { serverId?: string },
-    @ConnectedSocket() client: Socket,
-  ) {
-    if (!payload.serverId) {
-      return;
+    for (const socket of await this.server.in(room).fetchSockets()) {
+      if ((socket.data as { userId?: string }).userId === server.ownerId) {
+        socket.emit(event, channel);
+      }
     }
-
-    client.leave(this.getServerRoom(payload.serverId));
-  }
-
-  emitChannelNew(serverId: string, channel: unknown) {
-    this.server.to(this.getServerRoom(serverId)).emit('channel:new', channel);
-  }
-
-  emitChannelUpdate(serverId: string, channel: unknown) {
-    this.server
-      .to(this.getServerRoom(serverId))
-      .emit('channel:update', channel);
-  }
-
-  emitChannelDelete(serverId: string, channel: unknown) {
-    this.server
-      .to(this.getServerRoom(serverId))
-      .emit('channel:delete', channel);
   }
 
   private getServerRoom(serverId: string) {

@@ -9,6 +9,7 @@ client/.packages
 # Backend build
 backend/dist/
 backend/node_modules/
+backend/storage/
 
 # Flutter / Dart
 **/.dart_tool/

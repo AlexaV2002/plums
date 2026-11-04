@@ -4,8 +4,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import { PermissionsService } from '../permissions/permissions.service';
 import { ServersGateway } from '../servers/servers.gateway';
 import { CreateInviteDto } from './dto/create-invite.dto';
 
@@ -14,29 +16,22 @@ export class InvitesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly serversGateway: ServersGateway,
+    private readonly permissionsService: PermissionsService,
   ) {}
 
+  // Владелец сервера всегда проходит эту проверку; для остальных участников
+  // решает эффективное право manageInvites (пока роли никому не назначены,
+  // поведение не отличается от прежней точечной проверки ownerId).
   private async getServerOwnerOrThrow(userId: string, serverId: string) {
-    const server = await this.prisma.server.findUnique({
-      where: {
-        id: serverId,
-      },
-    });
-
-    if (!server) {
-      throw new NotFoundException('Сервер не найден');
-    }
-
-    if (server.ownerId !== userId) {
-      throw new ForbiddenException(
-        'Только владелец сервера может создавать приглашения',
-      );
-    }
-
-    return server;
+    return this.permissionsService.assertPermission(
+      userId,
+      serverId,
+      'manageInvites',
+      'Только владелец сервера может создавать приглашения',
+    );
   }
 
-  private async getUsableInviteOrThrow(code: string) {
+  private async getInviteOrThrow(code: string) {
     const invite = await this.prisma.invite.findUnique({
       where: {
         code,
@@ -47,6 +42,7 @@ export class InvitesService {
             id: true,
             name: true,
             iconUrl: true,
+            profileImageRevision: true,
             ownerId: true,
             createdAt: true,
             updatedAt: true,
@@ -59,6 +55,14 @@ export class InvitesService {
       throw new NotFoundException('Приглашение не найдено');
     }
 
+    return invite;
+  }
+
+  private assertInviteAvailable(invite: {
+    expiresAt: Date | null;
+    maxUses: number | null;
+    currentUses: number;
+  }) {
     if (invite.expiresAt && invite.expiresAt <= new Date()) {
       throw new BadRequestException('Срок действия приглашения истёк');
     }
@@ -66,8 +70,6 @@ export class InvitesService {
     if (invite.maxUses !== null && invite.currentUses >= invite.maxUses) {
       throw new BadRequestException('Лимит использований приглашения исчерпан');
     }
-
-    return invite;
   }
 
   private async generateInviteCode() {
@@ -114,6 +116,7 @@ export class InvitesService {
             id: true,
             name: true,
             iconUrl: true,
+            profileImageRevision: true,
             ownerId: true,
           },
         },
@@ -122,7 +125,8 @@ export class InvitesService {
   }
 
   async getInvite(code: string) {
-    const invite = await this.getUsableInviteOrThrow(code);
+    const invite = await this.getInviteOrThrow(code);
+    this.assertInviteAvailable(invite);
 
     return {
       id: invite.id,
@@ -135,7 +139,7 @@ export class InvitesService {
   }
 
   async joinInvite(userId: string, code: string) {
-    const invite = await this.getUsableInviteOrThrow(code);
+    const invite = await this.getInviteOrThrow(code);
 
     const ban = await this.prisma.serverBan.findUnique({
       where: {
@@ -163,39 +167,105 @@ export class InvitesService {
       return invite.server;
     }
 
-    const [member] = await this.prisma.$transaction([
-      this.prisma.serverMember.create({
-        data: {
-          serverId: invite.serverId,
-          userId,
-        },
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              email: true,
-              avatarUrl: true,
-              status: true,
-              bio: true,
+    this.assertInviteAvailable(invite);
+
+    try {
+      const member = await this.prisma.$transaction(async (tx) => {
+        // Сериализуем join и ban для одной пары (serverId, userId): лок берём
+        // первым действием транзакции, чтобы конкурентный banServerMember не
+        // мог "разминуться" с этим вступлением (см. тот же lock-key там).
+        await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtextextended(${`${invite.serverId}:${userId}`}, 0))`;
+
+        const freshBan = await tx.serverBan.findUnique({
+          where: {
+            serverId_userId: {
+              serverId: invite.serverId,
+              userId,
             },
           },
-        },
-      }),
-      this.prisma.invite.update({
-        where: {
-          id: invite.id,
-        },
-        data: {
-          currentUses: {
-            increment: 1,
+        });
+
+        if (freshBan) {
+          throw new ForbiddenException('Вы забанены на этом сервере');
+        }
+
+        // Второй конкурентный join того же пользователя не расходует инвайт.
+        const freshMember = await tx.serverMember.findUnique({
+          where: {
+            serverId_userId: { serverId: invite.serverId, userId },
           },
-        },
-      }),
-    ]);
+        });
+        if (freshMember) return null;
 
-    this.serversGateway.emitMemberJoin(member);
+        // Берём row-lock до проверки срока и лимита. clock_timestamp() ниже
+        // вычисляется уже после ожидания других использований приглашения.
+        await tx.$queryRaw`SELECT "id" FROM "invites" WHERE "id" = ${invite.id} FOR UPDATE`;
+        const incremented = await tx.$queryRaw<Array<{ id: string }>>`
+          UPDATE "invites"
+          SET "currentUses" = "currentUses" + 1
+          WHERE "id" = ${invite.id}
+            AND ("expiresAt" IS NULL OR "expiresAt" > clock_timestamp())
+            AND ("maxUses" IS NULL OR "currentUses" < "maxUses")
+          RETURNING "id"
+        `;
 
-    return invite.server;
+        if (incremented.length === 0) {
+          const current = await tx.invite.findUnique({
+            where: { id: invite.id },
+          });
+          const isExpired =
+            !current ||
+            (current.expiresAt !== null && current.expiresAt <= new Date());
+
+          if (isExpired) {
+            throw new BadRequestException('Срок действия приглашения истёк');
+          }
+          throw new BadRequestException(
+            'Лимит использований приглашения исчерпан',
+          );
+        }
+
+        return tx.serverMember.create({
+          data: {
+            serverId: invite.serverId,
+            userId,
+          },
+          include: {
+            user: {
+              select: {
+                id: true,
+                username: true,
+                avatarUrl: true,
+                profileImageRevision: true,
+                status: true,
+                bio: true,
+              },
+            },
+          },
+        });
+      });
+
+      if (member) this.serversGateway.emitMemberJoin(member);
+
+      return invite.server;
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        // Другая транзакция могла создать участника без нашего advisory lock.
+        // Подтверждаем итоговое членство и отсутствие бана перед ответом.
+        const [member, banAfterConflict] = await Promise.all([
+          this.prisma.serverMember.findUnique({
+            where: { serverId_userId: { serverId: invite.serverId, userId } },
+          }),
+          this.prisma.serverBan.findUnique({
+            where: { serverId_userId: { serverId: invite.serverId, userId } },
+          }),
+        ]);
+        if (member && !banAfterConflict) return invite.server;
+      }
+      throw error;
+    }
   }
 }

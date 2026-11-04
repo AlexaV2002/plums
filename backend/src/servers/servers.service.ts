@@ -5,6 +5,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { PermissionsService } from '../permissions/permissions.service';
+import { ServerPermissionKey } from '../permissions/permission-keys';
 import { BanMemberDto } from './dto/ban-member.dto';
 import { CreateServerDto } from './dto/create-server.dto';
 import { UpdateServerDto } from './dto/update-server.dto';
@@ -15,32 +17,30 @@ export class ServersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly serversGateway: ServersGateway,
+    private readonly permissionsService: PermissionsService,
   ) {}
 
   private async getServerOrThrow(serverId: string) {
-    const server = await this.prisma.server.findUnique({
-      where: {
-        id: serverId,
-      },
-    });
-
-    if (!server) {
-      throw new NotFoundException('Сервер не найден');
-    }
-
-    return server;
+    return this.permissionsService.getServerOrThrow(serverId);
   }
 
-  private async getServerOwnerOrThrow(userId: string, serverId: string) {
-    const server = await this.getServerOrThrow(serverId);
-
-    if (server.ownerId !== userId) {
-      throw new ForbiddenException(
-        'Только владелец сервера может управлять сервером',
-      );
-    }
-
-    return server;
+  // Владелец сервера всегда проходит эту проверку. Пока участникам не
+  // назначены роли с соответствующим правом, поведение для не-владельцев
+  // не меняется — эффективные права такого участника пусты, как и раньше
+  // при точечной проверке ownerId. Ключ права передаётся вызывающим кодом,
+  // чтобы разные действия (управление сервером / участниками / банами)
+  // впоследствии можно было разрешать разными ролями, а не только владельцу.
+  private async getServerOwnerOrThrow(
+    userId: string,
+    serverId: string,
+    key: ServerPermissionKey = 'manageServer',
+  ) {
+    return this.permissionsService.assertPermission(
+      userId,
+      serverId,
+      key,
+      'Только владелец сервера может управлять сервером',
+    );
   }
 
   private async getServerMemberOrThrow(userId: string, serverId: string) {
@@ -96,6 +96,7 @@ export class ServersService {
         id: true,
         name: true,
         iconUrl: true,
+        profileImageRevision: true,
         ownerId: true,
         createdAt: true,
         updatedAt: true,
@@ -115,11 +116,20 @@ export class ServersService {
               select: {
                 id: true,
                 username: true,
-                email: true,
                 avatarUrl: true,
+                profileImageRevision: true,
                 status: true,
                 bio: true,
               },
+            },
+            roles: {
+              select: {
+                id: true,
+                name: true,
+                color: true,
+                position: true,
+              },
+              orderBy: { position: 'asc' },
             },
           },
         },
@@ -158,11 +168,20 @@ export class ServersService {
           select: {
             id: true,
             username: true,
-            email: true,
             avatarUrl: true,
+            profileImageRevision: true,
             status: true,
             bio: true,
           },
+        },
+        roles: {
+          select: {
+            id: true,
+            name: true,
+            color: true,
+            position: true,
+          },
+          orderBy: { position: 'asc' },
         },
       },
     });
@@ -170,6 +189,46 @@ export class ServersService {
 
   async updateServer(userId: string, serverId: string, dto: UpdateServerDto) {
     await this.getServerOwnerOrThrow(userId, serverId);
+
+    // Legacy clients may still set iconUrl directly. Retire any managed image
+    // transactionally when they replace it, without rewriting existing URLs.
+    if (dto.iconUrl !== undefined) {
+      const updated = await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM servers WHERE id = ${serverId} FOR UPDATE`;
+        const current = await tx.server.findUniqueOrThrow({
+          where: { id: serverId },
+          select: { iconUrl: true },
+        });
+        if (current.iconUrl !== dto.iconUrl) {
+          await tx.profileImage.deleteMany({ where: { serverId } });
+        }
+        return tx.server.update({
+          where: { id: serverId },
+          data: {
+            name: dto.name,
+            iconUrl: dto.iconUrl,
+            ...(current.iconUrl !== dto.iconUrl
+              ? { profileImageRevision: { increment: 1 } }
+              : {}),
+          },
+          select: {
+            id: true,
+            name: true,
+            iconUrl: true,
+            profileImageRevision: true,
+            ownerId: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        });
+      });
+      this.serversGateway.emitServerIconUpdate(
+        serverId,
+        updated.iconUrl,
+        updated.profileImageRevision,
+      );
+      return updated;
+    }
 
     return this.prisma.server.update({
       where: {
@@ -183,6 +242,7 @@ export class ServersService {
         id: true,
         name: true,
         iconUrl: true,
+        profileImageRevision: true,
         ownerId: true,
         createdAt: true,
         updatedAt: true,
@@ -193,11 +253,21 @@ export class ServersService {
   async deleteServer(userId: string, serverId: string) {
     await this.getServerOwnerOrThrow(userId, serverId);
 
+    const channels = await this.prisma.channel.findMany({
+      where: { serverId },
+      select: { id: true },
+    });
+
     await this.prisma.server.delete({
       where: {
         id: serverId,
       },
     });
+
+    this.serversGateway.evictServerRooms(
+      serverId,
+      channels.map((channel) => channel.id),
+    );
 
     return {
       message: 'Сервер удалён',
@@ -228,6 +298,7 @@ export class ServersService {
       memberId: member.id,
       reason: 'leave',
     });
+    await this.serversGateway.evictUserFromServer(serverId, userId);
 
     return {
       message: 'Вы вышли с сервера',
@@ -235,7 +306,11 @@ export class ServersService {
   }
 
   async kickServerMember(userId: string, serverId: string, memberId: string) {
-    const server = await this.getServerOwnerOrThrow(userId, serverId);
+    const server = await this.getServerOwnerOrThrow(
+      userId,
+      serverId,
+      'manageMembers',
+    );
 
     const member = await this.prisma.serverMember.findUnique({
       where: {
@@ -263,6 +338,7 @@ export class ServersService {
       memberId: member.id,
       reason: 'kick',
     });
+    await this.serversGateway.evictUserFromServer(serverId, member.userId);
 
     return {
       message: 'Участник удалён с сервера',
@@ -275,7 +351,11 @@ export class ServersService {
     targetUserId: string,
     dto: BanMemberDto,
   ) {
-    const server = await this.getServerOwnerOrThrow(userId, serverId);
+    const server = await this.getServerOwnerOrThrow(
+      userId,
+      serverId,
+      'manageBans',
+    );
 
     if (targetUserId === server.ownerId) {
       throw new ForbiddenException('Нельзя забанить владельца сервера');
@@ -294,32 +374,45 @@ export class ServersService {
       throw new ConflictException('Пользователь уже забанен на этом сервере');
     }
 
-    const member = await this.prisma.serverMember.findUnique({
-      where: {
-        serverId_userId: {
-          serverId,
-          userId: targetUserId,
-        },
-      },
-    });
+    const member = await this.prisma.$transaction(async (tx) => {
+      // Сериализуем ban и join для одной пары (serverId, userId) тем же
+      // lock-key, что и joinInvite, чтобы одна из операций всегда дожидалась
+      // другой и запись ServerMember не "переживала" успешный бан.
+      await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtextextended(${`${serverId}:${targetUserId}`}, 0))`;
 
-    await this.prisma.$transaction([
-      this.prisma.serverBan.create({
+      const freshBan = await tx.serverBan.findUnique({
+        where: { serverId_userId: { serverId, userId: targetUserId } },
+      });
+      if (freshBan) {
+        throw new ConflictException('Пользователь уже забанен на этом сервере');
+      }
+
+      const freshMember = await tx.serverMember.findUnique({
+        where: {
+          serverId_userId: {
+            serverId,
+            userId: targetUserId,
+          },
+        },
+      });
+
+      await tx.serverBan.create({
         data: {
           serverId,
           userId: targetUserId,
           bannedBy: userId,
           reason: dto.reason,
         },
-      }),
-      ...(member
-        ? [
-            this.prisma.serverMember.delete({
-              where: { id: member.id },
-            }),
-          ]
-        : []),
-    ]);
+      });
+
+      if (freshMember) {
+        await tx.serverMember.delete({
+          where: { id: freshMember.id },
+        });
+      }
+
+      return freshMember;
+    });
 
     if (member) {
       this.serversGateway.emitMemberLeave({
@@ -329,6 +422,7 @@ export class ServersService {
         reason: 'ban',
       });
     }
+    await this.serversGateway.evictUserFromServer(serverId, targetUserId);
 
     return {
       message: 'Пользователь забанен на сервере',
@@ -340,7 +434,7 @@ export class ServersService {
     serverId: string,
     targetUserId: string,
   ) {
-    await this.getServerOwnerOrThrow(userId, serverId);
+    await this.getServerOwnerOrThrow(userId, serverId, 'manageBans');
 
     const ban = await this.prisma.serverBan.findUnique({
       where: {
@@ -365,7 +459,7 @@ export class ServersService {
   }
 
   async getServerBans(userId: string, serverId: string) {
-    await this.getServerOwnerOrThrow(userId, serverId);
+    await this.getServerOwnerOrThrow(userId, serverId, 'manageBans');
 
     return this.prisma.serverBan.findMany({
       where: { serverId },
@@ -381,9 +475,8 @@ export class ServersService {
           select: {
             id: true,
             username: true,
-            email: true,
             avatarUrl: true,
-            status: true,
+            profileImageRevision: true,
             bio: true,
           },
         },

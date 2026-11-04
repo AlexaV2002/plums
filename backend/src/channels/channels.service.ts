@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { PermissionsService } from '../permissions/permissions.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
 import { UpdateChannelPermissionsDto } from './dto/update-channel-permissions.dto';
 import { UpdateChannelDto } from './dto/update-channel.dto';
@@ -20,6 +21,7 @@ export class ChannelsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly channelsGateway: ChannelsGateway,
+    private readonly permissionsService: PermissionsService,
   ) {}
 
   private async checkServerAccess(userId: string, serverId: string) {
@@ -39,24 +41,16 @@ export class ChannelsService {
     return member;
   }
 
+  // Владелец сервера всегда проходит эту проверку; для остальных участников
+  // решает эффективное право manageChannels (пока роли никому не назначены,
+  // поведение не отличается от прежней точечной проверки ownerId).
   private async checkServerOwner(userId: string, serverId: string) {
-    const server = await this.prisma.server.findUnique({
-      where: {
-        id: serverId,
-      },
-    });
-
-    if (!server) {
-      throw new NotFoundException('Сервер не найден');
-    }
-
-    if (server.ownerId !== userId) {
-      throw new ForbiddenException(
-        'Только владелец сервера может управлять каналами',
-      );
-    }
-
-    return server;
+    return this.permissionsService.assertPermission(
+      userId,
+      serverId,
+      'manageChannels',
+      'Только владелец сервера может управлять каналами',
+    );
   }
 
   private async getChannelOrThrow(channelId: string) {
@@ -73,7 +67,9 @@ export class ChannelsService {
     return channel;
   }
 
-  private getPermissions(rawPermissions: unknown): Required<ChannelPermissions> {
+  private getPermissions(
+    rawPermissions: unknown,
+  ): Required<ChannelPermissions> {
     if (
       !rawPermissions ||
       typeof rawPermissions !== 'object' ||
@@ -113,7 +109,11 @@ export class ChannelsService {
       },
     });
 
-    this.channelsGateway.emitChannelNew(serverId, channel);
+    await this.channelsGateway.emitChannelNew(
+      serverId,
+      channel,
+      this.getPermissions(channel.permissions).canView === false,
+    );
 
     return channel;
   }
@@ -169,9 +169,10 @@ export class ChannelsService {
       },
     });
 
-    this.channelsGateway.emitChannelUpdate(
+    await this.channelsGateway.emitChannelUpdate(
       updatedChannel.serverId,
       updatedChannel,
+      this.getPermissions(channel.permissions).canView === false,
     );
 
     return updatedChannel;
@@ -188,10 +189,15 @@ export class ChannelsService {
       },
     });
 
-    this.channelsGateway.emitChannelDelete(channel.serverId, {
-      id: channel.id,
-      serverId: channel.serverId,
-    });
+    await this.channelsGateway.emitChannelDelete(
+      channel.serverId,
+      {
+        id: channel.id,
+        serverId: channel.serverId,
+      },
+      this.getPermissions(channel.permissions).canView === false,
+    );
+    this.channelsGateway.evictChannel(channelId);
 
     return {
       message: 'Канал удалён',
@@ -221,9 +227,33 @@ export class ChannelsService {
       },
     });
 
-    this.channelsGateway.emitChannelUpdate(
+    const isNowHidden =
+      this.getPermissions(updatedChannel.permissions).canView === false;
+
+    if (isNowHidden) {
+      const server = await this.prisma.server.findUnique({
+        where: { id: updatedChannel.serverId },
+        select: { ownerId: true },
+      });
+      if (server) {
+        await this.channelsGateway.evictChannelViewers(
+          channelId,
+          server.ownerId,
+        );
+        if (currentPermissions.canView) {
+          await this.channelsGateway.notifyChannelHidden(
+            updatedChannel.serverId,
+            channelId,
+            server.ownerId,
+          );
+        }
+      }
+    }
+
+    await this.channelsGateway.emitChannelUpdate(
       updatedChannel.serverId,
       updatedChannel,
+      isNowHidden,
     );
 
     return updatedChannel;

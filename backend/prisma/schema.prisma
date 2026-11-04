@@ -18,12 +18,18 @@ enum ChannelType {
   VOICE
 }
 
+enum AttachmentState {
+  UPLOADED
+  ATTACHED
+}
+
 model User {
   id           String     @id @default(uuid())
   email        String     @unique
   username     String
   passwordHash String
   avatarUrl    String?
+  profileImageRevision Int @default(0)
   status       UserStatus @default(OFFLINE)
   bio          String?
   createdAt    DateTime   @default(now())
@@ -32,10 +38,15 @@ model User {
   ownedServers Server[]       @relation("ServerOwner")
   memberships  ServerMember[]
   messages     Message[]
+  attachments  Attachment[]
+  profileImage ProfileImage?
   createdInvites Invite[]     @relation("InviteCreator")
   refreshTokens  RefreshToken[]
   bannedFrom     ServerBan[]  @relation("BannedUser")
   bansIssued     ServerBan[]  @relation("BannedByUser")
+  dmConversationsA DirectConversation[] @relation("DmUserA")
+  dmConversationsB DirectConversation[] @relation("DmUserB")
+  dmSentMessages   DirectMessage[]      @relation("DmSender")
 
   @@map("users")
 }
@@ -57,6 +68,7 @@ model Server {
   id        String   @id @default(uuid())
   name      String
   iconUrl   String?
+  profileImageRevision Int @default(0)
   ownerId   String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -66,6 +78,8 @@ model Server {
   channels Channel[]
   invites  Invite[]
   bans     ServerBan[]
+  roles    Role[]
+  profileImage ProfileImage?
 
   @@map("servers")
 }
@@ -78,9 +92,27 @@ model ServerMember {
 
   server Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roles  Role[] @relation("MemberRoles")
 
   @@unique([serverId, userId])
   @@map("server_members")
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  serverId    String
+  name        String
+  color       String?
+  position    Int      @default(0)
+  permissions Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  server  Server         @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  members ServerMember[] @relation("MemberRoles")
+
+  @@unique([serverId, name])
+  @@map("roles")
 }
 
 model Channel {
@@ -95,24 +127,78 @@ model Channel {
 
   server   Server    @relation(fields: [serverId], references: [id], onDelete: Cascade)
   messages Message[]
+  attachments Attachment[]
 
   @@map("channels")
 }
 
 model Message {
-  id        String    @id @default(uuid())
-  channelId String
-  authorId  String
-  content   String
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  deletedAt DateTime?
+  id              String    @id @default(uuid())
+  channelId       String
+  authorId        String
+  clientMessageId String?
+  content         String
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
 
   channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
   author  User    @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  attachments Attachment[]
 
   @@index([channelId, createdAt])
+  @@unique([authorId, channelId, clientMessageId])
   @@map("messages")
+}
+
+// Metadata only: file bytes live in the configured private storage adapter.
+model Attachment {
+  id           String          @id @default(uuid())
+  ownerId      String
+  channelId    String
+  messageId    String?
+  originalName String
+  mimeType     String
+  sizeBytes    Int
+  storageKey   String          @unique
+  state        AttachmentState @default(UPLOADED)
+  createdAt    DateTime        @default(now())
+  expiresAt    DateTime?
+
+  owner   User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  channel Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  message Message? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId, state, createdAt])
+  @@index([state, expiresAt])
+  @@index([channelId])
+  @@index([messageId])
+  @@map("attachments")
+}
+
+// Independent of users/messages/channels so cascades cannot erase deletion work.
+model AttachmentCleanup {
+  storageKey    String   @id
+  createdAt     DateTime @default(now())
+  attempts      Int      @default(0)
+  lastAttemptAt DateTime?
+
+  @@map("attachment_cleanup")
+}
+
+// Profile and server icons share the private attachment storage and cleanup queue.
+model ProfileImage {
+  id         String   @id @default(uuid())
+  userId     String?  @unique
+  serverId   String?  @unique
+  mimeType   String
+  sizeBytes  Int
+  storageKey String   @unique
+  createdAt  DateTime @default(now())
+  user       User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  server     Server?  @relation(fields: [serverId], references: [id], onDelete: Cascade)
+
+  @@map("profile_images")
 }
 
 model Invite {
@@ -129,6 +215,39 @@ model Invite {
   creator User   @relation("InviteCreator", fields: [createdBy], references: [id], onDelete: Cascade)
 
   @@map("invites")
+}
+
+model DirectConversation {
+  id        String    @id @default(uuid())
+  userA     String
+  userB     String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  userAPeer User   @relation("DmUserA", fields: [userA], references: [id], onDelete: Cascade)
+  userBPeer User   @relation("DmUserB", fields: [userB], references: [id], onDelete: Cascade)
+  messages  DirectMessage[]
+
+  @@unique([userA, userB])
+  @@index([userA])
+  @@index([userB])
+  @@map("direct_conversations")
+}
+
+model DirectMessage {
+  id             String    @id @default(uuid())
+  conversationId String
+  senderId       String
+  content        String
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  conversation DirectConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User               @relation("DmSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@map("direct_messages")
 }
 
 model ServerBan {

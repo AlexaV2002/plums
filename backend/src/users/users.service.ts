@@ -16,6 +16,23 @@ export class UsersService {
     });
   }
 
+  async search(q: string, excludeId: string, limit?: number) {
+    return this.prisma.user.findMany({
+      where: {
+        username: { contains: q, mode: 'insensitive' },
+        NOT: { id: excludeId },
+      },
+      select: {
+        id: true,
+        username: true,
+        avatarUrl: true,
+        profileImageRevision: true,
+      },
+      orderBy: { username: 'asc' },
+      take: limit ?? 10,
+    });
+  }
+
   async findPublicById(id: string) {
     const user = await this.prisma.user.findUnique({
       where: { id },
@@ -24,6 +41,7 @@ export class UsersService {
         username: true,
         email: true,
         avatarUrl: true,
+        profileImageRevision: true,
         status: true,
         bio: true,
         createdAt: true,
@@ -38,11 +56,7 @@ export class UsersService {
     return user;
   }
 
-  createUser(data: {
-    username: string;
-    email: string;
-    passwordHash: string;
-  }) {
+  createUser(data: { username: string; email: string; passwordHash: string }) {
     return this.prisma.user.create({
       data,
       select: {
@@ -50,6 +64,7 @@ export class UsersService {
         username: true,
         email: true,
         avatarUrl: true,
+        profileImageRevision: true,
         status: true,
         bio: true,
         createdAt: true,
@@ -71,6 +86,7 @@ export class UsersService {
         username: true,
         email: true,
         avatarUrl: true,
+        profileImageRevision: true,
         status: true,
         bio: true,
         createdAt: true,
@@ -79,7 +95,7 @@ export class UsersService {
     });
 
     if (dto.status) {
-      this.usersGateway.emitUserStatus(user.id, user.status);
+      await this.usersGateway.emitUserStatus(user.id, user.status);
     }
 
     return user;
@@ -90,6 +106,7 @@ export class UsersService {
     username: string;
     email: string;
     avatarUrl: string | null;
+    profileImageRevision: number;
     status: string;
     bio: string | null;
     createdAt: Date;
@@ -100,6 +117,7 @@ export class UsersService {
       username: user.username,
       email: user.email,
       avatarUrl: user.avatarUrl,
+      profileImageRevision: user.profileImageRevision,
       status: user.status,
       bio: user.bio,
       createdAt: user.createdAt,
