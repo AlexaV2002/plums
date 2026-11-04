@@ -5520,28 +5520,50 @@ class RoleChip extends StatelessWidget {
 
 /// Only follows new messages when the reader was already near the bottom.
 class MessageScrollFollower {
-  const MessageScrollFollower._(this.follow, this.pixels);
+  const MessageScrollFollower._(this.follow, this.pixels, this.viewport);
 
   final bool follow;
   final double? pixels;
+  final double? viewport;
 
   static MessageScrollFollower capture(ScrollController controller) {
-    if (!controller.hasClients) return const MessageScrollFollower._(true, null);
+    if (!controller.hasClients) return const MessageScrollFollower._(true, null, null);
     final position = controller.position;
     return MessageScrollFollower._(
       position.extentAfter <= 80,
       position.pixels,
+      position.viewportDimension,
     );
   }
 
   void schedule(ScrollController controller, {required bool Function() isCurrent}) {
     if (!follow) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    var expectedPixels = pixels;
+    var previousViewport = viewport;
+    var attempts = 0;
+    var stableFrames = 0;
+    void followAfterLayout(Duration _) {
       if (!isCurrent() || !controller.hasClients) return;
       final position = controller.position;
-      if (pixels != null && (position.pixels - pixels!).abs() > 1) return;
-      controller.jumpTo(position.maxScrollExtent);
-    });
+      if (position.isScrollingNotifier.value) return;
+      final viewportChanged = previousViewport != null &&
+          (position.viewportDimension - previousViewport!).abs() > 1;
+      if (!viewportChanged && expectedPixels != null &&
+          (position.pixels - expectedPixels!).abs() > 1) {
+        return;
+      }
+      final target = position.maxScrollExtent;
+      final alreadyAtEnd = (position.pixels - target).abs() <= 1;
+      if (!alreadyAtEnd) controller.jumpTo(target);
+      expectedPixels = position.pixels;
+      previousViewport = position.viewportDimension;
+      stableFrames = alreadyAtEnd ? stableFrames + 1 : 0;
+      if (++attempts < 8 && stableFrames < 2) {
+        WidgetsBinding.instance.addPostFrameCallback(followAfterLayout);
+        WidgetsBinding.instance.scheduleFrame();
+      }
+    }
+    WidgetsBinding.instance.addPostFrameCallback(followAfterLayout);
   }
 }
 
