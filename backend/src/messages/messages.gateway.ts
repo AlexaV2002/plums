@@ -7,6 +7,7 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
+import { withChannelRoomLock } from '../channels/channels.gateway';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   getActiveSocketIdentity,
@@ -41,65 +42,82 @@ export class MessagesGateway {
       ack?.({ joined: false, reason: 'session_required' });
       return;
     }
+    const channelId = payload.channelId;
 
     const channel = await this.prisma.channel.findUnique({
-      where: { id: payload.channelId },
+      where: { id: channelId },
       include: { server: true },
     });
     if (!channel) {
       client.emit('channel:error', {
-        channelId: payload.channelId,
+        channelId,
         error: 'Канал не найден',
       });
       ack?.({
         joined: false,
-        channelId: payload.channelId,
+        channelId,
         reason: 'not_found',
       });
       return;
     }
-    const member = await this.prisma.serverMember.findUnique({
-      where: {
-        serverId_userId: {
-          serverId: channel.serverId,
-          userId: identity.userId,
-        },
-      },
-    });
-    const permissions = channel.permissions;
-    const hidden =
-      permissions &&
-      typeof permissions === 'object' &&
-      !Array.isArray(permissions) &&
-      (permissions as { canView?: boolean }).canView === false;
-    if (!member || (hidden && channel.server.ownerId !== identity.userId)) {
+
+    // Delete holds the same lock through DB removal and room eviction. A join
+    // that read the channel just before deletion must recheck it under the lock.
+    await withChannelRoomLock(channelId, async () => {
       if (!isSocketIdentityCurrent(client, identity)) {
         ack?.({ joined: false, reason: 'session_required' });
         return;
       }
-      client.emit('channel:error', {
-        channelId: payload.channelId,
-        error: 'Нет доступа к каналу',
+      const current = await this.prisma.channel.findUnique({
+        where: { id: channelId },
+        include: { server: true },
       });
-      ack?.({
-        joined: false,
-        channelId: payload.channelId,
-        reason: 'forbidden',
+      if (!current) {
+        client.emit('channel:error', {
+          channelId,
+          error: 'Канал не найден',
+        });
+        ack?.({ joined: false, channelId, reason: 'not_found' });
+        return;
+      }
+      const member = await this.prisma.serverMember.findUnique({
+        where: {
+          serverId_userId: {
+            serverId: current.serverId,
+            userId: identity.userId,
+          },
+        },
       });
-      return;
-    }
+      const permissions = current.permissions;
+      const hidden =
+        permissions &&
+        typeof permissions === 'object' &&
+        !Array.isArray(permissions) &&
+        (permissions as { canView?: boolean }).canView === false;
+      if (!member || (hidden && current.server.ownerId !== identity.userId)) {
+        if (!isSocketIdentityCurrent(client, identity)) {
+          ack?.({ joined: false, reason: 'session_required' });
+          return;
+        }
+        client.emit('channel:error', {
+          channelId,
+          error: 'Нет доступа к каналу',
+        });
+        ack?.({ joined: false, channelId, reason: 'forbidden' });
+        return;
+      }
 
-    if (!isSocketIdentityCurrent(client, identity)) {
-      ack?.({ joined: false, reason: 'session_required' });
-      return;
-    }
-    const room = this.getChannelRoom(payload.channelId);
-    await joinProtectedRoom(client, room, identity);
-    if (!isSocketIdentityCurrent(client, identity)) {
-      ack?.({ joined: false, reason: 'session_required' });
-      return;
-    }
-    ack?.({ joined: true, channelId: payload.channelId });
+      if (!isSocketIdentityCurrent(client, identity)) {
+        ack?.({ joined: false, reason: 'session_required' });
+        return;
+      }
+      await joinProtectedRoom(client, this.getChannelRoom(channelId), identity);
+      if (!isSocketIdentityCurrent(client, identity)) {
+        ack?.({ joined: false, reason: 'session_required' });
+        return;
+      }
+      ack?.({ joined: true, channelId });
+    });
   }
 
   @SubscribeMessage('channel:leave')

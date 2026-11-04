@@ -6,12 +6,13 @@
 ## Формы
 
 ```ts
-DmUser         = { id, username, avatarUrl: string | null }   // без email и приватных полей
+DmUser         = { id, username, avatarUrl: string | null, profileImageRevision: number }
 DmMessage      = { id, conversationId, senderId, content, createdAt, updatedAt, sender: DmUser }
 DmConversation = { id, createdAt, updatedAt, userA: DmUser, userB: DmUser, lastMessage: DmMessage | null }
 ```
 
 - `DmMessage` одинаков в истории, ответе POST, `dm:new` и `lastMessage`. `deletedAt` наружу не отдаётся, удалённые сообщения не возвращаются.
+- `profileImageRevision` — публичное целое неотрицательное число (начальное значение `0`), позволяющее клиенту обновить кэш аватара при его изменении. `DmUser` не содержит `email`, `passwordHash` и других приватных полей.
 - `userA`/`userB` в каноническом порядке: `userA.id < userB.id` (не зависит от инициатора).
 - `updatedAt` диалога = время последнего сообщения (обновляется в одной транзакции с созданием сообщения).
 

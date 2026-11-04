@@ -8,7 +8,12 @@ import { AddressInfo } from 'net';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
 
-type DmUser = { id: string; username: string; avatarUrl: string | null };
+type DmUser = {
+  id: string;
+  username: string;
+  avatarUrl: string | null;
+  profileImageRevision: number;
+};
 type DmMessage = {
   id: string;
   conversationId: string;
@@ -44,7 +49,7 @@ const messageKeys = [
   'senderId',
   'updatedAt',
 ];
-const userKeys = ['avatarUrl', 'id', 'username'];
+const userKeys = ['avatarUrl', 'id', 'profileImageRevision', 'username'];
 
 // Рекурсивно: ни в одном ответе/событии DM не должно быть ключа email.
 function expectNoEmail(value: unknown) {
@@ -59,15 +64,21 @@ function expectNoEmail(value: unknown) {
   }
 }
 
+function expectUserShape(user: DmUser) {
+  expect(Object.keys(user).sort()).toEqual(userKeys);
+  expect(Number.isInteger(user.profileImageRevision)).toBe(true);
+  expect(user.profileImageRevision).toBeGreaterThanOrEqual(0);
+}
+
 function expectMessageShape(message: DmMessage) {
   expect(Object.keys(message).sort()).toEqual(messageKeys);
-  expect(Object.keys(message.sender).sort()).toEqual(userKeys);
+  expectUserShape(message.sender);
 }
 
 function expectConversationShape(conversation: DmConversation) {
   expect(Object.keys(conversation).sort()).toEqual(conversationKeys);
-  expect(Object.keys(conversation.userA).sort()).toEqual(userKeys);
-  expect(Object.keys(conversation.userB).sort()).toEqual(userKeys);
+  expectUserShape(conversation.userA);
+  expectUserShape(conversation.userB);
   if (conversation.lastMessage) expectMessageShape(conversation.lastMessage);
 }
 

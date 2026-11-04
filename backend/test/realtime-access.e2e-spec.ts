@@ -1,9 +1,11 @@
 import './ensure-test-database';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { Prisma } from '@prisma/client';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AddressInfo } from 'net';
+import { JwtService } from '@nestjs/jwt';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { ServersGateway } from '../src/servers/servers.gateway';
@@ -68,6 +70,12 @@ class SocketProbe {
     return JSON.parse(ack.slice(3)) as Array<{ userId: string }>;
   }
 
+  async joinChannel(channelId: string) {
+    this.socket.send(`422${JSON.stringify(['channel:join', { channelId }])}`);
+    const ack = await this.waitPacket((packet) => packet.startsWith('432'));
+    return (JSON.parse(ack.slice(3)) as Array<{ joined: boolean }>)[0];
+  }
+
   emit(name: string, payload: object) {
     this.socket.send(`42${JSON.stringify([name, payload])}`);
   }
@@ -99,6 +107,7 @@ describe('realtime access (e2e)', () => {
   let app: INestApplication<App>;
   let prisma: PrismaService;
   let gateway: ServersGateway;
+  let jwtService: JwtService;
   let port: number;
   const userIds: string[] = [];
   const probes: SocketProbe[] = [];
@@ -121,6 +130,7 @@ describe('realtime access (e2e)', () => {
     ).address().port;
     prisma = app.get(PrismaService);
     gateway = app.get(ServersGateway);
+    jwtService = app.get(JwtService);
   });
 
   afterAll(async () => {
@@ -173,6 +183,164 @@ describe('realtime access (e2e)', () => {
     }
     throw new Error(`Room ${room}: user ${userId} presence was not ${present}`);
   }
+
+  async function waitForSocketRoom(
+    room: string,
+    socketId: string,
+    present: boolean,
+  ) {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const sockets = await gateway.server.in(room).fetchSockets();
+      if (sockets.some((socket) => socket.id === socketId) === present) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(
+      `Room ${room}: socket ${socketId} presence was not ${present}`,
+    );
+  }
+
+  it('expires a short-lived socket session, then restores permitted rooms after re-identify', async () => {
+    const owner = await user('ttl-owner');
+    const member = await user('ttl-member');
+    const auth = (token: string) => ({ Authorization: `Bearer ${token}` });
+    const http = () => request(app.getHttpServer());
+    const server = await http()
+      .post('/servers')
+      .set(auth(owner.token))
+      .send({ name: 'Short TTL socket' })
+      .expect(201);
+    const serverId = (server.body as { id: string }).id;
+    const channel = await http()
+      .post(`/servers/${serverId}/channels`)
+      .set(auth(owner.token))
+      .send({ name: 'general' })
+      .expect(201);
+    const channelId = (channel.body as { id: string }).id;
+    await prisma.serverMember.create({ data: { serverId, userId: member.id } });
+
+    const ownerSocket = await SocketProbe.connect(port);
+    const memberSocket = await SocketProbe.connect(port);
+    probes.push(ownerSocket, memberSocket);
+    await ownerSocket.identify(owner.token);
+    ownerSocket.emit('server:join', { serverId });
+    ownerSocket.emit('channel:join', { channelId });
+    await waitForRoom(`channel:${channelId}`, owner.id, true);
+
+    const shortToken = await jwtService.signAsync(
+      { sub: member.id, email: 'ttl-member@plums.test' },
+      { secret: process.env.JWT_SECRET, expiresIn: '3s' },
+    );
+    expect((await memberSocket.identify(shortToken))[0].userId).toBe(member.id);
+    memberSocket.emit('server:join', { serverId });
+    memberSocket.emit('channel:join', { channelId });
+    await waitForRoom(`server:${serverId}`, member.id, true);
+    await waitForRoom(`channel:${channelId}`, member.id, true);
+    const channelSockets = await gateway.server
+      .in(`channel:${channelId}`)
+      .fetchSockets();
+    const memberSocketId = channelSockets.find(
+      (socket) => (socket.data as { userId?: string }).userId === member.id,
+    )!.id;
+
+    expect(await memberSocket.event('session:expired')).toEqual({
+      reason: 'token_expired',
+    });
+    await waitForSocketRoom(`server:${serverId}`, memberSocketId, false);
+    await waitForSocketRoom(`channel:${channelId}`, memberSocketId, false);
+    await waitForRoom(`channel:${channelId}`, owner.id, true);
+
+    memberSocket.emit('server:join', { serverId });
+    memberSocket.emit('channel:join', { channelId });
+    const missed = await http()
+      .post(`/channels/${channelId}/messages`)
+      .set(auth(owner.token))
+      .send({ content: 'while expired' })
+      .expect(201);
+    expect(await ownerSocket.event('message:new')).toMatchObject({
+      id: (missed.body as { id: string }).id,
+    });
+    await memberSocket.expectNoEvent('message:new');
+    await waitForSocketRoom(`channel:${channelId}`, memberSocketId, false);
+
+    await http().get('/users/me').set(auth(member.token)).expect(200);
+    expect((await memberSocket.identify(member.token))[0].userId).toBe(
+      member.id,
+    );
+    memberSocket.emit('server:join', { serverId });
+    memberSocket.emit('channel:join', { channelId });
+    await waitForSocketRoom(`channel:${channelId}`, memberSocketId, true);
+
+    const resumed = await http()
+      .post(`/channels/${channelId}/messages`)
+      .set(auth(owner.token))
+      .send({ content: 'after re-identify' })
+      .expect(201);
+    expect(await memberSocket.event('message:new')).toMatchObject({
+      id: (resumed.body as { id: string }).id,
+    });
+  }, 20_000);
+
+  it('does not join a channel deleted after its lookup but before join completes', async () => {
+    const owner = await user('delete-race-owner');
+    const auth = (token: string) => ({ Authorization: `Bearer ${token}` });
+    const http = () => request(app.getHttpServer());
+    const server = await http()
+      .post('/servers')
+      .set(auth(owner.token))
+      .send({ name: 'Delete during join' })
+      .expect(201);
+    const serverId = (server.body as { id: string }).id;
+    const channel = await http()
+      .post(`/servers/${serverId}/channels`)
+      .set(auth(owner.token))
+      .send({ name: 'temporary' })
+      .expect(201);
+    const channelId = (channel.body as { id: string }).id;
+
+    const socket = await SocketProbe.connect(port);
+    probes.push(socket);
+    await socket.identify(owner.token);
+
+    const delegate = prisma.channel;
+    const originalFindUnique = delegate.findUnique.bind(delegate) as (
+      args: Prisma.ChannelFindUniqueArgs,
+    ) => Promise<unknown>;
+    let lookupFinished!: () => void;
+    let releaseLookup!: () => void;
+    const lookupReady = new Promise<void>(
+      (resolve) => (lookupFinished = resolve),
+    );
+    const lookupGate = new Promise<void>(
+      (resolve) => (releaseLookup = resolve),
+    );
+    const spy = jest
+      .spyOn(delegate, 'findUnique')
+      .mockImplementationOnce(async (args) => {
+        const row = await originalFindUnique(args);
+        lookupFinished();
+        await lookupGate;
+        return row as Awaited<ReturnType<typeof delegate.findUnique>>;
+      });
+
+    try {
+      const pendingJoin = socket.joinChannel(channelId);
+      await lookupReady;
+      await http()
+        .delete(`/channels/${channelId}`)
+        .set(auth(owner.token))
+        .expect(200);
+      releaseLookup();
+      expect((await pendingJoin).joined).toBe(false);
+      expect(
+        (await gateway.server.in(`channel:${channelId}`).fetchSockets()).some(
+          (joined) => (joined.data as { userId?: string }).userId === owner.id,
+        ),
+      ).toBe(false);
+    } finally {
+      releaseLookup();
+      spy.mockRestore();
+    }
+  }, 15_000);
 
   it('applies role assignment, updates, removal and deletion to a connected member', async () => {
     const owner = await user('roles-owner');

@@ -101,6 +101,7 @@ describe('channel image attachments (e2e)', () => {
   let prisma: PrismaService;
   let cleanup: AttachmentsService;
   let root: string;
+  let previousStorageDir: string | undefined;
   let png: Buffer;
   let owner: User;
   let member: User;
@@ -141,6 +142,7 @@ describe('channel image attachments (e2e)', () => {
   }
 
   beforeAll(async () => {
+    previousStorageDir = process.env.ATTACHMENT_STORAGE_DIR;
     const base = path.resolve(process.cwd(), '.tmp');
     root = path.join(base, `attachments-e2e-${randomUUID()}`);
     if (!root.startsWith(base + path.sep))
@@ -203,7 +205,9 @@ describe('channel image attachments (e2e)', () => {
     if (cleanup) await cleanup.cleanup();
     if (app) await app.close();
     if (root) await fs.rm(root, { recursive: true, force: true });
-    delete process.env.ATTACHMENT_STORAGE_DIR;
+    if (previousStorageDir === undefined)
+      delete process.env.ATTACHMENT_STORAGE_DIR;
+    else process.env.ATTACHMENT_STORAGE_DIR = previousStorageDir;
   });
 
   it('validates bytes, size, access and attaches atomically with idempotent history', async () => {

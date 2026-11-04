@@ -490,6 +490,30 @@ void main() {
       expect(inChat('alice'), findsOneWidget); // заголовок с собеседником
     });
 
+    testWidgets('shows loading until the selected history arrives', (tester) async {
+      api.conversations = [conv('A', alice)];
+      final pending = Completer<void>();
+      api.holdBaseline['A'] = pending;
+      await pumpView(tester);
+      unawaited(controller.loadConversations().then((_) => controller.selectConversation('A')));
+      await pumpMany(tester);
+      expect(find.descendant(of: find.byType(DmChatArea),
+          matching: find.byType(CircularProgressIndicator)), findsOneWidget);
+      pending.complete();
+      await pumpMany(tester);
+      expect(inChat('Сообщений пока нет'), findsOneWidget);
+    });
+
+    testWidgets('a repeated realtime DM appears once in the open history', (tester) async {
+      api.conversations = [conv('A', alice)];
+      await pumpView(tester);
+      await load(tester, 'A');
+      controller.handleDmNew(dmMsg(8, 'A'));
+      controller.handleDmNew(dmMsg(8, 'A'));
+      await pumpMany(tester);
+      expect(inChat('text-8'), findsOneWidget);
+    });
+
     testWidgets('new DM does not move a reader browsing older messages', (tester) async {
       api.conversations = [conv('A', alice)];
       for (var i = 1; i <= 40; i++) {
