@@ -454,10 +454,11 @@ class ChannelAttachmentInput extends StatelessWidget {
                     color: const Color(0xFFBFA7FF),
                   ),
                   Expanded(
-                    child: TextField(
+                    child: ChatComposerField(
                       controller: draft.text,
-                      enabled: !blocked && !draft.uncertain,
-                      onSubmitted: (_) {
+                      enabled: canSendMessages,
+                      readOnly: draft.sending || draft.uncertain,
+                      onSend: () {
                         if (!blocked && ready) {
                           unawaited(drafts.send(channelId, onSend));
                         }

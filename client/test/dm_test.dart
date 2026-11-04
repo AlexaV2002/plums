@@ -501,7 +501,7 @@ void main() {
         of: find.byType(DmChatArea), matching: find.byType(CustomScrollView),
       ));
       final scroll = list.controller!;
-      scroll.jumpTo(200);
+      scroll.jumpTo((scroll.position.minScrollExtent + scroll.position.maxScrollExtent) / 2);
       await tester.pump();
       final before = scroll.position.pixels;
       controller.handleDmNew(dmMsg(41, 'A'));

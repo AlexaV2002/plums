@@ -5599,8 +5599,10 @@ class _MessagesListState extends State<MessagesList> {
 
     if (_anchorChannelId != messages.first.channelId ||
         !messages.any((message) => message.id == _anchorId)) {
-      _anchorId = messages.first.id;
-      _anchorChannelId = messages.first.channelId;
+      // Anchor the last loaded message so the initial viewport can render the
+      // actual end even when the rest of a long history is still virtualized.
+      _anchorId = messages.last.id;
+      _anchorChannelId = messages.last.channelId;
     }
     final anchor = messages.indexWhere((message) => message.id == _anchorId);
     Widget messageAt(int index) {
@@ -5608,6 +5610,9 @@ class _MessagesListState extends State<MessagesList> {
       return MessageBubble(
         key: ValueKey(message.id),
         message: message,
+        // Both composers add 12 px above their field: 6 + 12 = the same
+        // 18 px gap used between message bubbles.
+        bottomPadding: index == messages.length - 1 ? 6 : 18,
         onEdit: widget.canEditMessage?.call(message) ?? true
             ? () => widget.onEditMessage(message) : null,
         onDelete: widget.canDeleteMessage?.call(message) ?? true
@@ -5615,11 +5620,14 @@ class _MessagesListState extends State<MessagesList> {
       );
     }
 
-    // The first loaded message is the fixed zero point. Older pages extend
+    // The last initially loaded message is the fixed zero point. Older pages extend
     // above it and live messages below it, without moving the visible anchor.
     return CustomScrollView(
       controller: widget.scrollController,
       center: _centerKey,
+      // Place the center at the viewport bottom; after scrolling to the end,
+      // short histories sit next to the composer while older items extend up.
+      anchor: 1.0,
       slivers: [
         SliverPadding(
           padding: const EdgeInsets.fromLTRB(22, 24, 22, 0),
@@ -5643,7 +5651,7 @@ class _MessagesListState extends State<MessagesList> {
         ),
         SliverPadding(
           key: _centerKey,
-          padding: const EdgeInsets.fromLTRB(22, 0, 22, 18),
+          padding: const EdgeInsets.fromLTRB(22, 0, 22, 0),
           sliver: SliverList.builder(
             itemCount: messages.length - anchor,
             itemBuilder: (context, index) => messageAt(anchor + index),
@@ -5660,9 +5668,11 @@ class MessageBubble extends StatelessWidget {
     required this.message,
     required this.onEdit,
     required this.onDelete,
+    this.bottomPadding = 18,
   });
 
   final AppMessage message;
+  final double bottomPadding;
   // null — кнопка действия не показывается.
   final VoidCallback? onEdit;
   final VoidCallback? onDelete;
@@ -5672,7 +5682,7 @@ class MessageBubble extends StatelessWidget {
     final isSystem = message.author == 'system';
 
     return Padding(
-      padding: const EdgeInsets.only(bottom: 18),
+      padding: EdgeInsets.only(bottom: bottomPadding),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -5805,6 +5815,80 @@ class _MessageDraft {
   final String? pendingClientMessageId;
 }
 
+class _SendChatMessageIntent extends Intent {
+  const _SendChatMessageIntent();
+}
+
+class _InsertChatNewlineIntent extends Intent {
+  const _InsertChatNewlineIntent();
+}
+
+/// A shared Windows composer for channels and direct messages.
+class ChatComposerField extends StatelessWidget {
+  const ChatComposerField({
+    super.key,
+    required this.controller,
+    required this.enabled,
+    required this.readOnly,
+    required this.onSend,
+    required this.decoration,
+    this.style,
+  });
+
+  final TextEditingController controller;
+  final bool enabled;
+  final bool readOnly;
+  final VoidCallback? onSend;
+  final InputDecoration decoration;
+  final TextStyle? style;
+
+  void _insertNewline() {
+    if (!enabled || readOnly) return;
+    final value = controller.value;
+    final selection = value.selection;
+    final start = selection.isValid ? selection.start : value.text.length;
+    final end = selection.isValid ? selection.end : value.text.length;
+    final text = value.text.replaceRange(start, end, '\n');
+    controller.value = value.copyWith(
+      text: text,
+      selection: TextSelection.collapsed(offset: start + 1),
+      composing: TextRange.empty,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Shortcuts(
+    shortcuts: const <ShortcutActivator, Intent>{
+      SingleActivator(LogicalKeyboardKey.enter): _SendChatMessageIntent(),
+      SingleActivator(LogicalKeyboardKey.numpadEnter): _SendChatMessageIntent(),
+      SingleActivator(LogicalKeyboardKey.enter, shift: true): _InsertChatNewlineIntent(),
+      SingleActivator(LogicalKeyboardKey.numpadEnter, shift: true): _InsertChatNewlineIntent(),
+    },
+    child: Actions(
+      actions: <Type, Action<Intent>>{
+        _SendChatMessageIntent: CallbackAction<_SendChatMessageIntent>(
+          onInvoke: (_) { if (enabled && !readOnly) onSend?.call(); return null; },
+        ),
+        _InsertChatNewlineIntent: CallbackAction<_InsertChatNewlineIntent>(
+          onInvoke: (_) { _insertNewline(); return null; },
+        ),
+      },
+      child: TextField(
+        controller: controller,
+        enabled: enabled,
+        readOnly: readOnly,
+        minLines: 1,
+        maxLines: 5,
+        keyboardType: TextInputType.multiline,
+        textInputAction: TextInputAction.newline,
+        onSubmitted: (_) { if (enabled && !readOnly) onSend?.call(); },
+        style: style,
+        decoration: decoration,
+      ),
+    ),
+  );
+}
+
 class MessageInput extends StatefulWidget {
   const MessageInput({
     super.key,
@@ -5923,10 +6007,11 @@ class _MessageInputState extends State<MessageInput> {
               color: const Color(0xFFBFA7FF),
             ),
             Expanded(
-              child: TextField(
+              child: ChatComposerField(
                 controller: controller,
-                enabled: widget.canSendMessages && !isSending,
-                onSubmitted: (_) => submitMessage(),
+                enabled: widget.canSendMessages,
+                readOnly: isSending,
+                onSend: submitMessage,
                 style: const TextStyle(color: Color(0xFFF3EEFF), fontSize: 14),
                 decoration: InputDecoration(
                   hintText: widget.canSendMessages

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:client/main.dart';
@@ -7,6 +8,29 @@ Widget _wrap(Widget child) => MaterialApp(home: Scaffold(body: child));
 
 void main() {
   group('MessageInput', () {
+    testWidgets('Shift+Enter replaces selection, Enter sends and keeps focus', (tester) async {
+      final sent = <String>[];
+      await tester.pumpWidget(_wrap(MessageInput(
+        channelId: 'dm-1', channelName: 'alice', canSendMessages: true,
+        onSendMessage: (content, _) async { sent.add(content); return false; },
+      )));
+      await tester.enterText(find.byType(TextField), 'hello world');
+      final field = tester.widget<TextField>(find.byType(TextField));
+      field.controller!.selection = const TextSelection(baseOffset: 5, extentOffset: 11);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.pump();
+      expect(field.controller!.text, 'hello\n');
+      expect(field.controller!.selection.baseOffset, 6);
+      expect(sent, isEmpty);
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pump();
+      expect(sent, ['hello']);
+      expect(field.controller!.text, 'hello\n');
+      expect(tester.widget<EditableText>(find.byType(EditableText)).focusNode.hasFocus, isTrue);
+    });
+
     testWidgets('keeps the typed text when onSendMessage fails', (
       tester,
     ) async {

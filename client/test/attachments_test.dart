@@ -6,6 +6,7 @@ import 'package:client/main.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -93,6 +94,30 @@ class _UploadAdapter implements HttpClientAdapter {
 }
 
 void main() {
+  testWidgets('channel composer inserts a newline and sends with Enter', (tester) async {
+    final drafts = ChannelAttachmentDrafts(FakeAttachmentApi());
+    addTearDown(drafts.dispose);
+    final calls = <String>[];
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: ChannelAttachmentInput(
+      channelId: 'c', channelName: 'general', canSendMessages: true, drafts: drafts,
+      onSend: (_, text, _, _) async { calls.add(text); return AttachmentSendResult.sent; },
+    ))));
+    await tester.enterText(find.byType(TextField), 'abcd');
+    final field = tester.widget<TextField>(find.byType(TextField));
+    field.controller!.selection = const TextSelection.collapsed(offset: 2);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.pump();
+    expect(field.controller!.text, 'ab\ncd');
+    expect(field.controller!.selection.baseOffset, 3);
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+    expect(calls, ['ab\ncd']);
+    expect(field.controller!.text, isEmpty);
+    expect(tester.widget<EditableText>(find.byType(EditableText)).focusNode.hasFocus, isTrue);
+  });
+
   testWidgets('offline composer shows the reason and disables sending', (tester) async {
     final drafts = ChannelAttachmentDrafts(FakeAttachmentApi());
     addTearDown(drafts.dispose);
@@ -238,7 +263,7 @@ void main() {
       await tester.tap(find.byTooltip('Отправить'));
       await tester.pumpAndSettle();
       expect(find.textContaining('Ответ сервера не получен'), findsOneWidget);
-      expect(tester.widget<TextField>(find.byType(TextField)).enabled, isFalse);
+      expect(tester.widget<TextField>(find.byType(TextField)).readOnly, isTrue);
       expect(api.discarded, isEmpty);
       await tester.tap(find.byTooltip('Повторить отправку'));
       await tester.pumpAndSettle();
