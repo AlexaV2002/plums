@@ -6,9 +6,11 @@ import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:file_selector/file_selector.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
 
 part 'dm.dart';
+part 'attachments.dart';
 
 void main() {
   runApp(const PlumsApp());
@@ -196,6 +198,9 @@ class ApiClient {
           }
 
           final retryRequest = error.requestOptions;
+          if (retryRequest.data is FormData) {
+            retryRequest.data = (retryRequest.data as FormData).clone();
+          }
           retryRequest.headers['Authorization'] = 'Bearer $accessToken';
           retryRequest.extra['retried'] = true;
 
@@ -602,6 +607,7 @@ class ApiClient {
     required String channelId,
     required String content,
     String? clientMessageId,
+    List<String> attachmentIds = const [],
   }) async {
     final response = await dio.post(
       '/channels/$channelId/messages',
@@ -609,10 +615,28 @@ class ApiClient {
       data: {
         'content': content,
         'clientMessageId': ?clientMessageId,
+        if (attachmentIds.isNotEmpty) 'attachmentIds': attachmentIds,
       },
     );
 
     return AppMessage.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<AppAttachment> uploadAttachment(String channelId, String name, Uint8List bytes) async {
+    final response = await dio.post('/channels/$channelId/attachments',
+      options: authOptions,
+      data: FormData.fromMap({'file': MultipartFile.fromBytes(bytes, filename: name)}));
+    return AppAttachment.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<Uint8List> downloadAttachment(String id) async {
+    final response = await dio.get<List<int>>('/attachments/$id/content',
+      options: authOptions.copyWith(responseType: ResponseType.bytes));
+    return Uint8List.fromList(response.data!);
+  }
+
+  Future<void> discardAttachment(String id) async {
+    await dio.delete('/attachments/$id', options: authOptions);
   }
 
   Future<AppMessage> updateMessage({
@@ -1895,6 +1919,7 @@ class MainShell extends StatefulWidget {
 
 class _MainShellState extends State<MainShell> {
   final realtimeClient = RealtimeClient();
+  late final channelAttachmentDrafts = ChannelAttachmentDrafts(apiClient);
 
   AppUser? currentUser;
   List<AppServer> servers = [];
@@ -2017,6 +2042,7 @@ class _MainShellState extends State<MainShell> {
     messagesScrollController.removeListener(_handleMessagesScroll);
     messagesScrollController.dispose();
     dmController.dispose();
+    channelAttachmentDrafts.dispose();
     realtimeClient.dispose();
     super.dispose();
   }
@@ -3379,6 +3405,37 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
+  Future<AttachmentSendResult> sendMessageWithAttachments(
+    String channelId, String content, String clientMessageId, List<String> ids,
+  ) async {
+    if (ids.isEmpty) {
+      if (selectedChannelId != channelId) return AttachmentSendResult.uncertain;
+      return await sendMessage(content, clientMessageId)
+          ? AttachmentSendResult.sent : AttachmentSendResult.uncertain;
+    }
+    try {
+      final message = await apiClient.sendMessage(channelId: channelId,
+          content: content, clientMessageId: clientMessageId, attachmentIds: ids);
+      if (mounted && selectedChannelId == channelId) {
+        setState(() => messages = mergeMessagesChronologically(messages, [message]));
+      }
+      return AttachmentSendResult.sent;
+    } on DioException catch (error) {
+      if (handleUnauthorized(error)) return AttachmentSendResult.uncertain;
+      if (mounted && selectedChannelId == channelId) {
+        showErrorSnackBar(context, 'Ошибка отправки сообщения: ${describeRequestError(error)}');
+      }
+      final code = error.response?.statusCode;
+      return code != null && code >= 400 && code < 500 && code != 408 && code != 429
+          ? AttachmentSendResult.rejected : AttachmentSendResult.uncertain;
+    } catch (error) {
+      if (mounted && selectedChannelId == channelId) {
+        showErrorSnackBar(context, 'Не удалось отправить сообщение: ${describeRequestError(error)}');
+      }
+      return AttachmentSendResult.uncertain;
+    }
+  }
+
   Future<void> editMessage(AppMessage message) async {
     final newContent = await showTextDialog(
       context: context,
@@ -4178,7 +4235,8 @@ class _MainShellState extends State<MainShell> {
                     isLoadingMoreMessages: isLoadingMoreMessages,
                     canSendMessages: canSendMessages,
                     messagesScrollController: messagesScrollController,
-                    onSendMessage: sendMessage,
+                    onSendWithAttachments: sendMessageWithAttachments,
+                    attachmentDrafts: channelAttachmentDrafts,
                     onEditMessage: editMessage,
                     onDeleteMessage: deleteMessage,
                     onShowMembers: showMembers,
@@ -5009,7 +5067,8 @@ class ChatArea extends StatelessWidget {
     required this.isLoadingMoreMessages,
     required this.canSendMessages,
     required this.messagesScrollController,
-    required this.onSendMessage,
+    required this.onSendWithAttachments,
+    required this.attachmentDrafts,
     required this.onEditMessage,
     required this.onDeleteMessage,
     required this.onShowMembers,
@@ -5025,8 +5084,8 @@ class ChatArea extends StatelessWidget {
   final bool isLoadingMoreMessages;
   final bool canSendMessages;
   final ScrollController messagesScrollController;
-  final Future<bool> Function(String content, String clientMessageId)
-  onSendMessage;
+  final Future<AttachmentSendResult> Function(String, String, String, List<String>) onSendWithAttachments;
+  final ChannelAttachmentDrafts attachmentDrafts;
   final ValueChanged<AppMessage> onEditMessage;
   final ValueChanged<AppMessage> onDeleteMessage;
   final VoidCallback onShowMembers;
@@ -5079,11 +5138,12 @@ class ChatArea extends StatelessWidget {
                 : const VoiceChannelPlaceholder(),
           ),
           if (channel.type == ChannelType.text)
-            MessageInput(
+            ChannelAttachmentInput(
               channelId: channel.id,
               channelName: channel.name,
               canSendMessages: canSendMessages && messagesError == null,
-              onSendMessage: onSendMessage,
+              drafts: attachmentDrafts,
+              onSend: onSendWithAttachments,
             ),
         ],
       ),
@@ -5586,6 +5646,8 @@ class MessageBubble extends StatelessWidget {
                       height: 1.35,
                     ),
                   ),
+                  for (final attachment in message.attachments)
+                    ProtectedAttachmentImage(attachment: attachment, api: apiClient),
                 ],
               ),
             ),
@@ -7729,6 +7791,7 @@ class AppMessage {
     required this.time,
     required this.createdAt,
     required this.updatedAt,
+    this.attachments = const [],
   });
 
   final String id;
@@ -7739,6 +7802,7 @@ class AppMessage {
   final String time;
   final DateTime? createdAt;
   final DateTime? updatedAt;
+  final List<AppAttachment> attachments;
 
   String get authorInitial {
     if (author.isEmpty) {
@@ -7773,6 +7837,9 @@ class AppMessage {
       time: _formatTime(createdAtRaw),
       createdAt: DateTime.tryParse(createdAtRaw ?? ''),
       updatedAt: DateTime.tryParse(updatedAtRaw ?? ''),
+      attachments: (json['attachments'] as List? ?? const [])
+          .map((item) => AppAttachment.fromJson(Map<String, dynamic>.from(item as Map)))
+          .toList(),
     );
   }
 

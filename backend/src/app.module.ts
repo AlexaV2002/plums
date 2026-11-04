@@ -10,6 +10,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { RolesModule } from './roles/roles.module';
 import { ServersModule } from './servers/servers.module';
 import { UsersModule } from './users/users.module';
+import { AttachmentsModule } from './attachments/attachments.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { UsersModule } from './users/users.module';
     InvitesModule,
     RolesModule,
     DmModule,
+    AttachmentsModule,
   ],
 })
 export class AppModule {}

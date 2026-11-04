@@ -17,6 +17,21 @@ type ChannelPermissions = {
   canConnect?: boolean;
 };
 
+const messageRelations = {
+  author: {
+    select: {
+      id: true,
+      username: true,
+      avatarUrl: true,
+      status: true,
+    },
+  },
+  attachments: {
+    select: { id: true, originalName: true, mimeType: true, sizeBytes: true },
+    orderBy: [{ createdAt: 'asc' as const }, { id: 'asc' as const }],
+  },
+} satisfies Prisma.MessageInclude;
+
 @Injectable()
 export class MessagesService {
   constructor(
@@ -80,6 +95,15 @@ export class MessagesService {
   }
 
   async create(channelId: string, userId: string, dto: CreateMessageDto) {
+    const attachmentIds = dto.attachmentIds ?? [];
+    if (
+      attachmentIds.length > 4 ||
+      new Set(attachmentIds).size !== attachmentIds.length
+    ) {
+      throw new BadRequestException(
+        'Можно прикрепить до четырёх разных изображений',
+      );
+    }
     const channel = await this.getChannelForUser(channelId, userId);
 
     if (channel.type !== ChannelType.TEXT) {
@@ -109,21 +133,21 @@ export class MessagesService {
             clientMessageId: id,
           },
         },
-        include: {
-          author: {
-            select: {
-              id: true,
-              username: true,
-              avatarUrl: true,
-              status: true,
-            },
-          },
-        },
+        include: messageRelations,
       });
     const returnExisting = async (id: string) => {
       const existing = await findExisting(id);
       if (!existing) return null;
-      if (existing.content !== dto.content || existing.deletedAt) {
+      const existingIds = (existing.attachments ?? [])
+        .map((item) => item.id)
+        .sort();
+      const requestedIds = [...attachmentIds].sort();
+      if (
+        existing.content !== dto.content ||
+        existing.deletedAt ||
+        existingIds.length !== requestedIds.length ||
+        existingIds.some((item, index) => item !== requestedIds[index])
+      ) {
         throw new ConflictException(
           'Идентификатор уже использован для другого или удалённого сообщения',
         );
@@ -136,25 +160,91 @@ export class MessagesService {
       if (existing) return existing;
     }
 
+    if (
+      (!dto.content || dto.content.length === 0) &&
+      attachmentIds.length === 0
+    ) {
+      throw new BadRequestException('Добавьте текст или изображение');
+    }
+
     try {
-      const message = await this.prisma.message.create({
-        data: {
-          channelId,
-          authorId: userId,
-          clientMessageId,
-          content: dto.content,
-        },
-        include: {
-          author: {
-            select: {
-              id: true,
-              username: true,
-              avatarUrl: true,
-              status: true,
-            },
-          },
-        },
-      });
+      const data = {
+        channelId,
+        authorId: userId,
+        clientMessageId,
+        content: dto.content,
+      };
+      const message =
+        attachmentIds.length === 0
+          ? await this.prisma.message.create({
+              data,
+              include: messageRelations,
+            })
+          : await this.prisma.$transaction(async (tx) => {
+              // Hold the channel and membership rows while validating the current
+              // permissions and attaching files, so concurrent revocation cannot
+              // slip between the access check and the commit.
+              await tx.$queryRaw`SELECT "id" FROM "channels" WHERE "id" = ${channelId} FOR SHARE`;
+              const current = await tx.channel.findUnique({
+                where: { id: channelId },
+                include: { server: { select: { ownerId: true } } },
+              });
+              if (!current) throw new NotFoundException('Канал не найден');
+              await tx.$queryRaw`SELECT "id" FROM "server_members" WHERE "serverId" = ${current.serverId} AND "userId" = ${userId} FOR SHARE`;
+              const member = await tx.serverMember.findUnique({
+                where: {
+                  serverId_userId: { serverId: current.serverId, userId },
+                },
+                select: { id: true },
+              });
+              if (!member)
+                throw new ForbiddenException('Вы не состоите на этом сервере');
+              const currentPermissions = this.getPermissions(
+                current.permissions,
+              );
+              if (current.type !== ChannelType.TEXT)
+                throw new BadRequestException(
+                  'Сообщения можно отправлять только в текстовый канал',
+                );
+              if (
+                current.server.ownerId !== userId &&
+                (!currentPermissions.canView ||
+                  !currentPermissions.canSendMessages)
+              ) {
+                throw new ForbiddenException(
+                  'У вас нет доступа к этому каналу',
+                );
+              }
+              // Conditional update locks each attachment, preventing parallel reuse.
+              const created = await tx.message.create({
+                data,
+                select: { id: true },
+              });
+              const linked = await tx.attachment.updateMany({
+                where: {
+                  id: { in: attachmentIds },
+                  ownerId: userId,
+                  channelId,
+                  state: 'UPLOADED',
+                  messageId: null,
+                  expiresAt: { gt: new Date() },
+                },
+                data: {
+                  state: 'ATTACHED',
+                  messageId: created.id,
+                  expiresAt: null,
+                },
+              });
+              if (linked.count !== attachmentIds.length) {
+                throw new BadRequestException(
+                  'Вложение недоступно, истекло или уже использовано',
+                );
+              }
+              return tx.message.findUniqueOrThrow({
+                where: { id: created.id },
+                include: messageRelations,
+              });
+            });
 
       this.messagesGateway.emitMessageNew(channelId, message);
       return message;
@@ -265,16 +355,7 @@ export class MessagesService {
         ? [{ createdAt: 'asc' }, { id: 'asc' }]
         : [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit,
-      include: {
-        author: {
-          select: {
-            id: true,
-            username: true,
-            avatarUrl: true,
-            status: true,
-          },
-        },
-      },
+      include: messageRelations,
     });
 
     if (options?.after) {
@@ -342,16 +423,7 @@ export class MessagesService {
       data: {
         content: dto.content,
       },
-      include: {
-        author: {
-          select: {
-            id: true,
-            username: true,
-            avatarUrl: true,
-            status: true,
-          },
-        },
-      },
+      include: messageRelations,
     });
 
     this.messagesGateway.emitMessageUpdate(
@@ -404,13 +476,14 @@ export class MessagesService {
       throw new ForbiddenException('У вас нет доступа к этому каналу');
     }
 
-    const deletedMessage = await this.prisma.message.update({
-      where: {
-        id: messageId,
-      },
-      data: {
-        deletedAt: new Date(),
-      },
+    const deletedMessage = await this.prisma.$transaction(async (tx) => {
+      const deleted = await tx.message.update({
+        where: { id: messageId },
+        data: { deletedAt: new Date() },
+      });
+      // Database trigger places storage keys in the durable cleanup queue.
+      await tx.attachment.deleteMany({ where: { messageId } });
+      return deleted;
     });
 
     this.messagesGateway.emitMessageDelete(deletedMessage.channelId, {

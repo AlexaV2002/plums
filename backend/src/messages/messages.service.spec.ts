@@ -8,6 +8,8 @@ import { MessagesService } from './messages.service';
 describe('MessagesService', () => {
   let service: MessagesService;
   let prisma: {
+    $transaction: jest.Mock;
+    attachment: { deleteMany: jest.Mock };
     channel: { findUnique: jest.Mock };
     serverMember: { findUnique: jest.Mock };
     message: { findUnique: jest.Mock; findMany: jest.Mock; update: jest.Mock };
@@ -18,10 +20,19 @@ describe('MessagesService', () => {
 
   beforeEach(async () => {
     prisma = {
+      $transaction: jest.fn(),
+      attachment: { deleteMany: jest.fn() },
       channel: { findUnique: jest.fn() },
       serverMember: { findUnique: jest.fn() },
-      message: { findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn() },
+      message: {
+        findUnique: jest.fn(),
+        findMany: jest.fn(),
+        update: jest.fn(),
+      },
     };
+    prisma.$transaction.mockImplementation(
+      (callback: (tx: typeof prisma) => unknown) => callback(prisma),
+    );
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -29,7 +40,10 @@ describe('MessagesService', () => {
         { provide: PrismaService, useValue: prisma },
         {
           provide: MessagesGateway,
-          useValue: { emitMessageUpdate: jest.fn(), emitMessageDelete: jest.fn() },
+          useValue: {
+            emitMessageUpdate: jest.fn(),
+            emitMessageDelete: jest.fn(),
+          },
         },
       ],
     }).compile();
@@ -174,7 +188,9 @@ describe('MessagesService', () => {
 
       await expect(
         service.update(messageId, authorId, { content: 'x' }),
-      ).rejects.toThrow(new ForbiddenException('Вы не состоите на этом сервере'));
+      ).rejects.toThrow(
+        new ForbiddenException('Вы не состоите на этом сервере'),
+      );
 
       expect(prisma.message.update).not.toHaveBeenCalled();
     });

@@ -60,3 +60,14 @@ if (!looksLikeTestDatabase || !explicitlyConfirmedAsTestDatabase) {
       'или дев БД для них недопустима.',
   );
 }
+
+// A test database alone is not sufficient isolation: the attachment cleanup
+// task also scans the configured filesystem. Always route e2e storage into
+// the workspace's test-only directory before AppModule is loaded.
+process.env.NODE_ENV = 'test';
+process.env.ATTACHMENT_STORAGE_DIR = resolve(
+  __dirname,
+  '..',
+  '.tmp',
+  `attachments-e2e-${process.pid}`,
+);

@@ -18,6 +18,11 @@ enum ChannelType {
   VOICE
 }
 
+enum AttachmentState {
+  UPLOADED
+  ATTACHED
+}
+
 model User {
   id           String     @id @default(uuid())
   email        String     @unique
@@ -32,6 +37,7 @@ model User {
   ownedServers Server[]       @relation("ServerOwner")
   memberships  ServerMember[]
   messages     Message[]
+  attachments  Attachment[]
   createdInvites Invite[]     @relation("InviteCreator")
   refreshTokens  RefreshToken[]
   bannedFrom     ServerBan[]  @relation("BannedUser")
@@ -117,6 +123,7 @@ model Channel {
 
   server   Server    @relation(fields: [serverId], references: [id], onDelete: Cascade)
   messages Message[]
+  attachments Attachment[]
 
   @@map("channels")
 }
@@ -133,10 +140,46 @@ model Message {
 
   channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
   author  User    @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  attachments Attachment[]
 
   @@index([channelId, createdAt])
   @@unique([authorId, channelId, clientMessageId])
   @@map("messages")
+}
+
+// Metadata only: file bytes live in the configured private storage adapter.
+model Attachment {
+  id           String          @id @default(uuid())
+  ownerId      String
+  channelId    String
+  messageId    String?
+  originalName String
+  mimeType     String
+  sizeBytes    Int
+  storageKey   String          @unique
+  state        AttachmentState @default(UPLOADED)
+  createdAt    DateTime        @default(now())
+  expiresAt    DateTime?
+
+  owner   User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  channel Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  message Message? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId, state, createdAt])
+  @@index([state, expiresAt])
+  @@index([channelId])
+  @@index([messageId])
+  @@map("attachments")
+}
+
+// Independent of users/messages/channels so cascades cannot erase deletion work.
+model AttachmentCleanup {
+  storageKey    String   @id
+  createdAt     DateTime @default(now())
+  attempts      Int      @default(0)
+  lastAttemptAt DateTime?
+
+  @@map("attachment_cleanup")
 }
 
 model Invite {
