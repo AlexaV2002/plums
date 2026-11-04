@@ -1958,6 +1958,7 @@ class _MainShellState extends State<MainShell> {
   bool isMessagesLoading = false;
   bool hasMoreMessages = false;
   bool isLoadingMoreMessages = false;
+  int _messagesPageGeneration = 0;
   String? errorMessage;
   String? messagesError;
 
@@ -1970,6 +1971,8 @@ class _MainShellState extends State<MainShell> {
     readMessages: () => messages,
     writeMessages: (next, {hasMore}) {
       if (!mounted) return;
+      final follow = MessageScrollFollower.capture(messagesScrollController);
+      final channelId = selectedChannelId;
       setState(() {
         messages = next;
         if (hasMore != null) {
@@ -1977,6 +1980,8 @@ class _MainShellState extends State<MainShell> {
           messagesError = null;
         }
       });
+      follow.schedule(messagesScrollController,
+          isCurrent: () => mounted && !isDmMode && selectedChannelId == channelId);
     },
     isChannelActive: (channelId) =>
         mounted && selectedChannelId == channelId,
@@ -2069,14 +2074,16 @@ class _MainShellState extends State<MainShell> {
     // близко к верхней границе списка (список не reversed: верх = старые сообщения).
     const loadMoreThreshold = 200.0;
 
-    if (messagesScrollController.position.pixels <= loadMoreThreshold) {
+    if (messagesScrollController.position.extentBefore <= loadMoreThreshold) {
       loadMoreMessages();
     }
   }
 
   void _scrollMessagesToBottom() {
+    final channelId = selectedChannelId;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !messagesScrollController.hasClients) {
+      if (!mounted || isDmMode || selectedChannelId != channelId ||
+          !messagesScrollController.hasClients) {
         return;
       }
 
@@ -2199,9 +2206,14 @@ class _MainShellState extends State<MainShell> {
     }
 
     if (!messages.any((item) => item.id == message.id)) {
+      final follow = MessageScrollFollower.capture(messagesScrollController);
       setState(() {
         messages = [...messages, message];
       });
+      follow.schedule(
+        messagesScrollController,
+        isCurrent: () => mounted && !isDmMode && selectedChannelId == message.channelId,
+      );
     }
     // Продвигает подтверждённую точку только в состоянии inSync.
     _messageSync.onLiveMessage(message);
@@ -2738,6 +2750,7 @@ class _MainShellState extends State<MainShell> {
 
   Future<void> selectServer(String serverId) async {
     _rolesRefreshGeneration++;
+    _messagesPageGeneration++;
     setState(() {
       selectedServerId = serverId;
       channels = [];
@@ -2745,6 +2758,7 @@ class _MainShellState extends State<MainShell> {
       serverRoles = [];
       selectedChannelId = null;
       messages = [];
+      isLoadingMoreMessages = false;
       isLoading = true;
       errorMessage = null;
     });
@@ -2808,6 +2822,7 @@ class _MainShellState extends State<MainShell> {
   }
 
   Future<void> selectChannel(String channelId) async {
+    _messagesPageGeneration++;
     final channel = channels.firstWhere(
       (item) => item.id == channelId,
       orElse: () => channels.first,
@@ -2816,6 +2831,7 @@ class _MainShellState extends State<MainShell> {
     setState(() {
       selectedChannelId = channelId;
       messages = [];
+      isLoadingMoreMessages = false;
       isMessagesLoading = channel.type == ChannelType.text;
       hasMoreMessages = false;
       errorMessage = null;
@@ -2882,6 +2898,7 @@ class _MainShellState extends State<MainShell> {
 
   Future<void> loadMoreMessages() async {
     final channelId = selectedChannelId;
+    final generation = _messagesPageGeneration;
 
     if (channelId == null ||
         messages.isEmpty ||
@@ -2904,18 +2921,8 @@ class _MainShellState extends State<MainShell> {
 
       // Пользователь мог переключить канал, пока грузились старые сообщения —
       // тогда эта страница относится к уже неактуальному каналу.
-      if (!mounted || selectedChannelId != channelId) return;
-
-      // Запоминаем текущую позицию и высоту прокрутки до того, как в начало
-      // списка добавятся старые сообщения, чтобы после перестройки списка
-      // восстановить ту же видимую точку и не "прыгать" к низу.
-      final hasScrollPosition = messagesScrollController.hasClients;
-      final previousPixels = hasScrollPosition
-          ? messagesScrollController.position.pixels
-          : 0.0;
-      final previousMaxScrollExtent = hasScrollPosition
-          ? messagesScrollController.position.maxScrollExtent
-          : 0.0;
+      if (!mounted || selectedChannelId != channelId ||
+          generation != _messagesPageGeneration) return;
 
       setState(() {
         // Merge вместо склейки: страница могла уже прийти докачкой назад.
@@ -2924,21 +2931,11 @@ class _MainShellState extends State<MainShell> {
         isLoadingMoreMessages = false;
       });
 
-      if (hasScrollPosition) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted || !messagesScrollController.hasClients) return;
-
-          final addedExtent =
-              messagesScrollController.position.maxScrollExtent -
-              previousMaxScrollExtent;
-
-          messagesScrollController.jumpTo(previousPixels + addedExtent);
-        });
-      }
     } on DioException catch (error) {
       if (handleUnauthorized(error)) return;
 
-      if (!mounted || selectedChannelId != channelId) return;
+      if (!mounted || selectedChannelId != channelId ||
+          generation != _messagesPageGeneration) return;
 
       setState(() {
         isLoadingMoreMessages = false;
@@ -2949,7 +2946,8 @@ class _MainShellState extends State<MainShell> {
         'Не удалось загрузить более старые сообщения: ${describeRequestError(error)}',
       );
     } catch (error) {
-      if (!mounted || selectedChannelId != channelId) return;
+      if (!mounted || selectedChannelId != channelId ||
+          generation != _messagesPageGeneration) return;
 
       setState(() {
         isLoadingMoreMessages = false;
@@ -3397,11 +3395,14 @@ class _MainShellState extends State<MainShell> {
 
       if (!mounted || selectedChannelId != channelId) return true;
 
+      final follow = MessageScrollFollower.capture(messagesScrollController);
       setState(() {
         // Merge по id и (createdAt, id): то же сообщение могло уже прийти
         // через message:new, а чужое live-сообщение — раньше HTTP-ответа.
         messages = mergeMessagesChronologically(messages, [sentMessage]);
       });
+      follow.schedule(messagesScrollController,
+          isCurrent: () => mounted && !isDmMode && selectedChannelId == channelId);
 
       return true;
     } on DioException catch (error) {
@@ -3436,7 +3437,10 @@ class _MainShellState extends State<MainShell> {
       final message = await apiClient.sendMessage(channelId: channelId,
           content: content, clientMessageId: clientMessageId, attachmentIds: ids);
       if (mounted && selectedChannelId == channelId) {
+        final follow = MessageScrollFollower.capture(messagesScrollController);
         setState(() => messages = mergeMessagesChronologically(messages, [message]));
+        follow.schedule(messagesScrollController,
+            isCurrent: () => mounted && !isDmMode && selectedChannelId == channelId);
       }
       return AttachmentSendResult.sent;
     } on DioException catch (error) {
@@ -4127,7 +4131,7 @@ class _MainShellState extends State<MainShell> {
   Widget build(BuildContext context) {
     final user = currentUser;
 
-    if (isLoading || user == null) {
+    if (isLoading) {
       return const Scaffold(
         backgroundColor: Color(0xFF15131A),
         body: Center(
@@ -4142,17 +4146,25 @@ class _MainShellState extends State<MainShell> {
         body: Center(
           child: Padding(
             padding: EdgeInsets.all(24),
-            child: Text(
-              errorMessage!,
-              style: const TextStyle(
-                color: Color(0xFFFF7A7A),
-                fontSize: 15,
-                fontWeight: FontWeight.w700,
-              ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(errorMessage!, textAlign: TextAlign.center,
+                  style: const TextStyle(color: Color(0xFFFF7A7A),
+                    fontSize: 15, fontWeight: FontWeight.w700)),
+                TextButton(onPressed: () {
+                  setState(() { isLoading = true; errorMessage = null; });
+                  unawaited(loadInitialData());
+                }, child: const Text('Повторить')),
+              ],
             ),
           ),
         ),
       );
+    }
+
+    if (user == null) {
+      return const Scaffold(body: Center(child: Text('Не удалось загрузить профиль')));
     }
 
     final selectedServer = servers.isNotEmpty && selectedServerId != null
@@ -4251,7 +4263,9 @@ class _MainShellState extends State<MainShell> {
                     onCreateVoiceChannel: () =>
                         createChannel(initialType: ChannelType.voice),
                   )
-                : ChatArea(
+                : ValueListenableBuilder<bool>(
+                  valueListenable: realtimeClient.identifiedListenable,
+                  builder: (context, connected, _) => ChatArea(
                     channel: selectedChannel,
                     messages: messages,
                     isMessagesLoading: isMessagesLoading,
@@ -4259,6 +4273,7 @@ class _MainShellState extends State<MainShell> {
                     hasMoreMessages: hasMoreMessages,
                     isLoadingMoreMessages: isLoadingMoreMessages,
                     canSendMessages: canSendMessages,
+                    isConnected: connected,
                     messagesScrollController: messagesScrollController,
                     onSendWithAttachments: sendMessageWithAttachments,
                     attachmentDrafts: channelAttachmentDrafts,
@@ -4268,6 +4283,7 @@ class _MainShellState extends State<MainShell> {
                     onLoadMoreMessages: loadMoreMessages,
                     onRetryMessages: () => selectChannel(selectedChannel.id),
                   ),
+                ),
           ),
           if (selectedServer != null)
             MembersSidebar(
@@ -5117,6 +5133,7 @@ class ChatArea extends StatelessWidget {
     required this.hasMoreMessages,
     required this.isLoadingMoreMessages,
     required this.canSendMessages,
+    this.isConnected = true,
     required this.messagesScrollController,
     required this.onSendWithAttachments,
     required this.attachmentDrafts,
@@ -5134,6 +5151,7 @@ class ChatArea extends StatelessWidget {
   final bool hasMoreMessages;
   final bool isLoadingMoreMessages;
   final bool canSendMessages;
+  final bool isConnected;
   final ScrollController messagesScrollController;
   final Future<AttachmentSendResult> Function(String, String, String, List<String>) onSendWithAttachments;
   final ChannelAttachmentDrafts attachmentDrafts;
@@ -5192,7 +5210,12 @@ class ChatArea extends StatelessWidget {
             ChannelAttachmentInput(
               channelId: channel.id,
               channelName: channel.name,
-              canSendMessages: canSendMessages && messagesError == null,
+              canSendMessages: canSendMessages && isConnected &&
+                  !isMessagesLoading && messagesError == null,
+              disabledHintText: !isConnected ? 'Нет соединения' :
+                  isMessagesLoading ? 'Загрузка сообщений...' :
+                  messagesError != null ? 'Повторите загрузку сообщений' :
+                  'Нет прав писать в этот канал',
               drafts: attachmentDrafts,
               onSend: onSendWithAttachments,
             ),
@@ -5495,7 +5518,34 @@ class RoleChip extends StatelessWidget {
   }
 }
 
-class MessagesList extends StatelessWidget {
+/// Only follows new messages when the reader was already near the bottom.
+class MessageScrollFollower {
+  const MessageScrollFollower._(this.follow, this.pixels);
+
+  final bool follow;
+  final double? pixels;
+
+  static MessageScrollFollower capture(ScrollController controller) {
+    if (!controller.hasClients) return const MessageScrollFollower._(true, null);
+    final position = controller.position;
+    return MessageScrollFollower._(
+      position.extentAfter <= 80,
+      position.pixels,
+    );
+  }
+
+  void schedule(ScrollController controller, {required bool Function() isCurrent}) {
+    if (!follow) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!isCurrent() || !controller.hasClients) return;
+      final position = controller.position;
+      if (pixels != null && (position.pixels - pixels!).abs() > 1) return;
+      controller.jumpTo(position.maxScrollExtent);
+    });
+  }
+}
+
+class MessagesList extends StatefulWidget {
   const MessagesList({
     super.key,
     required this.messages,
@@ -5523,11 +5573,21 @@ class MessagesList extends StatelessWidget {
   final bool Function(AppMessage message)? canDeleteMessage;
 
   @override
+  State<MessagesList> createState() => _MessagesListState();
+}
+
+class _MessagesListState extends State<MessagesList> {
+  final Key _centerKey = UniqueKey();
+  String? _anchorId;
+  String? _anchorChannelId;
+
+  @override
   Widget build(BuildContext context) {
+    final messages = widget.messages;
     if (messages.isEmpty) {
       return Center(
         child: Text(
-          emptyText,
+          widget.emptyText,
           style: const TextStyle(
             color: Color(0xFFB8ADC8),
             fontSize: 15,
@@ -5537,52 +5597,59 @@ class MessagesList extends StatelessWidget {
       );
     }
 
-    final itemCount = messages.length + (hasMoreMessages ? 1 : 0);
+    if (_anchorChannelId != messages.first.channelId ||
+        !messages.any((message) => message.id == _anchorId)) {
+      _anchorId = messages.first.id;
+      _anchorChannelId = messages.first.channelId;
+    }
+    final anchor = messages.indexWhere((message) => message.id == _anchorId);
+    Widget messageAt(int index) {
+      final message = messages[index];
+      return MessageBubble(
+        key: ValueKey(message.id),
+        message: message,
+        onEdit: widget.canEditMessage?.call(message) ?? true
+            ? () => widget.onEditMessage(message) : null,
+        onDelete: widget.canDeleteMessage?.call(message) ?? true
+            ? () => widget.onDeleteMessage(message) : null,
+      );
+    }
 
-    return ListView.builder(
-      controller: scrollController,
-      padding: const EdgeInsets.fromLTRB(22, 24, 22, 18),
-      itemCount: itemCount,
-      itemBuilder: (context, index) {
-        if (hasMoreMessages && index == 0) {
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 16),
-            child: Center(
-              child: isLoadingMoreMessages
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Color(0xFF8D5CFF),
-                      ),
-                    )
-                  : TextButton(
-                      onPressed: onLoadMoreMessages,
-                      child: const Text(
-                        'Загрузить более старые сообщения',
-                        style: TextStyle(
-                          color: Color(0xFF8D5CFF),
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                    ),
-            ),
-          );
-        }
-
-        final message = messages[index - (hasMoreMessages ? 1 : 0)];
-
-        return MessageBubble(
-          message: message,
-          onEdit: canEditMessage?.call(message) ?? true
-              ? () => onEditMessage(message)
-              : null,
-          onDelete: canDeleteMessage?.call(message) ?? true
-              ? () => onDeleteMessage(message)
-              : null,
-        );
-      },
+    // The first loaded message is the fixed zero point. Older pages extend
+    // above it and live messages below it, without moving the visible anchor.
+    return CustomScrollView(
+      controller: widget.scrollController,
+      center: _centerKey,
+      slivers: [
+        SliverPadding(
+          padding: const EdgeInsets.fromLTRB(22, 24, 22, 0),
+          sliver: SliverList.builder(
+            itemCount: anchor + (widget.hasMoreMessages ? 1 : 0),
+            itemBuilder: (context, index) {
+              if (index < anchor) return messageAt(anchor - 1 - index);
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 16),
+                child: Center(child: widget.isLoadingMoreMessages
+                    ? const SizedBox(width: 20, height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2,
+                            color: Color(0xFF8D5CFF)))
+                    : TextButton(onPressed: widget.onLoadMoreMessages,
+                        child: const Text('Загрузить более старые сообщения',
+                          style: TextStyle(color: Color(0xFF8D5CFF),
+                              fontWeight: FontWeight.w700)))),
+              );
+            },
+          ),
+        ),
+        SliverPadding(
+          key: _centerKey,
+          padding: const EdgeInsets.fromLTRB(22, 0, 22, 18),
+          sliver: SliverList.builder(
+            itemCount: messages.length - anchor,
+            itemBuilder: (context, index) => messageAt(anchor + index),
+          ),
+        ),
+      ],
     );
   }
 }

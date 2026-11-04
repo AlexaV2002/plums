@@ -325,6 +325,7 @@ class ChannelAttachmentInput extends StatelessWidget {
     required this.channelId,
     required this.channelName,
     required this.canSendMessages,
+    this.disabledHintText,
     required this.drafts,
     required this.onSend,
     this.pickFiles,
@@ -332,6 +333,7 @@ class ChannelAttachmentInput extends StatelessWidget {
   final String channelId;
   final String channelName;
   final bool canSendMessages;
+  final String? disabledHintText;
   final ChannelAttachmentDrafts drafts;
   final Future<AttachmentSendResult> Function(
     String,
@@ -466,7 +468,7 @@ class ChannelAttachmentInput extends StatelessWidget {
                         hintStyle: const TextStyle(color: Color(0xFF8F849F)),
                         hintText: canSendMessages
                             ? 'Написать в #$channelName'
-                            : 'Нет прав писать в этот канал',
+                            : disabledHintText ?? 'Нет прав писать в этот канал',
                       ),
                     ),
                   ),

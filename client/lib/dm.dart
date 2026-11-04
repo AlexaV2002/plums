@@ -668,6 +668,7 @@ class _DmViewState extends State<DmView> {
   StreamSubscription<DmNotice>? _noticeSubscription;
   String? _shownConversationId;
   String? _shownLastMessageId;
+  bool _needsInitialScroll = false;
 
   @override
   void initState() {
@@ -711,48 +712,43 @@ class _DmViewState extends State<DmView> {
     super.dispose();
   }
 
-  // Прокрутка вниз при смене диалога и при новом последнем сообщении.
+  // Новые сообщения не уводят читателя от старой истории.
   void _handleControllerChange() {
     final controller = widget.controller;
     final messages = controller.messages;
     final lastId = messages.isEmpty ? null : messages.last.id;
-    if (controller.selectedId == _shownConversationId &&
-        lastId == _shownLastMessageId) {
+    final changedConversation = controller.selectedId != _shownConversationId;
+    if (!changedConversation && lastId == _shownLastMessageId) {
       return;
     }
+    if (changedConversation) _needsInitialScroll = true;
     _shownConversationId = controller.selectedId;
     _shownLastMessageId = lastId;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !scrollController.hasClients) return;
-      scrollController.jumpTo(scrollController.position.maxScrollExtent);
-    });
+    if (lastId == null) return;
+    final conversationId = controller.selectedId;
+    if (_needsInitialScroll) {
+      _needsInitialScroll = false;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || widget.controller.selectedId != conversationId ||
+            !scrollController.hasClients) return;
+        scrollController.jumpTo(scrollController.position.maxScrollExtent);
+      });
+    } else {
+      final follow = MessageScrollFollower.capture(scrollController);
+      follow.schedule(scrollController, isCurrent: () =>
+          mounted && widget.controller.selectedId == conversationId);
+    }
   }
 
   void _handleScroll() {
     if (!scrollController.hasClients) return;
     final controller = widget.controller;
-    if (scrollController.position.pixels > 200 ||
+    if (scrollController.position.extentBefore > 200 ||
         controller.loadingMore ||
         !controller.hasMore) {
       return;
     }
-    final previousPixels = scrollController.position.pixels;
-    final previousExtent = scrollController.position.maxScrollExtent;
-    final lastId = _shownLastMessageId;
-    unawaited(
-      controller.loadMore().then((_) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted ||
-              !scrollController.hasClients ||
-              _shownLastMessageId != lastId) {
-            return;
-          }
-          final added =
-              scrollController.position.maxScrollExtent - previousExtent;
-          scrollController.jumpTo(previousPixels + added);
-        });
-      }),
-    );
+    unawaited(controller.loadMore());
   }
 
   Future<void> _startNewConversation() async {

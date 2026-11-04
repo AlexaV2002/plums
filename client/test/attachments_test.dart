@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -92,6 +93,42 @@ class _UploadAdapter implements HttpClientAdapter {
 }
 
 void main() {
+  testWidgets('offline composer shows the reason and disables sending', (tester) async {
+    final drafts = ChannelAttachmentDrafts(FakeAttachmentApi());
+    addTearDown(drafts.dispose);
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: ChannelAttachmentInput(
+      channelId: 'c', channelName: 'general', canSendMessages: false,
+      disabledHintText: 'Нет соединения', drafts: drafts,
+      onSend: (_, _, _, _) async => AttachmentSendResult.sent,
+    ))));
+    expect(find.text('Нет соединения'), findsOneWidget);
+    final send = find.byWidgetPredicate(
+      (widget) => widget is IconButton && widget.tooltip == 'Отправить',
+    );
+    expect(tester.widget<IconButton>(send).onPressed, isNull);
+  });
+
+  testWidgets('composer blocks a second send while the first is pending', (tester) async {
+    final drafts = ChannelAttachmentDrafts(FakeAttachmentApi());
+    addTearDown(drafts.dispose);
+    final pending = Completer<AttachmentSendResult>();
+    var calls = 0;
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: ChannelAttachmentInput(
+      channelId: 'c', channelName: 'general', canSendMessages: true,
+      drafts: drafts, onSend: (_, _, _, _) { calls++; return pending.future; },
+    ))));
+    await tester.enterText(find.byType(TextField), 'hello');
+    await tester.tap(find.byTooltip('Отправить'));
+    await tester.pump();
+    final send = find.byWidgetPredicate(
+      (widget) => widget is IconButton && widget.tooltip == 'Отправить',
+    );
+    expect(tester.widget<IconButton>(send).onPressed, isNull);
+    expect(calls, 1);
+    pending.complete(AttachmentSendResult.sent);
+    await tester.pump();
+  });
+
   test('upload retries multipart content after a 401 refresh', () async {
     SharedPreferences.setMockInitialValues({});
     final api = ApiClient()

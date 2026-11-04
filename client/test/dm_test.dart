@@ -490,6 +490,25 @@ void main() {
       expect(inChat('alice'), findsOneWidget); // заголовок с собеседником
     });
 
+    testWidgets('new DM does not move a reader browsing older messages', (tester) async {
+      api.conversations = [conv('A', alice)];
+      for (var i = 1; i <= 40; i++) {
+        api.add(dmMsg(i, 'A'));
+      }
+      await pumpView(tester);
+      await load(tester, 'A');
+      final list = tester.widget<CustomScrollView>(find.descendant(
+        of: find.byType(DmChatArea), matching: find.byType(CustomScrollView),
+      ));
+      final scroll = list.controller!;
+      scroll.jumpTo(200);
+      await tester.pump();
+      final before = scroll.position.pixels;
+      controller.handleDmNew(dmMsg(41, 'A'));
+      await pumpMany(tester);
+      expect(scroll.position.pixels, before);
+    });
+
     testWidgets('history error offers retry', (tester) async {
       api.conversations = [conv('A', alice)];
       api.historyErrors['A'] = Exception('offline');
